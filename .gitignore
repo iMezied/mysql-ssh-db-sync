@@ -1,0 +1,29 @@
+# ── Sensitive Config ─────────────────────────────────────────────
+.env
+
+# ── Tables Config (contains your actual table names) ─────────────
+config/tables.conf
+tables.conf
+table.conf
+
+# ── Backup Files ─────────────────────────────────────────────────
+*.sql
+*.sql.gz
+backups/
+logs/
+
+# ── macOS ────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# ── Editors ──────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Logs ─────────────────────────────────────────────────────────
+*.log

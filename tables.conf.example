@@ -1,0 +1,43 @@
+# ================================================================
+#  tables.conf — Tables to Backup WITH Data
+#  Copy this file: cp config/tables.conf.example config/tables.conf
+#
+#  Rules:
+#    - One table name per line
+#    - Lines starting with # are comments
+#    - Blank lines are ignored
+#    - All OTHER tables in the DB get schema only (no data)
+# ================================================================
+
+# ── Core Business Tables ─────────────────────────────────────────
+orders
+order_items
+order_status_history
+
+# ── Shipping & Logistics ─────────────────────────────────────────
+shipments
+shipment_tracking
+carriers
+carrier_rates
+
+# ── Users & Auth ─────────────────────────────────────────────────
+users
+user_profiles
+roles
+permissions
+role_user
+
+# ── Payments & Finance ───────────────────────────────────────────
+payments
+payment_methods
+invoices
+invoice_items
+refunds
+
+# ── Products & Catalog ───────────────────────────────────────────
+products
+product_variants
+categories
+tags
+
+# ── Add your 200 tables below ────────────────────────────────────
