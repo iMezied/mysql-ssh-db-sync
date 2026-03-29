@@ -264,17 +264,38 @@ There is no limit on the number of tables. The file supports hundreds of entries
 
 ## Usage
 
+### Short Commands
+
+Use these as the primary command forms:
+
+| Action | Command |
+|---|---|
+| Full sync (backup + restore) | `./db_migrate.sh sync` |
+| Backup only (source → local) | `./db_migrate.sh sync --backup-only` |
+| Restore only (local → destination) | `./db_migrate.sh restore` |
+| Validate configuration only | `./db_migrate.sh dry-run` |
+
+Legacy flags are still supported for compatibility: `--backup`, `--restore`, `--dry-run`.
+
 ### Full Pipeline
 
 Runs all 8 steps: connects to Source, dumps schema and data, compresses, connects to Destination, creates DB, restores, verifies.
 
 ```bash
-./db_migrate.sh
+./db_migrate.sh sync
 ```
+
+`sync` is the default command, so `./db_migrate.sh` behaves the same.
 
 ### Backup Only
 
 Connects to Source, runs the full dump and compression, saves the `.sql.gz` file locally. Stops before touching the Destination server. Useful for scheduled backups or when you want to review the file before restoring.
+
+```bash
+./db_migrate.sh sync --backup-only
+```
+
+Legacy shortcut still works:
 
 ```bash
 ./db_migrate.sh --backup
@@ -285,7 +306,7 @@ Connects to Source, runs the full dump and compression, saves the `.sql.gz` file
 Skips the dump entirely. Presents a numbered list of `.sql.gz` files available in your `BACKUP_DIR`, lets you choose one, then connects to Destination and restores it into a new database.
 
 ```bash
-./db_migrate.sh --restore
+./db_migrate.sh restore
 ```
 
 Example prompt:
@@ -304,6 +325,12 @@ Example prompt:
 ### Dry Run
 
 Validates your entire configuration without opening any tunnels or touching any database. Checks Docker, SSH keys, disk space, tables config, and all required `.env` values.
+
+```bash
+./db_migrate.sh dry-run
+```
+
+Legacy shortcut still works:
 
 ```bash
 ./db_migrate.sh --dry-run

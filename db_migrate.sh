@@ -5,6 +5,8 @@
 #
 #  Usage:
 #    ./db_migrate.sh              — full run (backup + restore)
+#    ./db_migrate.sh sync         — same as full run
+#    ./db_migrate.sh sync --backup-only  — backup only (no restore)
 #    ./db_migrate.sh --backup     — backup only
 #    ./db_migrate.sh --restore    — restore only (pick from saved backups)
 #    ./db_migrate.sh --dry-run    — validate config, no changes
@@ -55,6 +57,7 @@ RESTORE_START=0
 DUMP_START=0
 TOTAL_TABLES_IN_DB=0
 TABLES_WITH_DATA=()
+RUN_MODE="full"
 
 # ── Env loader ───────────────────────────────────────────────────
 load_env() {
@@ -670,7 +673,11 @@ print_summary() {
   echo -e "${NC}"
   divider
   echo -e "  ${DIM}Source DB     :${NC} ${BOLD}${SRC_DB_NAME}${NC} @ ${SRC_SSH_HOST}"
-  echo -e "  ${DIM}Restored To   :${NC} ${BOLD}${NEW_DB_NAME}${NC} @ ${DST_SSH_HOST}"
+  if [ "$RUN_MODE" = "backup" ]; then
+    echo -e "  ${DIM}Restore Step  :${NC} ${YELLOW}Skipped (backup-only mode)${NC}"
+  else
+    echo -e "  ${DIM}Restored To   :${NC} ${BOLD}${NEW_DB_NAME}${NC} @ ${DST_SSH_HOST}"
+  fi
   echo -e "  ${DIM}Backup File   :${NC} $(basename "$FINAL_BACKUP_FILE")"
   echo -e "  ${DIM}Saved At      :${NC} ${BACKUP_DIR}"
   divider
@@ -683,14 +690,59 @@ print_summary() {
 # ── Entry Point ───────────────────────────────────────────────────
 main() {
   local MODE="full"
+  local COMMAND="sync"
+  local BACKUP_ONLY="false"
 
   for arg in "$@"; do
     case $arg in
-      --backup)   MODE="backup"  ;;
-      --restore)  MODE="restore" ;;
-      --dry-run)  MODE="dryrun"  ;;
+      sync)            COMMAND="sync" ;;
+      backup)          COMMAND="backup" ;;
+      restore)         COMMAND="restore" ;;
+      dry-run)         COMMAND="dryrun" ;;
+      --backup-only)   BACKUP_ONLY="true" ;;
+      --backup)        COMMAND="backup" ;;
+      --restore)       COMMAND="restore" ;;
+      --dry-run)       COMMAND="dryrun" ;;
+      --full)          COMMAND="sync" ;;
+      -h|--help)
+        cat <<'EOF'
+Usage:
+  ./db_migrate.sh [sync] [--backup-only]
+  ./db_migrate.sh backup
+  ./db_migrate.sh restore
+  ./db_migrate.sh dry-run
+
+Legacy flags (still supported):
+  --backup
+  --restore
+  --dry-run
+EOF
+        exit 0
+        ;;
+      *)
+        error "Unknown argument: ${arg}. Run with --help for usage."
+        ;;
     esac
   done
+
+  case "$COMMAND" in
+    sync)
+      MODE="full"
+      [ "$BACKUP_ONLY" = "true" ] && MODE="backup"
+      ;;
+    backup) MODE="backup" ;;
+    restore) MODE="restore" ;;
+    dryrun) MODE="dryrun" ;;
+    *)
+      error "Unknown command: ${COMMAND}"
+      ;;
+  esac
+
+  if [ "$BACKUP_ONLY" = "true" ] && [ "$MODE" != "backup" ]; then
+    error "--backup-only can only be used with sync"
+  fi
+
+  RUN_MODE="$MODE"
 
   load_env
   print_header
