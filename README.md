@@ -3,11 +3,12 @@
 Cross-server database backup, restore and sync for MySQL and PostgreSQL — a
 desktop app for DBAs, plus a headless CLI that does exactly the same things.
 
-> **Status: M4′ (partial).** MySQL and PostgreSQL backup and restore work end
-> to end over SSH tunnels, plus cross-server sync as a single job with
-> verification and retention. Scheduling, notifications and packaging are the
-> remaining M4′ items. The original Bash tool in this repo still works and is
-> unchanged; see [Legacy tool](#legacy-tool).
+> **Status: M9.** MySQL and PostgreSQL backup and restore work end to end over
+> SSH tunnels; cross-server sync runs as one job with verification and
+> retention. Scheduling, packaging, encryption at rest, content verification,
+> restore drills and column masking are in. See the
+> [roadmap](#roadmap) for what is outstanding. The original Bash tool in this
+> repo still works and is unchanged; see [Legacy tool](#legacy-tool).
 
 ---
 
@@ -18,6 +19,7 @@ desktop app for DBAs, plus a headless CLI that does exactly the same things.
 - [How a backup job flows through the system](#how-a-backup-job-flows-through-the-system)
 - [Development setup](#development-setup)
 - [Scheduling](#scheduling)
+- [Masking](#masking)
 - [Packaging](#packaging)
 - [Testing](#testing)
 - [Security model](#security-model)
@@ -74,6 +76,8 @@ Reasoning for the non-obvious choices is in [DECISIONS.md](DECISIONS.md).
                  │ plan     settings     │
                  │ cron  schedule        │
                  │ scheduler  notify     │
+                 │ crypto  backupkey     │
+                 │ mask                  │
                  └───────────────────────┘
 ```
 
@@ -284,6 +288,61 @@ or directory ever leaves the machine — the artifact is named, not located.
 Redirects are not followed, delivery is a single 10-second attempt, and a
 failed webhook is logged against the job but never fails the run.
 
+## Masking
+
+Masking rewrites columns so a production copy can be handed to people who are
+not cleared to see production. Rules live on the sync plan, so every schedule
+running that plan inherits them.
+
+```bash
+dbsync mask add nightly users email --transform email
+dbsync mask add nightly users ssn   --transform null
+dbsync mask add nightly users notes --transform constant --value redacted
+dbsync mask list nightly            # `!` marks a rule that will not run
+dbsync mask sql  nightly            # exactly what the destination will execute
+```
+
+| Transform | Result | NULL |
+|---|---|---|
+| `hash` | salted SHA-256 in hex, `--length` to truncate | preserved |
+| `email` | deterministic address at `example.invalid` | preserved |
+| `phone` | deterministic number under `+1555` | preserved |
+| `null` | every row NULL — fails on a NOT NULL column | — |
+| `constant` | every row set to `--value`, NULLs included | overwritten |
+
+**The backup artifact is not masked.** Masking runs on the destination, after
+the restore, as SQL the destination server executes on itself; `mysqldump` and
+`pg_dump` cannot apply an expression to a column. An artifact from a masked
+sync is exactly as sensitive as the source — encrypt it, and do not hand it to
+anyone who is only cleared to see the masked copy.
+
+**Either the destination is masked, or it is dropped.** Every run is followed
+by a read-back that counts rows without the masked shape. If the masking fails,
+or the read-back finds unmasked rows, or the read-back cannot run, the sync
+drops the destination database and fails. A half-masked database looks finished
+and someone believes it, so it is never left standing. Masking is therefore
+refused for a restore into an existing database — dropping that would destroy
+data the sync did not create.
+
+**Rules are checked against the source before the backup starts.** A rule
+naming a column that does not exist protects nothing, and without that check
+the operator learns about it by reading real addresses out of the dev database.
+A rule on a table the plan does not copy with data is reported, not fatal:
+nothing reaches the destination, so nothing is exposed.
+
+**Deterministic, which means pseudonymisation and not anonymisation.** The same
+input always produces the same output, so `users.email` and
+`orders.billing_email` still join and a weekly refresh keeps stable pseudonyms.
+The price is that anyone holding both the masked data and the salt can confirm
+a guess. The salt lives in the operator's local app database and is never
+written to the destination, so compromising the dev server does not enable that
+attack.
+
+Masked tables are excluded from deep verification. Their contents differ from
+the source by design, so they are recorded as *not compared* — the same as any
+other undigestable table, so masking cannot become a way for a genuinely broken
+table to report success.
+
 ## Packaging
 
 ```bash
@@ -454,6 +513,9 @@ a schedule that comes due, moves data, verifies it, and enforces retention.
   permission.
 - **Destructive restores require typed confirmation**, and production-tagged
   targets require it even for non-obviously-destructive strategies.
+- **Masking protects the destination, not the artifact.** The backup file still
+  holds the real data; a masked sync leaves the destination masked or drops it.
+  See [Masking](#masking).
 
 ## Roadmap
 
@@ -466,9 +528,19 @@ a schedule that comes due, moves data, verifies it, and enforces retention.
 | **M4′** | Sync wizard, sync plans, retention enforcement | **Done** |
 | **M4′** | Scheduler, tray mode, launch at login, notifications and webhooks | **Done** |
 | **M5′** | Packaging: bundles, icons, bundled CLI, signing and notarization config, release workflow | **Done** |
+| **M6** | Encryption at rest (age), key generation, escrow and import | **Done** |
+| **M7** | Verification beyond row counts: content digests and column comparison | **Done** |
+| **M8** | Restore drills — proving an artifact restores, on a schedule | **Done** |
+| **M9** | Column-level masking on the destination, with a verified read-back | **Done** |
+| **M12** | Slack and Teams webhook rendering | **Partly** — library analytics outstanding |
 
-Not in scope for v1: data masking, incremental/binlog/WAL sync, cloud upload,
-multi-user access control. Trait seams are left where they would attach.
+Outstanding: off-site destinations (M10), team features (M13), MongoDB and SQL
+Server (M14), and library size/growth analytics. Masking and encryption are
+currently CLI-only; neither has a GUI yet. Restore drills have no scheduled
+kind — they run from cron or the CLI.
+
+Not in scope for v1: incremental/binlog/WAL sync, multi-user access control.
+Trait seams are left where they would attach.
 
 ## Legacy tool
 

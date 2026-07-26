@@ -11,6 +11,7 @@ use specta::Type;
 use uuid::Uuid;
 
 use crate::backup::TableSelection;
+use crate::mask::MaskRule;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct SyncPlan {
@@ -19,6 +20,13 @@ pub struct SyncPlan {
     pub name: String,
     pub database: String,
     pub selections: Vec<TableSelection>,
+    /// Columns masked on the destination after a sync restores this plan.
+    ///
+    /// Lives here rather than on the schedule because it describes the data,
+    /// not the timing — every schedule running this plan inherits the same
+    /// protection instead of keeping a copy that can drift.
+    #[serde(default)]
+    pub masking: Vec<MaskRule>,
     /// Bumped on every save, so a plan that changed under a schedule is
     /// visible rather than silent.
     pub revision: u32,
@@ -32,6 +40,8 @@ pub struct SyncPlanCreate {
     pub name: String,
     pub database: String,
     pub selections: Vec<TableSelection>,
+    #[serde(default)]
+    pub masking: Vec<MaskRule>,
 }
 
 impl SyncPlan {
@@ -40,6 +50,18 @@ impl SyncPlan {
             .iter()
             .filter(|s| s.mode == crate::backup::TableMode::SchemaAndData)
             .map(|s| s.name.clone())
+            .collect()
+    }
+
+    /// Masking rules whose table is actually copied with data.
+    ///
+    /// A rule on a schema-only or excluded table protects nothing because
+    /// nothing reaches the destination — safe, but not the same as active.
+    pub fn active_masking(&self) -> Vec<&MaskRule> {
+        let with_data = self.tables_with_data();
+        self.masking
+            .iter()
+            .filter(|r| with_data.contains(&r.table))
             .collect()
     }
 
@@ -109,6 +131,7 @@ mod tests {
             name: "nightly".into(),
             database: "app".into(),
             selections,
+            masking: Vec::new(),
             revision: 1,
             created_at: Utc::now(),
             updated_at: Utc::now(),

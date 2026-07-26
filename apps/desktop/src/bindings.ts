@@ -385,6 +385,36 @@ export type JobRecord = {
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
+/**  One column, one transform. */
+export type MaskRule = {
+	/**
+	 *  Table name as the plan spells it. For PostgreSQL this may be
+	 *  `schema.table`; a bare name means `public`.
+	 */
+	table: string,
+	column: string,
+	transform: MaskTransform,
+};
+
+/**  What to replace a column's values with. */
+export type MaskTransform = 
+/**  Salted SHA-256, hex, optionally truncated. NULL stays NULL. */
+{ kind: "hash"; length: number | null } | 
+/**  A deterministic address at [`FAKE_EMAIL_DOMAIN`]. NULL stays NULL. */
+{ kind: "email" } | 
+/**  A deterministic number in the reserved 555 range. NULL stays NULL. */
+{ kind: "phone" } | 
+/**  Every row set to NULL. Fails loudly on a NOT NULL column. */
+{ kind: "null" } | 
+/**
+ *  Every row set to one literal, NULLs included.
+ * 
+ *  Bound as text, so this is for text-ish columns. On a numeric column
+ *  PostgreSQL rejects it outright and MySQL coerces; either way the
+ *  post-mask check has the final say.
+ */
+{ kind: "constant"; value: string };
+
 export type MysqlBackupOptions = {
 	/**  Consistent snapshot without locking. Only meaningful for InnoDB. */
 	single_transaction: boolean,
@@ -780,6 +810,14 @@ export type SyncPlan = {
 	database: string,
 	selections: TableSelection[],
 	/**
+	 *  Columns masked on the destination after a sync restores this plan.
+	 * 
+	 *  Lives here rather than on the schedule because it describes the data,
+	 *  not the timing — every schedule running this plan inherits the same
+	 *  protection instead of keeping a copy that can drift.
+	 */
+	masking?: MaskRule[],
+	/**
 	 *  Bumped on every save, so a plan that changed under a schedule is
 	 *  visible rather than silent.
 	 */
@@ -793,6 +831,7 @@ export type SyncPlanCreate = {
 	name: string,
 	database: string,
 	selections: TableSelection[],
+	masking?: MaskRule[],
 };
 
 /**  Back up a source and restore it to a destination as one job. */
@@ -810,6 +849,14 @@ export type SyncRequest = {
 	 *  rather than silently acquiring a full table scan.
 	 */
 	deep_verify?: boolean,
+	/**
+	 *  Columns to mask on the destination once the restore lands.
+	 * 
+	 *  Defaulted so an existing stored request still deserialises. Note what
+	 *  this does *not* cover: the artifact written by this run still holds the
+	 *  real data. See [`crate::mask`].
+	 */
+	masking?: MaskRule[],
 	/**  Applied to the source's backup directory after a successful run. */
 	retention: RetentionPolicy | null,
 	/**  Required when the destination naming strategy is destructive. */

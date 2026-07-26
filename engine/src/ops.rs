@@ -13,6 +13,7 @@ use crate::connect::{self, ConnectError};
 use crate::db::ConnectParams;
 use crate::events::{JobKind, JobPhase};
 use crate::job::{JobContext, JobOutcome, JobRecord};
+use crate::mask::{self, MaskError, MaskRule, MaskingCoverage, MaskingReport};
 use crate::profile::ConnectionProfile;
 use crate::restore::{
     EngineRestoreOptions, RestoreError, RestoreRequest, TargetNaming, run_mysql_restore,
@@ -39,6 +40,20 @@ pub enum OpError {
     Db(#[from] crate::db::DbError),
     #[error(transparent)]
     Store(#[from] crate::store::StoreError),
+    #[error(transparent)]
+    Mask(#[from] MaskError),
+    // Masking failed *and* the destination could not be dropped, so a database
+    // holding unmasked production data is still standing. Its own variant
+    // because it is the one failure here that needs a human immediately.
+    #[error(
+        "masking failed and {database} could not be dropped, so it may still hold unmasked data \
+         — drop it by hand now. Masking error: {masking}. Drop error: {drop}"
+    )]
+    UnmaskedDataLeftBehind {
+        database: String,
+        masking: String,
+        drop: String,
+    },
     // Field named `source_engine`, not `source`: thiserror treats a `source`
     // field as the underlying error cause.
     #[error("cannot sync a {source_engine:?} source to a {dest_engine:?} destination")]
@@ -183,6 +198,13 @@ pub struct VerifyRequest<'a> {
     /// choice rather than the default — but it is the only thing that catches
     /// the right number of rows holding the wrong bytes.
     pub deep: bool,
+    /// Tables whose contents were deliberately changed by masking.
+    ///
+    /// Their digests cannot match, so they are not digested at all. They are
+    /// recorded as "not compared" rather than skipped or passed, which is what
+    /// a missing digest already means everywhere else — masking must not be a
+    /// way for a genuinely broken table to report success.
+    pub masked_tables: &'a [String],
 }
 
 /// Compare a restored database against what the backup said it contained.
@@ -281,6 +303,7 @@ async fn deep_compare(
         &source.endpoint,
         request.source_database,
         &tables,
+        request.masked_tables,
     )
     .await?;
     drop(source);
@@ -291,6 +314,7 @@ async fn deep_compare(
         &dest.endpoint,
         request.dest_database,
         &tables,
+        request.masked_tables,
     )
     .await?;
     drop(dest);
@@ -314,6 +338,7 @@ async fn digest_tables(
     endpoint: &Endpoint,
     database: &str,
     tables: &[String],
+    masked: &[String],
 ) -> Result<DigestsAndColumns, OpError> {
     let params = ConnectParams {
         engine: profile.engine,
@@ -329,6 +354,17 @@ async fn digest_tables(
     let mut columns = BTreeMap::new();
 
     for table in tables {
+        // A masked table's contents differ from the source by design, so
+        // digesting it would report the feature working as corruption. Its
+        // columns are still compared — masking changes values, never shape.
+        if masked.iter().any(|m| m == table) {
+            digests.insert(table.clone(), None);
+            if let Ok(cols) = introspector.column_names(database, table).await {
+                columns.insert(table.clone(), cols);
+            }
+            continue;
+        }
+
         // A table that cannot be digested is recorded as `None`, never
         // skipped: the refinement step needs to know the difference between
         // "compared and equal" and "could not compare".
@@ -443,10 +479,40 @@ pub struct SyncRequest {
     /// rather than silently acquiring a full table scan.
     #[serde(default)]
     pub deep_verify: bool,
+    /// Columns to mask on the destination once the restore lands.
+    ///
+    /// Defaulted so an existing stored request still deserialises. Note what
+    /// this does *not* cover: the artifact written by this run still holds the
+    /// real data. See [`crate::mask`].
+    #[serde(default)]
+    pub masking: Vec<MaskRule>,
     /// Applied to the source's backup directory after a successful run.
     pub retention: Option<RetentionPolicy>,
     /// Required when the destination naming strategy is destructive.
     pub typed_confirmation: Option<String>,
+}
+
+impl SyncRequest {
+    /// Reject a masking request that cannot be made safe.
+    ///
+    /// Masking's guarantee is that the destination ends up masked or ends up
+    /// gone, and that rests on being able to drop it. `IntoExisting` restores
+    /// into a database that was already there — dropping it would destroy data
+    /// this sync never created, so the combination is refused up front rather
+    /// than discovered at the point of no return.
+    pub fn validate_masking(&self) -> Result<(), MaskError> {
+        if self.masking.is_empty() {
+            return Ok(());
+        }
+
+        if let TargetNaming::IntoExisting { name } = &self.naming {
+            return Err(MaskError::UnsafeNaming {
+                naming: format!("restoring into the existing database {name}"),
+            });
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -454,6 +520,10 @@ pub struct SyncOutcome {
     pub artifact_path: String,
     pub target_database: String,
     pub verification: Option<VerificationReport>,
+    /// What masking did, when it ran. A `Some` here always means masking was
+    /// applied *and* verified — a failure of either aborts the sync.
+    #[serde(default)]
+    pub masking: Option<MaskingReport>,
     /// Artifacts retention removed, if it ran.
     pub removed_artifacts: Vec<String>,
 }
@@ -479,6 +549,14 @@ pub async fn sync(
         });
     }
 
+    // ── Masking pre-flight ──────────────────────────────────────────────
+    //
+    // Deliberately before the backup. The failure this catches — a rule naming
+    // a column that does not exist, so nothing is masked — is only cheap to
+    // recover from while no data has moved. Once the restore has run, the
+    // remedy is dropping a database someone may already be using.
+    let coverage = plan_masking(source, request, store, ctx).await?;
+
     // ── Backup ──────────────────────────────────────────────────────────
     let artifact = backup(source, &request.backup, store, ctx).await?;
     ctx.bail_if_cancelled().map_err(|_| OpError::Cancelled)?;
@@ -494,6 +572,16 @@ pub async fn sync(
 
     let target = restore(dest, &restore_request, store, ctx).await?;
     ctx.bail_if_cancelled().map_err(|_| OpError::Cancelled)?;
+
+    // ── Mask ────────────────────────────────────────────────────────────
+    //
+    // Before verification, and before anything is allowed to report success:
+    // between the restore landing and this finishing, the destination holds
+    // real data.
+    let masking = match &coverage {
+        Some(coverage) => Some(mask_destination(dest, &target, coverage, store, ctx).await?),
+        None => None,
+    };
 
     // ── Verify ──────────────────────────────────────────────────────────
     let verification = if request.verify {
@@ -523,6 +611,10 @@ pub async fn sync(
                     tables_with_data: &with_data,
                     schema_only: &schema_only,
                     deep: request.deep_verify,
+                    masked_tables: &coverage
+                        .as_ref()
+                        .map(MaskingCoverage::tables)
+                        .unwrap_or_default(),
                 },
                 store,
                 ctx,
@@ -556,8 +648,284 @@ pub async fn sync(
         artifact_path: artifact.display().to_string(),
         target_database: target,
         verification,
+        masking,
         removed_artifacts: removed,
     })
+}
+
+// ── Masking ─────────────────────────────────────────────────────────────
+
+/// Decide what masking will do, and refuse anything it cannot do safely.
+///
+/// Runs against the source before any data moves. Returns `None` when the
+/// request asks for no masking at all.
+async fn plan_masking(
+    source: &ConnectionProfile,
+    request: &SyncRequest,
+    store: &Store,
+    ctx: &JobContext,
+) -> Result<Option<MaskingCoverage>, OpError> {
+    if request.masking.is_empty() {
+        return Ok(None);
+    }
+
+    request.validate_masking()?;
+
+    let tables_with_data: Vec<String> = request
+        .backup
+        .common
+        .tables_with_data()
+        .into_iter()
+        .map(|s| s.name.clone())
+        .collect();
+
+    // Only the tables a rule actually names and that carry data need looking up.
+    let wanted: std::collections::BTreeSet<String> = request
+        .masking
+        .iter()
+        .map(|r| r.table.clone())
+        .filter(|t| tables_with_data.contains(t))
+        .collect();
+    let wanted: Vec<String> = wanted.into_iter().collect();
+
+    ctx.emit(
+        JobPhase::Initializing,
+        format!(
+            "checking {} masking rule(s) against the source schema",
+            request.masking.len()
+        ),
+    )
+    .await;
+
+    let columns = source_columns(source, &request.backup.common.database, &wanted, store).await?;
+    let coverage = mask::plan_coverage(&request.masking, &tables_with_data, &columns)?;
+
+    for inert in &coverage.inert {
+        ctx.emit_warn(
+            JobPhase::Initializing,
+            format!(
+                "masking rule for {}.{} will not run: {}",
+                inert.rule.table, inert.rule.column, inert.reason
+            ),
+        )
+        .await;
+    }
+
+    if coverage.is_empty() {
+        // Every rule was inert. Nothing is exposed, but the operator asked for
+        // masking and would get an unmasked-looking destination; say so.
+        ctx.emit_warn(
+            JobPhase::Initializing,
+            "no masking rule matches a table in this plan; nothing will be masked",
+        )
+        .await;
+        return Ok(None);
+    }
+
+    ctx.emit(
+        JobPhase::Initializing,
+        format!(
+            "will mask {} column(s) across {} table(s) after the restore. \
+             The backup artifact itself is NOT masked",
+            coverage.effective.len(),
+            coverage.tables().len()
+        ),
+    )
+    .await;
+
+    Ok(Some(coverage))
+}
+
+/// Read the column names of specific tables from a profile.
+async fn source_columns(
+    profile: &ConnectionProfile,
+    database: &str,
+    tables: &[String],
+    store: &Store,
+) -> Result<BTreeMap<String, Vec<String>>, OpError> {
+    if tables.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let reachable = reach(profile, store).await?;
+    let params = ConnectParams {
+        engine: profile.engine,
+        host: reachable.endpoint.host.clone(),
+        port: reachable.endpoint.port,
+        user: reachable.endpoint.user.clone(),
+        password: reachable.endpoint.password.clone(),
+        database: Some(database.to_string()),
+    };
+    let introspector = crate::db::connect(&params).await?;
+
+    let mut out = BTreeMap::new();
+    for table in tables {
+        // A table we cannot read is left absent rather than recorded empty.
+        // `plan_coverage` treats absent as "stop", and an empty column list
+        // would instead read as "that column does not exist" — the same
+        // outcome by luck, but for the wrong reason.
+        if let Ok(cols) = introspector.column_names(database, table).await {
+            out.insert(table.clone(), cols);
+        }
+    }
+    introspector.close().await;
+
+    Ok(out)
+}
+
+/// Mask the destination, prove it worked, and destroy it if either fails.
+///
+/// The whole feature rests on this function's failure path. A masking run that
+/// errors halfway leaves a database that looks finished and is not, so there is
+/// no path out of here that returns `Ok` with the destination still standing
+/// and unverified.
+async fn mask_destination(
+    dest: &ConnectionProfile,
+    database: &str,
+    coverage: &MaskingCoverage,
+    store: &Store,
+    ctx: &JobContext,
+) -> Result<MaskingReport, OpError> {
+    match run_masking(dest, database, coverage, store, ctx).await {
+        Ok(report) => Ok(report),
+        Err(masking_error) => {
+            ctx.emit_error(
+                JobPhase::Cleanup,
+                format!(
+                    "masking failed: {masking_error}. Dropping {database} — it holds unmasked data"
+                ),
+            )
+            .await;
+
+            if let Err(drop_error) = drop_database(dest, database, store).await {
+                return Err(OpError::UnmaskedDataLeftBehind {
+                    database: database.to_string(),
+                    masking: masking_error.to_string(),
+                    drop: drop_error.to_string(),
+                });
+            }
+
+            ctx.emit(
+                JobPhase::Cleanup,
+                format!("dropped {database}; no unmasked data was left behind"),
+            )
+            .await;
+            Err(masking_error)
+        }
+    }
+}
+
+/// The masking itself. Every error here means the destination must go.
+async fn run_masking(
+    dest: &ConnectionProfile,
+    database: &str,
+    coverage: &MaskingCoverage,
+    store: &Store,
+    ctx: &JobContext,
+) -> Result<MaskingReport, OpError> {
+    let salt = mask::derive_salt(&mask::ensure_secret(store).await?);
+
+    let updates = mask::update_statements(dest.engine, &coverage.effective, &salt)?;
+    let checks = mask::check_statements(dest.engine, &coverage.effective)?;
+
+    let reachable = reach(dest, store).await?;
+    let params = ConnectParams {
+        engine: dest.engine,
+        host: reachable.endpoint.host.clone(),
+        port: reachable.endpoint.port,
+        user: reachable.endpoint.user.clone(),
+        password: reachable.endpoint.password.clone(),
+        database: Some(database.to_string()),
+    };
+
+    ctx.emit(
+        JobPhase::Restore,
+        format!("masking {} table(s) in {database}", updates.len()),
+    )
+    .await;
+
+    let statements: Vec<crate::db::Statement> =
+        updates.iter().map(|u| u.statement.clone()).collect();
+    let affected = crate::db::execute_batch(&params, &statements).await?;
+
+    for (update, rows) in updates.iter().zip(&affected) {
+        ctx.emit(
+            JobPhase::Restore,
+            format!("masked {} row(s) in {}", rows, update.table),
+        )
+        .await;
+    }
+
+    // ── Prove it ────────────────────────────────────────────────────────
+    //
+    // The UPDATE reporting success is not evidence the column is unreadable.
+    // A silent truncation, a trigger rewriting the row, a coercion that throws
+    // the expression away — none of those raise an error.
+    ctx.emit(JobPhase::Verify, "checking that masking took effect")
+        .await;
+
+    let queries: Vec<crate::db::Statement> = checks.iter().map(|c| c.statement.clone()).collect();
+    let counts = crate::db::fetch_count_rows(&params, &queries).await?;
+
+    let mut columns = Vec::new();
+    for (check, row) in checks.iter().zip(&counts) {
+        for (i, column) in check.columns.iter().enumerate() {
+            let unmasked = row.get(i).copied().unwrap_or(0);
+            if unmasked > 0 {
+                return Err(MaskError::NotMasked {
+                    table: check.table.clone(),
+                    column: column.clone(),
+                    count: unmasked,
+                }
+                .into());
+            }
+            columns.push(format!("{}.{}", check.table, column));
+        }
+    }
+
+    ctx.emit(
+        JobPhase::Verify,
+        format!("{} column(s) confirmed masked", columns.len()),
+    )
+    .await;
+
+    Ok(MaskingReport {
+        tables: updates.iter().map(|u| u.table.clone()).collect(),
+        columns,
+        rows_rewritten: affected.iter().sum(),
+        inert: coverage.inert.clone(),
+        verified: true,
+    })
+}
+
+/// Drop a database this run created.
+///
+/// Separate from the drill's cleanup, which refuses any name it did not
+/// generate. Here the caller's guarantee is different and enforced upstream:
+/// [`plan_masking`] refuses to run at all unless the naming strategy means
+/// this sync owns the database.
+async fn drop_database(dest: &ConnectionProfile, name: &str, store: &Store) -> Result<(), OpError> {
+    let reachable = reach(dest, store).await?;
+    let params = ConnectParams {
+        engine: dest.engine,
+        host: reachable.endpoint.host.clone(),
+        port: reachable.endpoint.port,
+        user: reachable.endpoint.user.clone(),
+        password: reachable.endpoint.password.clone(),
+        // Never connect *to* the database being dropped.
+        database: match dest.engine {
+            Engine::Postgres => Some("postgres".to_string()),
+            Engine::Mysql => None,
+        },
+    };
+
+    let quoted = match dest.engine {
+        Engine::Mysql => crate::db::quote_mysql_ident(name),
+        Engine::Postgres => crate::db::quote_pg_ident(name),
+    }?;
+
+    crate::db::execute_raw(&params, &format!("DROP DATABASE IF EXISTS {quoted}")).await?;
+    Ok(())
 }
 
 /// Apply a retention policy, reporting exactly what it removed.
@@ -806,7 +1174,9 @@ async fn check_against_manifest(
     if deep {
         ctx.emit(JobPhase::Verify, "reading every row").await;
         let (digests, columns) =
-            digest_tables(dest, &reachable.endpoint, scratch, &manifest.tables).await?;
+            // A drill checks an artifact against its own manifest, and masking
+            // never touched the artifact, so nothing here is exempt.
+            digest_tables(dest, &reachable.endpoint, scratch, &manifest.tables, &[]).await?;
 
         for entry in &mut report.tables {
             if matches!(entry.verdict, crate::verify::TableVerdict::Match)
@@ -961,5 +1331,100 @@ mod drill_tests {
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(!json.contains("typed_confirmation"));
+    }
+}
+
+#[cfg(test)]
+mod masking_tests {
+    use super::*;
+    use crate::backup::{
+        CommonBackupOptions, EngineBackupOptions, MysqlBackupOptions, TableSelection,
+    };
+
+    fn request(naming: TargetNaming, masking: Vec<MaskRule>) -> SyncRequest {
+        SyncRequest {
+            backup: BackupRequest {
+                common: CommonBackupOptions {
+                    database: "app".into(),
+                    selections: vec![TableSelection::with_data("users")],
+                    output_dir: PathBuf::from("/backups"),
+                    compress: true,
+                    encrypt: false,
+                },
+                engine: EngineBackupOptions::Mysql(MysqlBackupOptions::default()),
+            },
+            naming,
+            restore: EngineRestoreOptions::Mysql(Default::default()),
+            verify: true,
+            deep_verify: false,
+            masking,
+            retention: None,
+            typed_confirmation: None,
+        }
+    }
+
+    #[test]
+    fn masking_into_an_existing_database_is_refused() {
+        // Masking's guarantee is "masked, or gone". Honouring the second half
+        // would mean dropping a database this sync did not create.
+        let req = request(
+            TargetNaming::IntoExisting {
+                name: "dev_app".into(),
+            },
+            vec![MaskRule::email("users", "email")],
+        );
+        let err = req.validate_masking().unwrap_err();
+        assert!(matches!(err, MaskError::UnsafeNaming { .. }), "{err}");
+    }
+
+    #[test]
+    fn masking_is_allowed_for_the_naming_strategies_that_own_the_target() {
+        for naming in [
+            TargetNaming::NewTimestamped {
+                prefix: "dev".into(),
+            },
+            TargetNaming::DropAndRecreate {
+                name: "dev_app".into(),
+            },
+        ] {
+            let req = request(naming.clone(), vec![MaskRule::email("users", "email")]);
+            assert!(
+                req.validate_masking().is_ok(),
+                "{naming:?} creates the database it restores into"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sync_without_masking_is_unaffected_by_the_naming_rule() {
+        // Restoring into an existing database stays legal; it is only masking
+        // that needs to be able to destroy the target.
+        let req = request(
+            TargetNaming::IntoExisting {
+                name: "dev_app".into(),
+            },
+            Vec::new(),
+        );
+        assert!(req.validate_masking().is_ok());
+    }
+
+    #[test]
+    fn a_stored_request_without_masking_still_deserialises() {
+        // Every schedule written before this milestone. Built by serialising a
+        // current request and deleting the new key, so this stays honest as the
+        // surrounding shape changes rather than drifting into a fixture that
+        // no longer resembles anything stored.
+        let current = request(
+            TargetNaming::NewTimestamped {
+                prefix: "dev".into(),
+            },
+            vec![MaskRule::email("users", "email")],
+        );
+        let mut json = serde_json::to_value(&current).unwrap();
+        json.as_object_mut().unwrap().remove("masking").unwrap();
+
+        let parsed: SyncRequest =
+            serde_json::from_value(json).expect("an old request must still load");
+        assert!(parsed.masking.is_empty(), "and it must load as unmasked");
     }
 }

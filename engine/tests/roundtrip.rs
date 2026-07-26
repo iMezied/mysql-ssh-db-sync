@@ -396,6 +396,7 @@ db_test! {
         let report = ops::verify_restore(
             ops::VerifyRequest {
                 deep: true,
+                masked_tables: &[],
                 source_profile: &source,
                 dest_profile: &dest,
                 source_database: "fixture",
@@ -588,6 +589,7 @@ db_test! {
                 name: "nightly".into(),
                 database: "fixture".into(),
                 selections: backup_request(out.path().to_path_buf()).common.selections,
+                masking: Vec::new(),
             })
             .await
             .unwrap();
@@ -743,6 +745,7 @@ db_test! {
                 name: "hourly".into(),
                 database: "fixture".into(),
                 selections: vec![TableSelection::with_data("users")],
+                masking: Vec::new(),
             })
             .await
             .unwrap();
@@ -1007,6 +1010,7 @@ db_test! {
         let with_data = vec!["users".to_string()];
         let verify_request = || ops::VerifyRequest {
             deep: true,
+            masked_tables: &[],
             source_profile: &source,
             dest_profile: &dest,
             source_database: "fixture",

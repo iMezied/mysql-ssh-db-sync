@@ -77,6 +77,7 @@ async fn plan_and_profiles(store: &Store) -> (Uuid, Uuid) {
                 TableSelection::with_data("orders"),
                 TableSelection::schema_only("audit_log"),
             ],
+            masking: Vec::new(),
         })
         .await
         .unwrap();

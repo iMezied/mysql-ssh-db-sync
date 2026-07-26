@@ -127,6 +127,7 @@ async fn plan(store: &Store, profile_id: Uuid, selections: Vec<TableSelection>) 
             name: "nightly".into(),
             database: "app".into(),
             selections,
+            masking: Vec::new(),
         })
         .await
         .unwrap()

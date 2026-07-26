@@ -5,8 +5,11 @@
 //! would paper over.
 
 use chrono::Utc;
+use db_sync_engine::backup::TableSelection;
 use db_sync_engine::events::JobKind;
 use db_sync_engine::job::{JobOutcome, JobRecord};
+use db_sync_engine::mask::{MaskRule, MaskTransform};
+use db_sync_engine::plan::SyncPlanCreate;
 use db_sync_engine::profile::{
     DbConfig, ProfileCreate, ProfileUpdate, SshAuth, SshConfig, SshEndpoint, ToolOverrides,
 };
@@ -502,4 +505,130 @@ async fn malformed_ssh_json_is_corruption_not_a_direct_connection() {
         ),
         "a tunnelled profile must never degrade into a direct connection"
     );
+}
+
+// ── Masking rules ───────────────────────────────────────────────────────
+
+async fn plan_with_masking(
+    store: &Store,
+    masking: Vec<MaskRule>,
+) -> db_sync_engine::plan::SyncPlan {
+    let profile = store
+        .create_profile(profile_input(&Uuid::new_v4().to_string(), Engine::Mysql))
+        .await
+        .unwrap();
+
+    store
+        .create_sync_plan(SyncPlanCreate {
+            profile_id: profile.id,
+            name: "nightly".into(),
+            database: "app".into(),
+            selections: vec![
+                TableSelection::with_data("users"),
+                TableSelection::schema_only("audit_log"),
+            ],
+            masking,
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn masking_rules_survive_a_round_trip() {
+    let (store, _dir) = store().await;
+    let rules = vec![
+        MaskRule::email("users", "email"),
+        MaskRule {
+            table: "users".into(),
+            column: "note".into(),
+            transform: MaskTransform::Constant {
+                value: "redacted".into(),
+            },
+        },
+    ];
+
+    let created = plan_with_masking(&store, rules.clone()).await;
+    let read_back = store.get_sync_plan(created.id).await.unwrap().unwrap();
+    assert_eq!(read_back.masking, rules);
+}
+
+#[tokio::test]
+async fn a_plan_written_before_masking_existed_reads_as_unmasked() {
+    // The migration adds the column with a default. A plan row that predates
+    // it must come back as "no masking" rather than as corruption.
+    let (store, _dir) = store().await;
+    let plan = plan_with_masking(&store, Vec::new()).await;
+
+    sqlx::query("UPDATE sync_plans SET masking = '[]' WHERE id = ?1")
+        .bind(plan.id.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let read_back = store.get_sync_plan(plan.id).await.unwrap().unwrap();
+    assert!(read_back.masking.is_empty());
+}
+
+#[tokio::test]
+async fn corrupt_masking_rules_are_an_error_not_an_empty_list() {
+    // The dangerous shape: reading unparseable rules as "no masking" would
+    // hand somebody an unmasked destination while the plan still claims the
+    // column is protected. Failing the run is the only safe reading.
+    let (store, _dir) = store().await;
+    let plan = plan_with_masking(&store, vec![MaskRule::email("users", "email")]).await;
+
+    sqlx::query("UPDATE sync_plans SET masking = '{not json' WHERE id = ?1")
+        .bind(plan.id.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let err = store.get_sync_plan(plan.id).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StoreError::Corrupt {
+                field: "masking",
+                ..
+            }
+        ),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn changing_masking_bumps_the_revision() {
+    // A schedule whose masking changed underneath it must be as visible as one
+    // whose table selection did.
+    let (store, _dir) = store().await;
+    let plan = plan_with_masking(&store, Vec::new()).await;
+    assert_eq!(plan.revision, 1);
+
+    let updated = store
+        .set_sync_plan_masking(plan.id, vec![MaskRule::email("users", "email")])
+        .await
+        .unwrap();
+
+    assert_eq!(updated.revision, 2);
+    assert_eq!(updated.masking.len(), 1);
+}
+
+#[tokio::test]
+async fn a_rule_on_a_schema_only_table_is_not_active() {
+    // Nothing reaches the destination, so nothing is exposed — but it is not
+    // the same as a rule that runs, and the two must not read alike.
+    let (store, _dir) = store().await;
+    let plan = plan_with_masking(
+        &store,
+        vec![
+            MaskRule::email("users", "email"),
+            MaskRule::hash("audit_log", "actor"),
+        ],
+    )
+    .await;
+
+    assert_eq!(plan.masking.len(), 2);
+    let active = plan.active_masking();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].table, "users");
 }

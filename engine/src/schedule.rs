@@ -273,6 +273,10 @@ impl Schedule {
             restore: restore.options.clone(),
             verify: self.action.verify,
             deep_verify: self.action.deep_verify,
+            // Taken from the plan, never stored on the schedule: an operator
+            // who adds a masking rule expects every scheduled run of that plan
+            // to pick it up, not just the ones created afterwards.
+            masking: plan.masking.clone(),
             retention: self.action.retention,
             // Never populated. See the module docs: an unattended run has
             // nobody to confirm a destructive restore, so it must not be able
@@ -611,6 +615,7 @@ mod tests {
                 TableSelection::with_data("orders"),
                 TableSelection::schema_only("audit_log"),
             ],
+            masking: vec![crate::mask::MaskRule::email("orders", "buyer_email")],
             revision: 3,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -628,6 +633,23 @@ mod tests {
         assert_eq!(req.common.database, "app");
         assert_eq!(req.common.selections, plan.selections);
         assert_eq!(req.common.output_dir, PathBuf::from("/backups"));
+    }
+
+    #[test]
+    fn masking_rules_reach_a_scheduled_sync_from_the_plan() {
+        // An operator who adds a masking rule to a plan expects the schedule
+        // that has been running for months to start applying it. Storing the
+        // rules on the schedule instead would silently protect only the runs
+        // configured after the rule was written.
+        let mut s = schedule("0 3 * * *", at(0, 0));
+        s.dest_profile_id = Some(Uuid::new_v4());
+        s.action = action(Some(safe_restore()));
+
+        let plan = plan_for(&s);
+        let req = s
+            .sync_request(&plan)
+            .expect("a sync schedule has a request");
+        assert_eq!(req.masking, plan.masking);
     }
 
     #[test]

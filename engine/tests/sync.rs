@@ -234,7 +234,8 @@ db_test! {
                     TableSelection::with_data("orders"),
                     TableSelection::schema_only("audit_log"),
                 ],
-            })
+            masking: Vec::new(),
+        })
             .await
             .unwrap();
 
@@ -288,7 +289,8 @@ db_test! {
                 name: "nightly".into(),
                 database: "app".into(),
                 selections: vec![TableSelection::with_data("orders")],
-            })
+            masking: Vec::new(),
+        })
             .await
             .unwrap();
 
@@ -332,7 +334,8 @@ db_test! {
                 name: "imported".into(),
                 database: "app".into(),
                 selections: parse_tables_conf(conf),
-            })
+            masking: Vec::new(),
+        })
             .await
             .unwrap();
 
@@ -362,6 +365,7 @@ db_test! {
             restore: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
             verify: true,
             deep_verify: false,
+            masking: Vec::new(),
             retention: None,
             typed_confirmation: None,
         };
@@ -424,6 +428,7 @@ db_test! {
             restore: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
             verify: true,
             deep_verify: false,
+            masking: Vec::new(),
             retention: Some(RetentionPolicy {
                 keep_last: Some(1),
                 max_age_days: None,
@@ -479,6 +484,7 @@ db_test! {
             restore: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
             verify: false,
             deep_verify: false,
+            masking: Vec::new(),
             retention: None,
             typed_confirmation: None,
         };
@@ -525,6 +531,7 @@ db_test! {
             restore: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
             verify: false,
             deep_verify: false,
+            masking: Vec::new(),
             retention: None,
             typed_confirmation: None,
         };

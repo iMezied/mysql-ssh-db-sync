@@ -24,6 +24,7 @@ pub mod exec;
 pub mod job;
 pub mod library;
 pub mod manifest;
+pub mod mask;
 pub mod notify;
 pub mod ops;
 pub mod paths;

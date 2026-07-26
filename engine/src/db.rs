@@ -551,6 +551,115 @@ impl Introspector for PostgresIntrospector {
     }
 }
 
+/// A statement and the values bound into its placeholders.
+///
+/// Values are always bound, never interpolated. Identifiers cannot be bound in
+/// SQL, so those go through [`quote_mysql_ident`] / [`quote_pg_ident`] instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Statement {
+    pub sql: String,
+    pub binds: Vec<String>,
+}
+
+/// Run write statements in order, on one connection.
+///
+/// Returns the rows each statement affected. Sharing a connection matters: the
+/// alternative dials the destination once per statement, and through an SSH
+/// tunnel that is the dominant cost of masking a database.
+///
+/// Not on [`Introspector`], which is documented as read-only catalog access —
+/// keeping writes out of the read trait means nothing acquires the ability to
+/// modify data by accident.
+pub async fn execute_batch(
+    params: &ConnectParams,
+    statements: &[Statement],
+) -> Result<Vec<u64>, DbError> {
+    let mut affected = Vec::with_capacity(statements.len());
+
+    match params.engine {
+        Engine::Mysql => {
+            let introspector = MysqlIntrospector::connect(params).await?;
+            for statement in statements {
+                let mut q = sqlx::query(&statement.sql);
+                for bind in &statement.binds {
+                    q = q.bind(bind);
+                }
+                let result = q
+                    .execute(&introspector.pool)
+                    .await
+                    .map_err(|e| DbError::Query(format!("executing statement: {e}")))?;
+                affected.push(result.rows_affected());
+            }
+            introspector.pool.close().await;
+        }
+        Engine::Postgres => {
+            let introspector = PostgresIntrospector::connect(params).await?;
+            for statement in statements {
+                let mut q = sqlx::query(&statement.sql);
+                for bind in &statement.binds {
+                    q = q.bind(bind);
+                }
+                let result = q
+                    .execute(&introspector.pool)
+                    .await
+                    .map_err(|e| DbError::Query(format!("executing statement: {e}")))?;
+                affected.push(result.rows_affected());
+            }
+            introspector.pool.close().await;
+        }
+    }
+
+    Ok(affected)
+}
+
+/// Run queries that each return one row of integers.
+///
+/// The shape masking's read-back needs: one `SELECT` per table projecting a
+/// count per masked column.
+pub async fn fetch_count_rows(
+    params: &ConnectParams,
+    queries: &[Statement],
+) -> Result<Vec<Vec<i64>>, DbError> {
+    let mut out = Vec::with_capacity(queries.len());
+
+    macro_rules! run {
+        ($pool:expr) => {{
+            for query in queries {
+                let mut raw = sqlx::query(&query.sql);
+                for bind in &query.binds {
+                    raw = raw.bind(bind);
+                }
+                let row = raw
+                    .fetch_one($pool)
+                    .await
+                    .map_err(|e| DbError::Query(format!("reading counts: {e}")))?;
+                let mut counts = Vec::new();
+                for i in 0..row.len() {
+                    counts.push(row.try_get::<i64, _>(i).map_err(|e| {
+                        DbError::Query(format!("count {i} was not an integer: {e}"))
+                    })?);
+                }
+                out.push(counts);
+            }
+        }};
+    }
+
+    match params.engine {
+        Engine::Mysql => {
+            let introspector = MysqlIntrospector::connect(params).await?;
+            run!(&introspector.pool);
+            introspector.pool.close().await;
+        }
+        Engine::Postgres => {
+            let introspector = PostgresIntrospector::connect(params).await?;
+            run!(&introspector.pool);
+            introspector.pool.close().await;
+        }
+    }
+
+    Ok(out)
+}
+
 /// Run a statement that returns nothing.
 ///
 /// Deliberately narrow and deliberately not on [`Introspector`], which is

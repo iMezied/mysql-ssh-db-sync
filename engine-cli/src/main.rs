@@ -75,6 +75,12 @@ enum Command {
         #[arg(long)]
         keep_on_failure: bool,
     },
+    /// Manage the masking rules on a sync plan.
+    ///
+    /// Masking rewrites columns on the destination after a sync restores them.
+    /// It does not touch the backup artifact, which still holds the real data.
+    #[command(subcommand)]
+    Mask(MaskCommand),
     /// Manage the backup encryption key.
     #[command(subcommand)]
     Key(KeyCommand),
@@ -115,6 +121,63 @@ enum KeyCommand {
     /// Pass `age1...` public keys. Passing none clears the list; the
     /// installation's own key is always included regardless.
     Recipients { keys: Vec<String> },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum TransformArg {
+    /// Salted SHA-256, hex. NULL stays NULL.
+    Hash,
+    /// A deterministic address at example.invalid. NULL stays NULL.
+    Email,
+    /// A deterministic number in the reserved 555 range. NULL stays NULL.
+    Phone,
+    /// Every row set to NULL. Fails on a NOT NULL column.
+    Null,
+    /// Every row set to `--value`, NULLs included.
+    Constant,
+}
+
+#[derive(Subcommand)]
+enum MaskCommand {
+    /// Show the masking rules on a plan.
+    List {
+        /// Plan id, or a unique prefix of its name.
+        plan: String,
+    },
+    /// Add or replace a rule for one column.
+    Add {
+        /// Plan id, or a unique prefix of its name.
+        plan: String,
+        /// Table name as the plan spells it. For PostgreSQL this may be
+        /// `schema.table`; a bare name means `public`.
+        table: String,
+        column: String,
+        #[arg(long, value_enum)]
+        transform: TransformArg,
+        /// Replacement value, required by `--transform constant`.
+        #[arg(long)]
+        value: Option<String>,
+        /// Truncate a hash to this many hex characters.
+        #[arg(long)]
+        length: Option<u16>,
+    },
+    /// Drop the rule for one column.
+    Remove {
+        /// Plan id, or a unique prefix of its name.
+        plan: String,
+        table: String,
+        column: String,
+    },
+    /// Print the SQL a masking run would send to the destination.
+    ///
+    /// For review before a first run, and for answering "what exactly did this
+    /// do to my data" afterwards. The salt and any constants appear as bound
+    /// placeholders, never as literals, so the output is safe to paste into a
+    /// ticket.
+    Sql {
+        /// Plan id, or a unique prefix of its name.
+        plan: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -255,6 +318,12 @@ async fn main() -> Result<()> {
         } => {
             let store = Store::open(&store_path).await?;
             let result = run_drill(&store, &profile, dir, deep, keep_on_failure, cli.json).await;
+            store.close().await;
+            result?;
+        }
+        Command::Mask(cmd) => {
+            let store = Store::open(&store_path).await?;
+            let result = run_mask_command(cmd, &store, cli.json).await;
             store.close().await;
             result?;
         }
@@ -499,6 +568,171 @@ async fn run_key_command(cmd: KeyCommand, store: &Store) -> Result<()> {
 }
 
 // ── Schedules ───────────────────────────────────────────────────────────
+
+// ── Masking ─────────────────────────────────────────────────────────────
+
+/// Find a sync plan by id, or by a unique prefix of its name.
+///
+/// Plans are stored per profile and there is no global list, so this walks
+/// them. Ambiguity is reported rather than guessed at: picking the wrong plan
+/// here means masking the wrong columns.
+async fn resolve_plan(store: &Store, needle: &str) -> Result<db_sync_engine::plan::SyncPlan> {
+    let mut all = Vec::new();
+    for profile in store.list_profiles().await? {
+        all.extend(store.list_sync_plans(profile.id).await?);
+    }
+
+    if let Ok(id) = Uuid::parse_str(needle) {
+        return all
+            .into_iter()
+            .find(|p| p.id == id)
+            .with_context(|| format!("no sync plan with id {id}"));
+    }
+
+    let lowered = needle.to_lowercase();
+    let matches: Vec<_> = all
+        .iter()
+        .filter(|p| p.name.to_lowercase().starts_with(&lowered))
+        .collect();
+
+    match matches.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => bail!("no sync plan matches {needle:?}"),
+        many => {
+            let names: Vec<&str> = many.iter().map(|p| p.name.as_str()).collect();
+            bail!("{needle:?} matches several plans: {}", names.join(", "))
+        }
+    }
+}
+
+async fn run_mask_command(cmd: MaskCommand, store: &Store, json: bool) -> Result<()> {
+    use db_sync_engine::mask::{MaskRule, MaskTransform};
+
+    match cmd {
+        MaskCommand::List { plan } => {
+            let plan = resolve_plan(store, &plan).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&plan.masking)?);
+                return Ok(());
+            }
+
+            if plan.masking.is_empty() {
+                eprintln!("{}: no masking rules", plan.name);
+                return Ok(());
+            }
+
+            let active = plan.active_masking();
+            for rule in &plan.masking {
+                // A rule on a table the plan does not copy with data protects
+                // nothing, because nothing reaches the destination. Safe, but
+                // it almost always means the plan and the rules have drifted.
+                let mark = if active.contains(&rule) { " " } else { "!" };
+                println!(
+                    "{mark} {}.{}  {}",
+                    rule.table,
+                    rule.column,
+                    rule.transform.describe()
+                );
+            }
+            if active.len() != plan.masking.len() {
+                eprintln!(
+                    "\n! = the plan does not copy that table with data, so the rule will not run"
+                );
+            }
+            eprintln!("\nThe backup artifact is NOT masked; only the destination is.");
+        }
+
+        MaskCommand::Add {
+            plan,
+            table,
+            column,
+            transform,
+            value,
+            length,
+        } => {
+            let transform = match transform {
+                TransformArg::Hash => MaskTransform::Hash { length },
+                TransformArg::Email => MaskTransform::Email,
+                TransformArg::Phone => MaskTransform::Phone,
+                TransformArg::Null => MaskTransform::Null,
+                TransformArg::Constant => MaskTransform::Constant {
+                    value: value.context("--transform constant needs --value")?,
+                },
+            };
+
+            let plan = resolve_plan(store, &plan).await?;
+            let mut rules = plan.masking.clone();
+            // Replace rather than duplicate: two rules on one column would be
+            // refused at run time, and "add" reading as "edit" is what anyone
+            // typing this twice expects.
+            rules.retain(|r| !(r.table == table && r.column == column));
+            rules.push(MaskRule {
+                table: table.clone(),
+                column: column.clone(),
+                transform: transform.clone(),
+            });
+
+            let updated = store.set_sync_plan_masking(plan.id, rules).await?;
+            eprintln!(
+                "{}: {table}.{column} will be {} (revision {})",
+                updated.name,
+                transform.describe(),
+                updated.revision
+            );
+        }
+
+        MaskCommand::Remove {
+            plan,
+            table,
+            column,
+        } => {
+            let plan = resolve_plan(store, &plan).await?;
+            let mut rules = plan.masking.clone();
+            let before = rules.len();
+            rules.retain(|r| !(r.table == table && r.column == column));
+            if rules.len() == before {
+                bail!("{} has no masking rule for {table}.{column}", plan.name);
+            }
+
+            let updated = store.set_sync_plan_masking(plan.id, rules).await?;
+            eprintln!(
+                "{}: {table}.{column} is no longer masked (revision {})",
+                updated.name, updated.revision
+            );
+        }
+
+        MaskCommand::Sql { plan } => {
+            let plan = resolve_plan(store, &plan).await?;
+            let profile = store.require_profile(plan.profile_id).await?;
+
+            let active: Vec<MaskRule> = plan.active_masking().into_iter().cloned().collect();
+            if active.is_empty() {
+                eprintln!("{}: no masking rules would run", plan.name);
+                return Ok(());
+            }
+
+            // A placeholder, not the real salt: this output is meant to be
+            // shareable, and the salt is the one value that must not be.
+            let updates = db_sync_engine::mask::update_statements(
+                profile.engine,
+                &active,
+                "<salt bound at run time>",
+            )?;
+            let checks = db_sync_engine::mask::check_statements(profile.engine, &active)?;
+
+            println!("-- masking, applied to the destination after the restore");
+            for u in &updates {
+                println!("{};", u.statement.sql);
+            }
+            println!("\n-- read-back; every count must be zero or the sync aborts");
+            for c in &checks {
+                println!("{};", c.statement.sql);
+            }
+        }
+    }
+
+    Ok(())
+}
 
 /// Find a schedule by id or by a unique prefix of its name.
 ///

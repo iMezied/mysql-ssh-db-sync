@@ -476,7 +476,7 @@ fn row_to_job(row: sqlx::sqlite::SqliteRow) -> Result<JobRecord> {
 impl Store {
     pub async fn list_sync_plans(&self, profile_id: Uuid) -> Result<Vec<SyncPlan>> {
         let rows = sqlx::query(
-            "SELECT id, profile_id, name, database_name, table_selections, revision, \
+            "SELECT id, profile_id, name, database_name, table_selections, masking, revision, \
              created_at, updated_at FROM sync_plans WHERE profile_id = ?1 ORDER BY name",
         )
         .bind(profile_id.to_string())
@@ -488,7 +488,7 @@ impl Store {
 
     pub async fn get_sync_plan(&self, id: Uuid) -> Result<Option<SyncPlan>> {
         let row = sqlx::query(
-            "SELECT id, profile_id, name, database_name, table_selections, revision, \
+            "SELECT id, profile_id, name, database_name, table_selections, masking, revision, \
              created_at, updated_at FROM sync_plans WHERE id = ?1",
         )
         .bind(id.to_string())
@@ -506,6 +506,7 @@ impl Store {
             name: input.name,
             database: input.database,
             selections: input.selections,
+            masking: input.masking,
             revision: 1,
             created_at: now,
             updated_at: now,
@@ -513,13 +514,15 @@ impl Store {
 
         sqlx::query(
             "INSERT INTO sync_plans (id, profile_id, name, database_name, table_selections, \
-             revision, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             masking, revision, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )
         .bind(plan.id.to_string())
         .bind(plan.profile_id.to_string())
         .bind(&plan.name)
         .bind(&plan.database)
         .bind(serde_json::to_string(&plan.selections).map_err(|e| corrupt("table_selections", e))?)
+        .bind(serde_json::to_string(&plan.masking).map_err(|e| corrupt("masking", e))?)
         .bind(plan.revision)
         .bind(plan.created_at.to_rfc3339())
         .bind(plan.updated_at.to_rfc3339())
@@ -553,6 +556,39 @@ impl Store {
         )
         .bind(plan.id.to_string())
         .bind(serde_json::to_string(&plan.selections).map_err(|e| corrupt("table_selections", e))?)
+        .bind(plan.revision)
+        .bind(plan.updated_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(plan)
+    }
+
+    /// Replace a plan's masking rules, bumping its revision.
+    ///
+    /// Separate from [`Store::update_sync_plan`] because the two are edited in
+    /// different places and for different reasons — and because bumping the
+    /// revision here is the point: a schedule whose masking changed underneath
+    /// it must be as visible as one whose table selection did.
+    pub async fn set_sync_plan_masking(
+        &self,
+        id: Uuid,
+        masking: Vec<crate::mask::MaskRule>,
+    ) -> Result<SyncPlan> {
+        let mut plan = self
+            .get_sync_plan(id)
+            .await?
+            .ok_or(StoreError::SyncPlanNotFound(id))?;
+
+        plan.masking = masking;
+        plan.revision += 1;
+        plan.updated_at = Utc::now();
+
+        sqlx::query(
+            "UPDATE sync_plans SET masking = ?2, revision = ?3, updated_at = ?4 WHERE id = ?1",
+        )
+        .bind(plan.id.to_string())
+        .bind(serde_json::to_string(&plan.masking).map_err(|e| corrupt("masking", e))?)
         .bind(plan.revision)
         .bind(plan.updated_at.to_rfc3339())
         .execute(&self.pool)
@@ -860,6 +896,7 @@ fn row_to_schedule(row: sqlx::sqlite::SqliteRow) -> Result<Schedule> {
 
 fn row_to_plan(row: sqlx::sqlite::SqliteRow) -> Result<SyncPlan> {
     let selections_raw: String = row.get("table_selections");
+    let masking_raw: String = row.get("masking");
 
     Ok(SyncPlan {
         id: parse_uuid(&row.get::<String, _>("id"), "id")?,
@@ -868,6 +905,10 @@ fn row_to_plan(row: sqlx::sqlite::SqliteRow) -> Result<SyncPlan> {
         database: row.get("database_name"),
         selections: serde_json::from_str(&selections_raw)
             .map_err(|e| corrupt("table_selections", e))?,
+        // Corrupt masking rules are an error, never an empty list: silently
+        // reading them as "no masking" would hand somebody an unmasked
+        // destination while the plan still says the column is protected.
+        masking: serde_json::from_str(&masking_raw).map_err(|e| corrupt("masking", e))?,
         revision: row.get::<i64, _>("revision").max(0) as u32,
         created_at: parse_ts(&row.get::<String, _>("created_at"), "created_at")?,
         updated_at: parse_ts(&row.get::<String, _>("updated_at"), "updated_at")?,

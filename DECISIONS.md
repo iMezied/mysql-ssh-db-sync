@@ -944,3 +944,113 @@ is not Slack, and a test says so.
 The chat payloads carry the same guarantee as the raw one — profile names, no
 hosts, ports, credentials or paths — restated as its own test, because these
 are the shapes that actually get pasted into a shared channel.
+
+## M9 — Masking runs on the destination, and the artifact is not masked
+
+`mysqldump` and `pg_dump` cannot apply an expression to a column. There is no
+flag, and no combination of flags, that makes either of them emit
+`sha256(email)` instead of `email`.
+
+That leaves two ways to build masking, and they are not close in risk.
+
+**Write our own dump encoder.** Read rows over sqlx, apply the transform in
+Rust, emit `INSERT` statements. This is the only design where the artifact
+itself is masked. It is also the design where we hand-roll literal encoding for
+every column type in two engines — binary, `SET`, `ENUM`, arrays, `JSONB`,
+timestamps with and without zone, every character set. A bug there does not
+produce a masking failure. It produces a dump that restores cleanly into a
+corrupted database, which is the failure mode this project has spent its whole
+history trying to eliminate.
+
+**Ask the destination server to transform its own data.** One `UPDATE` per
+table after the restore lands. The server owns type fidelity, as it already
+does for every other value it stores. Nothing in this crate has to know what a
+`GEOMETRY` column is.
+
+We took the second. The cost is stated everywhere it could matter — module
+docs, README, CLI output: **masking protects the destination, not the backup
+file.** An artifact from a masked sync is exactly as sensitive as the source.
+That is a real limitation and it is not hidden behind a reassuring word like
+"secure".
+
+### Either the destination is masked, or it does not exist
+
+A masking `UPDATE` reporting success is not evidence that a column is
+unreadable. A silent truncation on a column too narrow for the hash, a trigger
+that rewrites the row, a coercion that discards the expression — none of those
+raise an error. Masking that trusts its own `UPDATE` is a feature that reports
+success while leaking.
+
+So every run is followed by a read-back: one query per table counting rows that
+do not have the masked shape. If any count is non-zero, if the masking
+statements fail, or if the read-back itself cannot run, the caller **drops the
+destination database** and fails the sync.
+
+The alternative — leaving a half-masked database in place with a warning — is
+the worst available outcome. It looks finished. Someone believes it. Dropping a
+dev database is an inconvenience that is fixed by re-running; a dev database
+that silently contains real customer data is a breach nobody knows about.
+
+That guarantee is why masking refuses `IntoExisting` naming. Honouring "or it
+does not exist" would mean dropping a database this sync never created.
+
+### Rules are checked against the source before the backup starts
+
+A rule naming `users.email` when the column is really `email_address` protects
+nothing, and nothing else in the system would notice. The check runs against
+the source schema before a single byte is dumped, because that is the only
+point where the remedy is editing a rule rather than dropping a database
+someone may already be using.
+
+A rule on a table the plan does not copy with data is *reported, not fatal*.
+Nothing reaches the destination, so nothing is exposed — but it almost always
+means the plan and the rules have drifted apart, so it is surfaced (`!` in
+`dbsync mask list`) rather than silently accepted.
+
+A table that cannot be introspected is treated as unknown and stops the run.
+"We could not look" is not "the column is fine".
+
+### Deterministic, and honest about what that means
+
+The same input produces the same output in every table and on every run. That
+is not a nicety: without it `users.email` and `orders.billing_email` no longer
+join, and a masked copy stops being usable for the thing dev databases are for.
+It also keeps pseudonyms stable across a weekly refresh.
+
+The price is that this is **pseudonymisation, not anonymisation**. Emails,
+phone numbers and names are small, guessable domains; anyone holding both the
+masked data and the salt can confirm a guess by hashing it. Calling this
+"anonymised" would be a lie that someone might rely on in a compliance
+conversation.
+
+The salt is what separates those two situations, so it never reaches the
+destination. It is stored in the operator's local app database and bound as a
+query parameter, never interpolated. What is bound is also not the stored
+secret but `sha256("dbsync/masking/v1\0" || secret)` — the destination's query
+log is read by more people than the app database is, and a one-way function of
+the secret is what should appear there.
+
+Consequences of stability worth knowing: the salt is generated once and never
+rotated automatically, because rotating it changes every pseudonym in every
+destination at once.
+
+### Masked tables are not deep-verified
+
+Their contents differ from the source by design, so digesting them would report
+the feature working as corruption. They are recorded as *not compared* — the
+same as any table that cannot be digested for any other reason. Deliberately
+not "passed": masking must not become a way for a genuinely broken table to
+report success. Columns are still compared, because masking changes values and
+never shape.
+
+### Rules live on the plan, not the schedule
+
+They describe the data, not the timing. An operator who adds a rule expects the
+schedule that has been running for months to start applying it; storing rules
+on the schedule would protect only the runs configured after the rule was
+written. Changing them bumps the plan revision, so a schedule whose masking
+moved underneath it is as visible as one whose table selection did.
+
+Corrupt masking JSON is a `StoreError::Corrupt`, never an empty list. Reading
+unparseable rules as "no masking" would hand somebody an unmasked destination
+while the plan still claims the column is protected.
