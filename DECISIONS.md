@@ -841,3 +841,65 @@ there is somewhere to publish to.
 `ubuntu-22.04`, not `ubuntu-latest`. An AppImage linked against a newer glibc
 will not start on an older distribution, and there is no runtime fix — only
 building on the oldest base you intend to support.
+
+## CI — running the suites that touch real credentials
+
+### The credential-touching suites now run in CI
+
+Twenty-two tests — every backup, restore, verification and scheduled run
+against real servers — were `#[ignore]`d because they need an OS credential
+store, and a headless runner has none. That meant the tests proving the app's
+central claim never ran anywhere except a developer's laptop.
+
+`gnome-keyring` inside `dbus-run-session` provides a Secret Service, and
+`--include-ignored` runs them.
+
+**The keyring password must be non-empty.** With an empty one gnome-keyring
+starts, answers on the bus, and then fails every write with
+`NoStorageAccess(NoResult)` because no default collection was created. It reads
+exactly like a permissions problem and is not. Three initialisation recipes
+were tried in an `ubuntu:24.04` container; only a non-empty password passed.
+
+### PostgreSQL clients come from PGDG, not from Ubuntu
+
+`pg_dump` refuses outright to read a server newer than itself —
+`check_pg_dump_compatibility` returns `Blocked`, by design. The fixture is
+`postgres:18` and Ubuntu ships a client several majors behind, so enabling the
+ignored suites with the distribution package would have failed every
+PostgreSQL round-trip immediately. The repository is added and
+`postgresql-client-18` installed explicitly, with the codename taken from
+`lsb_release -cs` so a runner-image bump does not silently pin the wrong one.
+
+### The fixtures job builds only the crates it exercises
+
+It ran `cargo test --workspace` without installing the GTK and webview
+development packages, so it could not build the desktop crate at all — proven
+by reproducing the failure in a container. Scoping it to `db-sync-engine` and
+`db-sync-cli` fixes it without adding minutes of dependency installation for a
+crate the `rust` job already builds and tests on all three platforms.
+
+### CI changes are verified in a container first
+
+The whole of the above was developed against a local `ubuntu:24.04` image
+mirroring the runner, with the fixture stack reachable over the host network
+and the Docker socket mounted so the tests' `docker exec` assertions work.
+Committing an unverifiable CI change and iterating through red builds is slower
+and leaves a worse history.
+
+### The bundled CLI is declared in an overlay config, not the base
+
+`externalBin` is validated by `tauri-build`, which runs on every `cargo build`,
+`cargo test` and `cargo clippy` of the desktop crate — not only when bundling.
+With it in `tauri.conf.json`, all of those fail with `resource path ... doesn't
+exist` until someone has run `npm run bundle:cli`, which breaks the ordinary
+developer loop and two CI jobs that have no reason to compile the CLI.
+`bundle.resources` behaves identically; it is not specific to `externalBin`.
+
+This was caught by a plain `cargo test --workspace` failing *after* the staged
+binary was cleaned up — the earlier verification had passed only because the
+directory happened to still be there from an earlier bundle. Worth recording:
+a build that depends on a leftover artifact looks exactly like a build that
+works.
+
+`tauri.bundle.conf.json` carries the one line, and `npm run bundle` stages the
+CLI and applies the overlay in a single command that cannot forget either step.

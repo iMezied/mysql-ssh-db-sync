@@ -5,7 +5,7 @@
   "identifier": "com.dbsync-studio.app",
   "build": {
     "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build && npm run bundle:cli",
+    "beforeBuildCommand": "npm run build",
     "devUrl": "http://localhost:1420",
     "frontendDist": "../dist"
   },
@@ -27,7 +27,7 @@
     "active": true,
     "targets": "all",
     "publisher": "DBSync Studio",
-    "copyright": "Copyright © 2026 DBSync Studio contributors",
+    "copyright": "Copyright \u00a9 2026 DBSync Studio contributors",
     "category": "DeveloperTool",
     "shortDescription": "Database backup, restore and cross-server sync",
     "longDescription": "Back up, restore and sync MySQL and PostgreSQL databases across servers over SSH tunnels, with exact row-count verification, retention policies and unattended schedules.",
@@ -38,7 +38,6 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": ["binaries/dbsync"],
     "macOS": {
       "minimumSystemVersion": "10.15",
       "entitlements": "entitlements.plist"
@@ -49,7 +48,9 @@
       },
       "nsis": {
         "installMode": "perMachine",
-        "languages": ["English"]
+        "languages": [
+          "English"
+        ]
       }
     },
     "linux": {
@@ -61,7 +62,11 @@
         ]
       },
       "rpm": {
-        "depends": ["webkit2gtk4.1", "gtk3", "libappindicator-gtk3"]
+        "depends": [
+          "webkit2gtk4.1",
+          "gtk3",
+          "libappindicator-gtk3"
+        ]
       }
     },
     "createUpdaterArtifacts": false

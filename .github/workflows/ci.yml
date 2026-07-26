@@ -107,12 +107,30 @@ jobs:
 
       # The engine shells out to these; they are never bundled (GPL applies to
       # mysqldump — see DECISIONS.md), so CI installs them as a user would.
-      # The PostgreSQL client major version must match the fixture server: a
-      # newer pg_dump emits directives an older server rejects on restore.
-      - name: Install database client tools
+      #
+      # PostgreSQL comes from PGDG, not from Ubuntu. `pg_dump` refuses outright
+      # to read a server newer than itself, and Ubuntu ships a client several
+      # majors behind the `postgres:18` fixture — so the distribution package
+      # would block every PostgreSQL round-trip test.
+      #
+      # gnome-keyring provides the Secret Service the engine stores database
+      # passwords in. Without it the credential-touching suites cannot run at
+      # all, which is what kept them out of CI until now.
+      - name: Install database client tools and a credential store
         run: |
           sudo apt-get update
-          sudo apt-get install -y mysql-client postgresql-client
+          sudo apt-get install -y mysql-client gnome-keyring dbus-x11
+
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-18
+
+          pg_dump --version
+          mysqldump --version
 
       - name: Build CLI
         run: cargo build -p db-sync-cli
@@ -126,8 +144,26 @@ jobs:
       - name: Verify DEFINER round-trip
         run: tests/verify-definer-roundtrip.sh
 
-      - name: Integration suites (tunnel, introspection, end-to-end)
-        run: cargo test --workspace
+      # `--include-ignored` is the point of this step: the suites that dump,
+      # restore, verify and run schedules against real servers are `#[ignore]`d
+      # because they need a credential store, and until now that meant they
+      # never ran anywhere.
+      #
+      # The keyring password must be NON-EMPTY. An empty one leaves
+      # gnome-keyring without a default collection, and every secret write
+      # fails with `NoStorageAccess` — which reads like a permissions problem
+      # and is not. Verified in an ubuntu:24.04 container before committing.
+      #
+      # Scoped to the two crates that talk to databases. The desktop crate is
+      # built and tested in the `rust` job, which installs the GTK and webview
+      # development packages; pulling those in here purely to compile a crate
+      # this job does not exercise would add minutes for nothing.
+      - name: Integration suites (tunnel, introspection, end-to-end, schedules)
+        run: |
+          dbus-run-session -- bash -c '
+            echo -n "dbsync-ci" | gnome-keyring-daemon --unlock > /dev/null
+            cargo test -p db-sync-engine -p db-sync-cli -- --include-ignored
+          '
         env:
           # Turn a "containers not running" skip into a failure, so a broken
           # harness cannot look like a green build forever.

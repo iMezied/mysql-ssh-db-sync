@@ -278,15 +278,23 @@ failed webhook is logged against the job but never fails the run.
 
 ```bash
 cd apps/desktop
-npm run tauri build                 # everything for this platform
-npm run tauri build -- --bundles app,dmg
+npm run bundle                      # everything for this platform
+npm run bundle -- --bundles app,dmg
 ```
 
-`beforeBuildCommand` builds the frontend **and** compiles `dbsync` into
-`src-tauri/binaries/`, so the CLI ships inside the bundle. On macOS it lands in
-`DBSync Studio.app/Contents/MacOS/dbsync`, next to the GUI binary — Settings →
-*Command-line tool* links it into `~/.local/bin` so a terminal and `cron` can
-find it.
+Use `npm run bundle`, not `npm run tauri build`. It compiles `dbsync`, stages
+it, and applies [`tauri.bundle.conf.json`](apps/desktop/src-tauri/tauri.bundle.conf.json)
+— the overlay that puts the CLI inside the app. A plain `tauri build` produces
+a working app *without* it.
+
+The overlay exists because `externalBin` is validated by `tauri-build`, which
+runs on every `cargo build`, `cargo test` and `cargo clippy` of the desktop
+crate; in the base config it makes all of them fail until the CLI has been
+staged. [The details are next to the config.](apps/desktop/src-tauri/README.md)
+
+On macOS the CLI lands in `DBSync Studio.app/Contents/MacOS/dbsync`, next to
+the GUI binary — Settings → *Command-line tool* links it into `~/.local/bin` so
+a terminal and `cron` can find it.
 
 That matters because every schedule offers a crontab line, and `cron` runs with
 a bare `PATH`. The generated line uses an absolute path to whichever `dbsync`
@@ -386,13 +394,31 @@ The PostgreSQL equivalent covers all three dump formats and selective restore:
 cargo test -p db-sync-engine --test roundtrip_pg -- --ignored
 ```
 
-Keychain tests touch the real OS credential store, so they are `#[ignore]`d —
-CI runners have no unlocked keychain. Run them locally after changing anything
-credential related:
+Keychain tests touch the real OS credential store, so they are `#[ignore]`d:
 
 ```bash
 cargo test -p db-sync-engine --test keychain -- --ignored
 ```
+
+To run **everything**, ignored suites included — which is what CI does:
+
+```bash
+docker compose -f docker-compose.test.yml up -d --wait
+cargo test --workspace -- --include-ignored
+```
+
+On Linux that needs a Secret Service, which a headless runner has to be given:
+
+```bash
+dbus-run-session -- bash -c '
+  echo -n "some-password" | gnome-keyring-daemon --unlock
+  cargo test --workspace -- --include-ignored
+'
+```
+
+The password must be **non-empty**. An empty one leaves gnome-keyring without a
+default collection and every secret write fails with `NoStorageAccess`, which
+looks like a permissions problem and is not.
 
 Scheduler behaviour that needs no database server — a schedule whose
 destination profile was deleted, a plan that cannot run, the one-run-at-a-time
