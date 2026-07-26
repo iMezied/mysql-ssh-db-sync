@@ -1286,3 +1286,66 @@ listing a bucket proves the endpoint resolves, the credential is valid and the
 bucket exists. It does not prove the credential can *write*. "Test passed"
 invites the opposite reading, so the sentence that follows it removes the
 invitation.
+
+## Restore was fully built and unreachable
+
+The engine's restore path had been complete and tested since M2′/M3′:
+`ops::restore`, both engine workers, target naming, typed confirmation,
+checksum verification, DEFINER stripping. The Tauri command was registered.
+And no user could run one.
+
+`RestorePage.tsx` was an 18-line stub whose milestone note said executing a
+restore "waits on connectivity" — connectivity landed at M1′, six milestones
+earlier. `engine-cli` had no `restore` subcommand. The only ways to reach the
+code were `sync`, which takes its own backup first, and `drill`, which restores
+into a scratch database and immediately drops it.
+
+So the sidebar had a Restore item, the page claimed the feature was
+implemented, and the thing a user actually needs at 3am on a bad day was not
+there. This is the same shape as every other finding in this project — code
+that claims something it does not do — except that here nothing was wrong with
+the code. What was wrong was the belief that it was finished.
+
+`dbsync backup` was missing for the same reason and got added alongside it: the
+CLI's own module doc says it "exists so that scheduled/CI runs have exactly the
+same capabilities as the GUI", which was not true while the GUI could take a
+backup and the CLI could only do so through a schedule.
+
+Two deliberate differences between the CLI and the GUI:
+
+- **`dbsync backup` dumps every table with its data by default.** The GUI shows
+  a table list and defaults everything to schema-only, because the user is
+  looking at it and can promote what matters. A cron line cannot ask, and a
+  backup that quietly dumped only schemas would be a file that looks right and
+  restores an empty database.
+- **`dbsync restore` defaults to a new timestamped database.** The strategy that
+  cannot destroy anything is the one you get for free. `target_naming` also
+  resolves an ambiguous set of flags to that strategy rather than to
+  `DropAndRecreate` — clap refuses two target flags today, and if that ever
+  stops being true the fallback must not be a DROP.
+
+## Restore target problems are caught before either tool starts
+
+Both engines issue a plain `CREATE DATABASE` — never `IF NOT EXISTS`. That is
+load-bearing: a "new database" restore that quietly merged into somebody else's
+would be the worst outcome available, so the collision *is* caught. It is just
+not caught usefully. What comes back is `psql failed with exit status: 1`, with
+the real reason on a separate stderr line — a poor thing to read at 3am and a
+poor thing to show in a job list.
+
+`ops::restore` now checks the resolved target against the server's database
+list first, on a connection it has already opened, and refuses two ordinary
+mistakes by name:
+
+- **A generated name that already exists.** The timestamp has one-second
+  resolution, so two restores in the same second collide. The second one is not
+  wrong; it needs a moment, and the error says so.
+- **`IntoExisting` naming a database that is not there.** Nothing creates it for
+  that strategy, so the dump streams at nothing.
+
+A server that will not list its databases is *not* a reason to refuse a restore
+that might work. The check exists to improve an error, not to become a new way
+to fail, so an unreadable list logs a warning and carries on.
+
+This was found by running the CLI twice in a row against a real PostgreSQL
+container, not by reading the code.

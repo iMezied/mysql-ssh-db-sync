@@ -232,6 +232,10 @@ Every schedule offers a `crontab` line, and `dbsync` runs the identical code
 path the app does:
 
 ```bash
+dbsync backup prod                  # dump everything, honouring destinations
+dbsync backup prod --schema-only audit_log --exclude sessions
+dbsync restore staging backup.sql.gz          # into a new timestamped database
+dbsync restore staging backup.sql.gz --replace dev_app --confirm dev_app
 dbsync key generate                 # create the backup encryption key
 dbsync key export > key.txt         # required before any encrypted backup
 dbsync key recipients age1... age1... # let teammates decrypt future backups
@@ -243,6 +247,17 @@ dbsync schedule tick                # run whatever is due, then exit
 dbsync schedule crontab nightly     # a line for system cron, plus the caveats
 dbsync daemon                       # the scheduler loop, headless
 ```
+
+`dbsync backup` dumps every table **with its data** unless told otherwise —
+the opposite of the GUI, which shows a table list and asks. A cron line cannot
+ask, and a backup that silently dumped only schemas would be a file that looks
+right and restores an empty database.
+
+`dbsync restore` defaults to a new timestamped database, which cannot destroy
+anything. `--replace` and `--into` can, and the engine requires `--confirm`
+with the exact target name — for `--replace` always, and for `--into` when the
+connection is tagged production. The check happens before any connection is
+opened, so a missing confirmation costs nothing.
 
 Pause the schedule in the app first, or both will run it. Cron reads the
 expression in **local time** regardless of the schedule's setting, runs with a

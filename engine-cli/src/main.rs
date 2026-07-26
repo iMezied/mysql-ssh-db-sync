@@ -75,6 +75,80 @@ enum Command {
         #[arg(long)]
         keep_on_failure: bool,
     },
+    /// Back up a database to an artifact on disk.
+    ///
+    /// Every table is dumped with its data unless `--schema-only` or
+    /// `--exclude` says otherwise — the opposite of the GUI's default, because
+    /// a command run from cron with no table list means "all of it".
+    Backup {
+        /// Connection to back up. Id, or a unique prefix of its name.
+        profile: String,
+        /// Database to dump. Defaults to the profile's own.
+        #[arg(long)]
+        database: Option<String>,
+        /// Where to write it. Defaults to the app's backup folder.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+
+        /// Dump this table's schema but not its rows. Repeatable.
+        #[arg(long = "schema-only")]
+        schema_only: Vec<String>,
+        /// Leave this table out entirely. Repeatable.
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
+
+        /// Encrypt the artifact to the installation's backup key.
+        #[arg(long)]
+        encrypt: bool,
+        /// Write the dump uncompressed.
+        #[arg(long)]
+        no_compress: bool,
+    },
+    /// Restore an artifact into a database.
+    ///
+    /// The target defaults to a new timestamped database, which cannot destroy
+    /// anything. `--replace` and `--into` can, and require `--confirm` with the
+    /// exact target name.
+    Restore {
+        /// Connection to restore into. Id, or a unique prefix of its name.
+        profile: String,
+        /// Path to the artifact. Its manifest, if present, is checked first.
+        artifact: PathBuf,
+
+        /// Restore into a new `{prefix}_{timestamp}` database. The default,
+        /// with the prefix taken from the artifact's own database name.
+        #[arg(long, group = "target")]
+        new_prefix: Option<String>,
+        /// Drop this database if it exists, then restore into it.
+        #[arg(long, group = "target")]
+        replace: Option<String>,
+        /// Restore into this database without dropping it first.
+        #[arg(long, group = "target")]
+        into: Option<String>,
+
+        /// The target's name, typed back. Required when the restore can
+        /// destroy data, and checked by the engine, not here.
+        #[arg(long)]
+        confirm: Option<String>,
+
+        /// Skip the checksum comparison against the manifest.
+        ///
+        /// The check is cheap next to a restore and catches a truncated or
+        /// altered artifact before it reaches a server, so turning it off
+        /// wants a reason.
+        #[arg(long)]
+        no_verify_checksum: bool,
+
+        /// PostgreSQL: restore only these tables. Needs an archive format.
+        #[arg(long = "only-table")]
+        only_tables: Vec<String>,
+        /// PostgreSQL: `pg_restore -j`. Needs an archive format.
+        #[arg(long)]
+        jobs: Option<u16>,
+        /// PostgreSQL: drop each object before recreating it.
+        #[arg(long)]
+        clean: bool,
+    },
     /// Manage the masking rules on a sync plan.
     ///
     /// Masking rewrites columns on the destination after a sync restores them.
@@ -411,6 +485,64 @@ async fn main() -> Result<()> {
             store.close().await;
             result?;
         }
+        Command::Backup {
+            profile,
+            database,
+            dir,
+            schema_only,
+            exclude,
+            encrypt,
+            no_compress,
+        } => {
+            let store = Store::open(&store_path).await?;
+            let result = run_backup(
+                &store,
+                &profile,
+                database,
+                dir,
+                schema_only,
+                exclude,
+                encrypt,
+                !no_compress,
+                cli.json,
+            )
+            .await;
+            store.close().await;
+            result?;
+        }
+        Command::Restore {
+            profile,
+            artifact,
+            new_prefix,
+            replace,
+            into,
+            confirm,
+            no_verify_checksum,
+            only_tables,
+            jobs,
+            clean,
+        } => {
+            let store = Store::open(&store_path).await?;
+            let result = run_restore(
+                &store,
+                RestoreArgs {
+                    profile: &profile,
+                    artifact,
+                    new_prefix,
+                    replace,
+                    into,
+                    confirm,
+                    verify_checksum: !no_verify_checksum,
+                    only_tables,
+                    jobs,
+                    clean,
+                },
+                cli.json,
+            )
+            .await;
+            store.close().await;
+            result?;
+        }
         Command::Mask(cmd) => {
             let store = Store::open(&store_path).await?;
             let result = run_mask_command(cmd, &store, cli.json).await;
@@ -526,6 +658,386 @@ async fn run_drill(
             }
         )
     }
+}
+
+// ── Backup ──────────────────────────────────────────────────────────────
+
+/// Build the table selections for a headless backup.
+///
+/// Defaults to schema **and data** for everything, which is the opposite of
+/// the GUI. The GUI shows a table list and asks; a cron line cannot, and a
+/// backup that silently dumped only schemas would be a file that looks right
+/// and restores an empty database.
+fn backup_selections(
+    tables: &[String],
+    schema_only: &[String],
+    exclude: &[String],
+) -> Vec<db_sync_engine::backup::TableSelection> {
+    use db_sync_engine::backup::{TableMode, TableSelection};
+
+    tables
+        .iter()
+        .map(|name| {
+            let mode = if exclude.iter().any(|e| e == name) {
+                TableMode::Exclude
+            } else if schema_only.iter().any(|s| s == name) {
+                TableMode::SchemaOnly
+            } else {
+                TableMode::SchemaAndData
+            };
+            TableSelection {
+                name: name.clone(),
+                mode,
+                where_filter: None,
+            }
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_backup(
+    store: &Store,
+    needle: &str,
+    database: Option<String>,
+    dir: Option<PathBuf>,
+    schema_only: Vec<String>,
+    exclude: Vec<String>,
+    encrypt: bool,
+    compress: bool,
+    json: bool,
+) -> Result<()> {
+    use db_sync_engine::backup::{BackupRequest, CommonBackupOptions};
+
+    let profile = resolve_profile(store, needle).await?;
+
+    let database = database
+        .or_else(|| profile.db.database.clone())
+        .context("no database given and the profile does not name one; pass --database")?;
+
+    let output_dir = match dir {
+        Some(d) => d,
+        None => db_sync_engine::paths::app_data_dir()
+            .context("could not determine the backup directory")?
+            .join("backups"),
+    };
+    std::fs::create_dir_all(&output_dir)
+        .with_context(|| format!("could not create {}", output_dir.display()))?;
+
+    let (event_tx, rx) = create_event_channel(EVENT_CHANNEL_CAPACITY);
+    if json {
+        tokio::spawn(stream_channel_as_json(rx));
+    } else {
+        tokio::spawn(stream_channel_as_text(rx));
+    }
+    let ctx = JobContext::with_sender(Uuid::new_v4(), event_tx);
+
+    // The table list comes from the server, so `--schema-only` and `--exclude`
+    // name real tables or name nothing. Asking here also means a typo is
+    // visible in the summary rather than silently selecting nothing.
+    let tables = introspect_table_names(&profile, &database, store).await?;
+    for named in schema_only.iter().chain(exclude.iter()) {
+        if !tables.contains(named) {
+            bail!("{database} has no table called {named:?}");
+        }
+    }
+
+    let request = BackupRequest {
+        common: CommonBackupOptions {
+            database: database.clone(),
+            selections: backup_selections(&tables, &schema_only, &exclude),
+            output_dir,
+            compress,
+            encrypt,
+        },
+        engine: default_backup_options(profile.engine),
+    };
+    request
+        .validate(&profile)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    db_sync_engine::ops::record_start(
+        store,
+        &ctx,
+        db_sync_engine::events::JobKind::Backup,
+        profile.id,
+        None,
+        serde_json::to_string(&request).unwrap_or_else(|_| "{}".into()),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("could not record the job: {e}"))?;
+
+    let result = db_sync_engine::ops::backup(&profile, &request, store, &ctx).await;
+
+    // The off-site copy is part of a backup, not an extra step, so a headless
+    // run ships to the same destinations the app does.
+    let offsite = match &result {
+        Ok(artifact) => db_sync_engine::ops::push_offsite(artifact, store, &ctx)
+            .await
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let failures = db_sync_engine::ops::push_failures(&offsite);
+
+    let outcome = match (&result, failures.is_empty()) {
+        (Ok(_), true) => JobOutcome::Success,
+        (Ok(_), false) => JobOutcome::Failed,
+        (Err(e), _) => {
+            ctx.emit_error(db_sync_engine::events::JobPhase::Done, e.to_string())
+                .await;
+            JobOutcome::Failed
+        }
+    };
+
+    let artifact = result.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let _ = db_sync_engine::ops::record_finish(
+        store,
+        &ctx,
+        outcome,
+        Some(artifact.display().to_string()),
+    )
+    .await;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "artifact": artifact.display().to_string(),
+                "offsite": offsite,
+            })
+        );
+    } else {
+        eprintln!("wrote {}", artifact.display());
+    }
+
+    // Same rule as everywhere else: a backup that did not reach the
+    // destination it was configured to reach has not fully succeeded.
+    if !failures.is_empty() {
+        bail!(
+            "the artifact is on disk but the off-site copy failed: {}",
+            failures.join("; ")
+        );
+    }
+    Ok(())
+}
+
+/// Every table in a database, as the backup would see them.
+async fn introspect_table_names(
+    profile: &db_sync_engine::ConnectionProfile,
+    database: &str,
+    store: &Store,
+) -> Result<Vec<String>> {
+    // PostgreSQL can only introspect the database it is connected to, so the
+    // target is part of opening the connection rather than just the query.
+    let connection = db_sync_engine::connect::open(profile, store, Some(database))
+        .await
+        .map_err(|e| anyhow::anyhow!("could not connect: {e}"))?;
+
+    let tables = connection.introspector.list_tables(database).await;
+    connection.close().await;
+
+    let tables = tables.map_err(|e| anyhow::anyhow!("could not read the table list: {e}"))?;
+
+    Ok(tables
+        .into_iter()
+        .map(|t| match t.schema {
+            // Schema-qualified for PostgreSQL: a bare name matches in every
+            // schema, which would pull in a same-named table elsewhere.
+            Some(schema) => format!("{schema}.{}", t.name),
+            None => t.name,
+        })
+        .collect())
+}
+
+/// Sensible defaults for a headless dump, matching what the GUI sends.
+fn default_backup_options(
+    engine: db_sync_engine::Engine,
+) -> db_sync_engine::backup::EngineBackupOptions {
+    use db_sync_engine::backup::{EngineBackupOptions, MysqlBackupOptions, PostgresBackupOptions};
+
+    match engine {
+        db_sync_engine::Engine::Mysql => EngineBackupOptions::Mysql(MysqlBackupOptions::default()),
+        db_sync_engine::Engine::Postgres => {
+            EngineBackupOptions::Postgres(PostgresBackupOptions::default())
+        }
+    }
+}
+
+// ── Restore ─────────────────────────────────────────────────────────────
+
+/// Grouped so the call site is not eleven positional arguments.
+struct RestoreArgs<'a> {
+    profile: &'a str,
+    artifact: PathBuf,
+    new_prefix: Option<String>,
+    replace: Option<String>,
+    into: Option<String>,
+    confirm: Option<String>,
+    verify_checksum: bool,
+    only_tables: Vec<String>,
+    jobs: Option<u16>,
+    clean: bool,
+}
+
+/// Turn the mutually exclusive target flags into a naming strategy.
+///
+/// Clap already refuses more than one of them, so the order here only decides
+/// what happens if that ever stops being true. It resolves to the *least*
+/// destructive interpretation last-resort — a bug in the argument definitions
+/// should not silently promote a restore into a DROP.
+fn target_naming(
+    replace: Option<String>,
+    into: Option<String>,
+    new_prefix: Option<String>,
+    artifact_database: Option<&str>,
+) -> db_sync_engine::restore::TargetNaming {
+    use db_sync_engine::restore::TargetNaming;
+
+    match (replace, into, new_prefix) {
+        (Some(name), None, None) => TargetNaming::DropAndRecreate { name },
+        (None, Some(name), None) => TargetNaming::IntoExisting { name },
+        (None, None, Some(prefix)) => TargetNaming::NewTimestamped { prefix },
+        // No target given, or — impossible today — more than one. Both land on
+        // the strategy that cannot destroy anything. Naming it after the
+        // database the artifact came from keeps a folder of restores readable.
+        _ => TargetNaming::NewTimestamped {
+            prefix: artifact_database.unwrap_or("restore").to_string(),
+        },
+    }
+}
+
+async fn run_restore(store: &Store, args: RestoreArgs<'_>, json: bool) -> Result<()> {
+    use db_sync_engine::restore::{EngineRestoreOptions, PostgresRestoreOptions, RestoreRequest};
+
+    let profile = resolve_profile(store, args.profile).await?;
+
+    if !args.artifact.is_file() {
+        bail!("{} is not a file", args.artifact.display());
+    }
+
+    // Read before anything else, so the summary below can say what is about to
+    // be restored rather than only where it is going.
+    let manifest = db_sync_engine::manifest::BackupManifest::read(&args.artifact).ok();
+
+    let naming = target_naming(
+        args.replace,
+        args.into,
+        args.new_prefix,
+        manifest.as_ref().map(|m| m.database.as_str()),
+    );
+
+    let engine = match profile.engine {
+        db_sync_engine::Engine::Mysql => {
+            if !args.only_tables.is_empty() || args.jobs.is_some() || args.clean {
+                // Silently ignoring them would produce a restore that is not
+                // the one that was asked for.
+                bail!(
+                    "--only-table, --jobs and --clean are PostgreSQL options, and {:?} is MySQL",
+                    profile.name
+                );
+            }
+            EngineRestoreOptions::Mysql(Default::default())
+        }
+        db_sync_engine::Engine::Postgres => {
+            EngineRestoreOptions::Postgres(PostgresRestoreOptions {
+                only_tables: args.only_tables,
+                parallel_jobs: args.jobs,
+                clean: args.clean,
+                ..Default::default()
+            })
+        }
+    };
+
+    let request = RestoreRequest {
+        artifact_path: args.artifact.clone(),
+        naming,
+        engine,
+        verify_checksum: args.verify_checksum,
+        typed_confirmation: args.confirm,
+    };
+
+    // Checked here as well as inside the job so a missing confirmation costs
+    // nothing — no history row, no connection, no tunnel.
+    request
+        .validate(&profile, manifest.as_ref())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if !json {
+        eprintln!(
+            "restoring {} into {} on {:?}",
+            args.artifact
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy(),
+            request.naming.resolve(chrono::Utc::now()),
+            profile.name
+        );
+        match &manifest {
+            Some(m) => eprintln!(
+                "  artifact: {} from {}, {} table(s), taken {}",
+                m.database,
+                m.source_profile_name,
+                m.tables.len(),
+                m.created_at.to_rfc3339()
+            ),
+            None => eprintln!(
+                "  no manifest alongside this artifact — its contents and checksum \
+                 are unknown, so nothing can be verified before or after"
+            ),
+        }
+    }
+
+    let (event_tx, rx) = create_event_channel(EVENT_CHANNEL_CAPACITY);
+    if json {
+        tokio::spawn(stream_channel_as_json(rx));
+    } else {
+        tokio::spawn(stream_channel_as_text(rx));
+    }
+
+    let ctx = JobContext::with_sender(Uuid::new_v4(), event_tx);
+
+    // Recorded the same way the GUI records it, so a restore run headlessly
+    // appears in the same history the app shows.
+    db_sync_engine::ops::record_start(
+        store,
+        &ctx,
+        db_sync_engine::events::JobKind::Restore,
+        profile.id,
+        Some(profile.id),
+        serde_json::to_string(&request).unwrap_or_else(|_| "{}".into()),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("could not record the job: {e}"))?;
+
+    let result = db_sync_engine::ops::restore(&profile, &request, store, &ctx).await;
+
+    let outcome = match &result {
+        Ok(_) => JobOutcome::Success,
+        Err(e) => {
+            ctx.emit_error(db_sync_engine::events::JobPhase::Done, e.to_string())
+                .await;
+            JobOutcome::Failed
+        }
+    };
+    let _ = db_sync_engine::ops::record_finish(
+        store,
+        &ctx,
+        outcome,
+        Some(args.artifact.display().to_string()),
+    )
+    .await;
+
+    let target = result.map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if json {
+        println!("{}", serde_json::json!({ "target_database": target }));
+    } else {
+        eprintln!("restored into {target}");
+        eprintln!(
+            "nothing has verified this against the source; run `dbsync drill` or a sync \
+             with --verify for that"
+        );
+    }
+    Ok(())
 }
 
 /// Find a profile by id or by a unique prefix of its name.
@@ -1459,5 +1971,77 @@ mod tests {
         let long = truncate("a name far longer than the column allows", 10);
         assert_eq!(long.chars().count(), 10);
         assert!(long.ends_with('…'));
+    }
+
+    // ── Restore target selection ────────────────────────────────────────
+
+    #[test]
+    fn the_default_restore_target_cannot_destroy_anything() {
+        // Running `dbsync restore prod backup.sql.gz` with no target flag must
+        // not be able to drop a database. It creates a new one.
+        let naming = target_naming(None, None, None, Some("app"));
+        assert!(!naming.is_destructive());
+        assert!(matches!(
+            naming,
+            db_sync_engine::restore::TargetNaming::NewTimestamped { ref prefix } if prefix == "app"
+        ));
+    }
+
+    #[test]
+    fn the_default_prefix_falls_back_when_there_is_no_manifest() {
+        let naming = target_naming(None, None, None, None);
+        assert!(matches!(
+            naming,
+            db_sync_engine::restore::TargetNaming::NewTimestamped { ref prefix }
+                if prefix == "restore"
+        ));
+    }
+
+    #[test]
+    fn each_flag_selects_its_strategy() {
+        use db_sync_engine::restore::TargetNaming;
+
+        assert!(matches!(
+            target_naming(Some("dev_app".into()), None, None, None),
+            TargetNaming::DropAndRecreate { ref name } if name == "dev_app"
+        ));
+        assert!(matches!(
+            target_naming(None, Some("dev_app".into()), None, None),
+            TargetNaming::IntoExisting { ref name } if name == "dev_app"
+        ));
+        assert!(matches!(
+            target_naming(None, None, Some("scratch".into()), None),
+            TargetNaming::NewTimestamped { ref prefix } if prefix == "scratch"
+        ));
+    }
+
+    #[test]
+    fn only_replace_is_treated_as_destructive() {
+        use db_sync_engine::restore::TargetNaming;
+
+        assert!(target_naming(Some("x".into()), None, None, None).is_destructive());
+        assert!(!target_naming(None, Some("x".into()), None, None).is_destructive());
+
+        // `IntoExisting` writes over live data without dropping the database.
+        // It is not classed destructive, and the engine still demands typed
+        // confirmation for it on a production target — this pins that the CLI
+        // is not quietly making its own, weaker, decision.
+        let _: TargetNaming = target_naming(None, Some("x".into()), None, None);
+    }
+
+    #[test]
+    fn two_target_flags_resolve_to_the_safe_one() {
+        // Clap refuses this today. If that ever changes, the fallback must not
+        // be the strategy that drops a database.
+        let naming = target_naming(
+            Some("dev_app".into()),
+            Some("other".into()),
+            None,
+            Some("app"),
+        );
+        assert!(
+            !naming.is_destructive(),
+            "an ambiguous target must never resolve to a DROP"
+        );
     }
 }

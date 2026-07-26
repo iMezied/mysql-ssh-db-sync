@@ -1209,3 +1209,122 @@ db_test! {
         assert!(err.to_string().contains("no backups found"), "got: {err}");
     }
 }
+
+// ── Restore target pre-flight ───────────────────────────────────────────
+
+db_test! {
+    #[ignore = "requires an unlocked OS keychain"]
+    async fn restoring_into_a_database_that_does_not_exist_says_so() {
+        // `IntoExisting` creates nothing, so without this check the dump
+        // streams at a database that is not there and the failure arrives as
+        // whatever the vendor client prints — "Unknown database", on a stderr
+        // line, under a generic "exit status: 1".
+        require_containers!();
+        let (store, _dir) = temp_store().await;
+        let out = tempfile::tempdir().unwrap();
+
+        let source = profile(&store, "pf-source", "root", "testroot").await;
+        let dest = profile(&store, "pf-dest", "root", "testroot").await;
+        let _cleanup = Cleanup(vec![source.id, dest.id]);
+
+        let ctx = JobContext::new(Uuid::new_v4());
+        let artifact = ops::backup(&source, &backup_request(out.path().to_path_buf()), &store, &ctx)
+            .await
+            .expect("backup");
+
+        let err = ops::restore(
+            &dest,
+            &RestoreRequest {
+                artifact_path: artifact,
+                naming: TargetNaming::IntoExisting {
+                    name: "definitely_not_a_database".into(),
+                },
+                engine: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
+                verify_checksum: true,
+                typed_confirmation: None,
+            },
+            &store,
+            &ctx,
+        )
+        .await
+        .expect_err("there is nothing to restore into");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("definitely_not_a_database") && message.contains("no database called"),
+            "the error must name the missing database: {message}"
+        );
+    }
+}
+
+db_test! {
+    #[ignore = "requires an unlocked OS keychain"]
+    async fn a_generated_name_that_already_exists_is_refused_not_merged_into() {
+        // The timestamp has one-second resolution, so two restores in the same
+        // second resolve to the same name. Writing into the first one's
+        // database would silently merge two restores; this pins that it is
+        // refused, and that the message explains a collision rather than
+        // reporting a generic CREATE failure.
+        require_containers!();
+        let (store, _dir) = temp_store().await;
+        let out = tempfile::tempdir().unwrap();
+
+        let source = profile(&store, "cl-source", "root", "testroot").await;
+        let dest = profile(&store, "cl-dest", "root", "testroot").await;
+        let _cleanup = Cleanup(vec![source.id, dest.id]);
+
+        let ctx = JobContext::new(Uuid::new_v4());
+        let artifact = ops::backup(&source, &backup_request(out.path().to_path_buf()), &store, &ctx)
+            .await
+            .expect("backup");
+
+        let naming = TargetNaming::NewTimestamped {
+            prefix: "collision_probe".into(),
+        };
+        // Create exactly the database the next restore will generate.
+        let occupied = naming.resolve(chrono::Utc::now());
+        let _ = query_scalar(
+            "mysql",
+            &format!("CREATE DATABASE IF NOT EXISTS `{occupied}`;"),
+        )
+        .await;
+
+        let err = ops::restore(
+            &dest,
+            &RestoreRequest {
+                artifact_path: artifact,
+                naming,
+                engine: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
+                verify_checksum: true,
+                typed_confirmation: None,
+            },
+            &store,
+            &ctx,
+        )
+        .await;
+
+        let _ = query_scalar("mysql", &format!("DROP DATABASE IF EXISTS `{occupied}`;")).await;
+
+        // The second can tick between resolving the name above and resolving it
+        // again inside the restore, which is the same one-second granularity
+        // this test is about. A restore that landed on a free name is a pass,
+        // not a flake — what must never happen is silently reusing the
+        // occupied one.
+        match err {
+            Err(e) => {
+                let message = e.to_string();
+                assert!(
+                    message.contains("already exists"),
+                    "a collision must be reported as one: {message}"
+                );
+            }
+            Ok(target) => {
+                assert_ne!(
+                    target, occupied,
+                    "a restore must never write into a database it did not create"
+                );
+                let _ = query_scalar("mysql", &format!("DROP DATABASE IF EXISTS `{target}`;")).await;
+            }
+        }
+    }
+}

@@ -65,6 +65,19 @@ pub enum OpError {
     Cancelled,
     #[error("{0}")]
     Destination(String),
+    // The timestamp in a generated name has one-second resolution. Nothing is
+    // wrong with the request; it arrived in the same second as another one.
+    #[error(
+        "{target} already exists, so this restore would have to write into a database it did \
+         not create. Generated names carry a one-second timestamp — run it again in a moment, \
+         or name the target explicitly"
+    )]
+    TargetCollision { target: String },
+    #[error(
+        "there is no database called {target} to restore into. Nothing creates it for this \
+         strategy — either create it first, or restore into a new database instead"
+    )]
+    TargetMissing { target: String },
 }
 
 /// A tunnel plus the local endpoint the tools should talk to.
@@ -176,12 +189,82 @@ pub async fn restore(
         .await;
     let reachable = reach(profile, store).await?;
 
+    check_target_exists(profile, request, &reachable.endpoint, ctx).await?;
+
     let endpoint = reachable.endpoint.clone();
     let target = match profile.engine {
         Engine::Mysql => run_mysql_restore(profile, request, endpoint, ctx).await?,
         Engine::Postgres => run_postgres_restore(profile, request, endpoint, ctx).await?,
     };
     Ok(target)
+}
+
+/// Refuse a target the restore cannot use, before either tool is started.
+///
+/// # Why this is not left to the database
+///
+/// Both engines issue a plain `CREATE DATABASE` — never `IF NOT EXISTS`, which
+/// is load-bearing: a "new database" restore that quietly merged into somebody
+/// else's would be the worst outcome available. So the collision *is* caught,
+/// just not usefully. What comes back is `psql failed with exit status: 1` with
+/// the real reason on a separate stderr line, which is a poor thing to read at
+/// 3am and a poor thing to show in a job list.
+///
+/// The two cases are opposite and both are ordinary mistakes:
+///
+///   * `NewTimestamped` resolving onto a name that already exists. The
+///     timestamp has one-second resolution, so two restores in the same second
+///     collide — and the second one is not wrong, it just needs a moment.
+///   * `IntoExisting` naming a database that is not there. Nothing creates it,
+///     so the dump streams at nothing.
+///
+/// A failure here costs one introspection round trip on a connection that has
+/// already been opened.
+async fn check_target_exists(
+    profile: &ConnectionProfile,
+    request: &RestoreRequest,
+    endpoint: &Endpoint,
+    ctx: &JobContext,
+) -> Result<(), OpError> {
+    let target = request.naming.resolve(chrono::Utc::now());
+
+    let params = ConnectParams {
+        engine: profile.engine,
+        host: endpoint.host.clone(),
+        port: endpoint.port,
+        user: endpoint.user.clone(),
+        password: endpoint.password.clone(),
+        // PostgreSQL cannot list databases from inside the one being created.
+        database: match profile.engine {
+            Engine::Postgres => Some("postgres".to_string()),
+            Engine::Mysql => None,
+        },
+    };
+
+    let introspector = crate::db::connect(&params).await?;
+    let databases = introspector.list_databases().await;
+    introspector.close().await;
+
+    // A server that will not list its databases is not a reason to refuse a
+    // restore that might work — this check exists to improve an error, not to
+    // become a new way to fail.
+    let Ok(databases) = databases else {
+        ctx.emit_warn(
+            JobPhase::Introspect,
+            "could not list databases, so the target was not checked in advance",
+        )
+        .await;
+        return Ok(());
+    };
+    let exists = databases.iter().any(|d| d.name == target);
+
+    match &request.naming {
+        TargetNaming::NewTimestamped { .. } if exists => Err(OpError::TargetCollision { target }),
+        TargetNaming::IntoExisting { name } if !exists => Err(OpError::TargetMissing {
+            target: name.clone(),
+        }),
+        _ => Ok(()),
+    }
 }
 
 /// What to compare, and where.
