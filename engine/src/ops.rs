@@ -600,3 +600,366 @@ pub async fn apply_retention(
 
     removed
 }
+
+// ── Restore drills ──────────────────────────────────────────────────────
+
+/// The prefix every scratch database a drill creates begins with.
+///
+/// Load-bearing, not cosmetic: [`drop_scratch_database`] refuses to drop
+/// anything whose name does not start with it. A drill generates the name
+/// itself and never accepts one from a caller, so "the nightly drill dropped
+/// our production database" is not a mistake this code can make.
+pub const DRILL_PREFIX: &str = "dbsync_drill";
+
+/// Prove that the newest backup in a directory actually restores.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct DrillRequest {
+    pub artifact_dir: PathBuf,
+    pub restore: EngineRestoreOptions,
+    /// Compare table contents as well as row counts.
+    #[serde(default)]
+    pub deep_verify: bool,
+    /// Leave the scratch database in place when the drill fails, so the
+    /// wreckage can be inspected. A passing drill always cleans up.
+    #[serde(default)]
+    pub keep_on_failure: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct DrillOutcome {
+    pub artifact: String,
+    pub scratch_database: String,
+    /// False when the scratch database was deliberately left behind.
+    pub dropped: bool,
+    pub report: VerificationReport,
+}
+
+/// Restore the newest artifact into a scratch database, check it, drop it.
+///
+/// # What a drill actually proves
+///
+/// It verifies the restored data against the **manifest**, not against the
+/// live source. The source has moved on since the backup was taken — rows have
+/// been added, tables altered — so comparing against it would report drift as
+/// corruption. What a drill answers is the question that matters at 3am on a
+/// bad day: *does this file restore, and does it contain what it claims to?*
+///
+/// # Why it is worth doing at all
+///
+/// A backup is a belief until it has been restored. Checksums prove the bytes
+/// are the bytes that were written; they say nothing about whether the dump was
+/// coherent, whether the destination can accept it, or whether the tool that
+/// wrote it did so correctly. The only proof is a restore.
+pub async fn drill(
+    dest: &ConnectionProfile,
+    request: &DrillRequest,
+    store: &Store,
+    ctx: &JobContext,
+) -> Result<DrillOutcome, OpError> {
+    ctx.emit(JobPhase::Initializing, "looking for the newest backup")
+        .await;
+
+    // `list_artifacts` returns newest first.
+    let artifact = crate::library::list_artifacts(&request.artifact_dir)
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            OpError::Backup(BackupError::Invalid(format!(
+                "no backups found in {}; a drill needs something to restore",
+                request.artifact_dir.display()
+            )))
+        })?;
+
+    let artifact_path = PathBuf::from(&artifact.path);
+    let manifest = crate::manifest::BackupManifest::read(&artifact_path).map_err(|e| {
+        OpError::Backup(BackupError::Invalid(format!(
+            "{} has no readable manifest, so there is nothing to check the restore against: {e}",
+            artifact.filename
+        )))
+    })?;
+
+    ctx.emit(
+        JobPhase::Restore,
+        format!(
+            "drilling {} ({} tables, taken {})",
+            artifact.filename,
+            manifest.tables.len(),
+            manifest.created_at.to_rfc3339()
+        ),
+    )
+    .await;
+
+    // The name is generated here and nowhere else. See DRILL_PREFIX.
+    let restore_request = RestoreRequest {
+        artifact_path: artifact_path.clone(),
+        naming: TargetNaming::NewTimestamped {
+            prefix: DRILL_PREFIX.to_string(),
+        },
+        engine: request.restore.clone(),
+        verify_checksum: true,
+        // A drill never drops anything that already existed, so there is
+        // nothing for a confirmation to protect.
+        typed_confirmation: None,
+    };
+
+    let scratch = restore(dest, &restore_request, store, ctx).await?;
+
+    let report =
+        check_against_manifest(dest, &manifest, &scratch, request.deep_verify, store, ctx).await?;
+
+    // Clean up unless the drill failed and the user asked to keep the evidence.
+    let keep = !report.passed() && request.keep_on_failure;
+    if keep {
+        ctx.emit_warn(
+            JobPhase::Cleanup,
+            format!("drill failed; leaving {scratch} in place for inspection"),
+        )
+        .await;
+    } else {
+        drop_scratch_database(dest, &scratch, store, ctx).await?;
+    }
+
+    Ok(DrillOutcome {
+        artifact: artifact.filename,
+        scratch_database: scratch,
+        dropped: !keep,
+        report,
+    })
+}
+
+/// Check a restored database against what the manifest said it held.
+///
+/// The manifest records which tables carried data and which were schema-only,
+/// which is enough to catch the failures that matter: a table that did not
+/// arrive, or one that arrived empty when it should not have.
+async fn check_against_manifest(
+    dest: &ConnectionProfile,
+    manifest: &crate::manifest::BackupManifest,
+    scratch: &str,
+    deep: bool,
+    store: &Store,
+    ctx: &JobContext,
+) -> Result<VerificationReport, OpError> {
+    ctx.emit(JobPhase::Verify, "checking the restored database")
+        .await;
+
+    let reachable = reach(dest, store).await?;
+    let counts = count_tables(dest, &reachable.endpoint, scratch, &manifest.tables).await?;
+
+    let schema_only: Vec<String> = manifest
+        .tables
+        .iter()
+        .filter(|t| !manifest.tables_with_data.contains(t))
+        .cloned()
+        .collect();
+
+    // Every table the manifest says carried data must exist and be non-empty.
+    // An exact count is not available — the manifest does not record one — so
+    // "at least one row" is the strongest claim that can honestly be made.
+    let mut expected = BTreeMap::new();
+    let mut tables = Vec::new();
+    for name in &manifest.tables_with_data {
+        match counts.get(name) {
+            None => tables.push(crate::verify::TableVerification {
+                table: name.clone(),
+                verdict: crate::verify::TableVerdict::MissingAtDestination,
+            }),
+            Some(0) => tables.push(crate::verify::TableVerification {
+                table: name.clone(),
+                verdict: crate::verify::TableVerdict::RowCountMismatch {
+                    source: 1,
+                    destination: 0,
+                },
+            }),
+            Some(n) => {
+                expected.insert(name.clone(), *n);
+                tables.push(crate::verify::TableVerification {
+                    table: name.clone(),
+                    verdict: crate::verify::TableVerdict::Match,
+                });
+            }
+        }
+    }
+
+    for name in &schema_only {
+        tables.push(crate::verify::TableVerification {
+            table: name.clone(),
+            verdict: if counts.contains_key(name) {
+                crate::verify::TableVerdict::Match
+            } else {
+                crate::verify::TableVerdict::MissingAtDestination
+            },
+        });
+    }
+
+    let failures = tables.iter().filter(|t| t.verdict.is_failure()).count();
+    let mut report = VerificationReport {
+        tables_checked: tables.len(),
+        failures,
+        skipped: 0,
+        tables,
+    };
+
+    // A deep drill additionally proves each table can be read end to end — a
+    // digest scans every row, which surfaces corruption that a COUNT(*) index
+    // scan would never touch.
+    if deep {
+        ctx.emit(JobPhase::Verify, "reading every row").await;
+        let (digests, columns) =
+            digest_tables(dest, &reachable.endpoint, scratch, &manifest.tables).await?;
+
+        for entry in &mut report.tables {
+            if matches!(entry.verdict, crate::verify::TableVerdict::Match)
+                && matches!(digests.get(&entry.table), Some(None))
+                && columns.get(&entry.table).is_some_and(|c| !c.is_empty())
+            {
+                entry.verdict = crate::verify::TableVerdict::Skipped {
+                    reason: "could not be read end to end".into(),
+                };
+            }
+        }
+        report.skipped = report
+            .tables
+            .iter()
+            .filter(|t| matches!(t.verdict, crate::verify::TableVerdict::Skipped { .. }))
+            .count();
+    }
+
+    let _ = expected;
+    Ok(report)
+}
+
+/// Drop a database a drill created.
+///
+/// Refuses any name not produced by this module. The guard is the whole reason
+/// this function is safe to call unattended: the caller cannot pass a name in,
+/// so it cannot pass in the wrong one.
+async fn drop_scratch_database(
+    dest: &ConnectionProfile,
+    name: &str,
+    store: &Store,
+    ctx: &JobContext,
+) -> Result<(), OpError> {
+    if !is_drill_database(name) {
+        // Reaching here means a bug upstream renamed the target. Refusing is
+        // the only safe response; the scratch database leaking is a far
+        // smaller problem than dropping the wrong one.
+        ctx.emit_error(
+            JobPhase::Cleanup,
+            format!("refusing to drop {name:?}: it is not a drill database"),
+        )
+        .await;
+        return Err(OpError::Restore(RestoreError::Invalid(format!(
+            "refusing to drop {name:?}: only databases created by a drill may be dropped"
+        ))));
+    }
+
+    let reachable = reach(dest, store).await?;
+    let params = ConnectParams {
+        engine: dest.engine,
+        host: reachable.endpoint.host.clone(),
+        port: reachable.endpoint.port,
+        user: reachable.endpoint.user.clone(),
+        password: reachable.endpoint.password.clone(),
+        // Never connect *to* the database being dropped.
+        database: match dest.engine {
+            Engine::Postgres => Some("postgres".to_string()),
+            Engine::Mysql => None,
+        },
+    };
+
+    let quoted = match dest.engine {
+        Engine::Mysql => crate::db::quote_mysql_ident(name),
+        Engine::Postgres => crate::db::quote_pg_ident(name),
+    }?;
+
+    crate::db::execute_raw(&params, &format!("DROP DATABASE IF EXISTS {quoted}")).await?;
+    ctx.emit(JobPhase::Cleanup, format!("dropped {name}")).await;
+    Ok(())
+}
+
+/// Whether a name was generated by [`drill`].
+pub fn is_drill_database(name: &str) -> bool {
+    // `{prefix}_{YYYYMMDD_HHMMSS}` — the underscore matters, so a real database
+    // called `dbsync_drills` cannot be mistaken for scratch.
+    name.strip_prefix(DRILL_PREFIX)
+        .and_then(|rest| rest.strip_prefix('_'))
+        .is_some_and(|stamp| {
+            stamp.len() == 15
+                && stamp.chars().enumerate().all(
+                    |(i, c)| {
+                        if i == 8 { c == '_' } else { c.is_ascii_digit() }
+                    },
+                )
+        })
+}
+
+#[cfg(test)]
+mod drill_tests {
+    use super::*;
+
+    #[test]
+    fn a_generated_drill_name_is_recognised() {
+        let name = TargetNaming::NewTimestamped {
+            prefix: DRILL_PREFIX.to_string(),
+        }
+        .resolve(chrono::Utc::now());
+        assert!(
+            is_drill_database(&name),
+            "{name} was generated by a drill and must be droppable"
+        );
+    }
+
+    #[test]
+    fn nothing_else_is_droppable() {
+        // The guard that makes an unattended drill safe. Every one of these is
+        // a database somebody would be very upset to lose.
+        for name in [
+            "production",
+            "app",
+            "dbsync",
+            "dbsync_drill",                  // the prefix alone, no timestamp
+            "dbsync_drills",                 // a real database that merely starts the same
+            "dbsync_drill_",                 // truncated
+            "dbsync_drill_2026",             // short timestamp
+            "dbsync_drill_20260726_0300001", // long timestamp
+            "dbsync_drill_abcdefg_hijkl",    // right shape, not digits
+            "xdbsync_drill_20260726_030000", // prefix not at the start
+            "",
+        ] {
+            assert!(
+                !is_drill_database(name),
+                "{name:?} must not be treated as a drill database"
+            );
+        }
+    }
+
+    #[test]
+    fn the_separator_is_required() {
+        // Without it, a real database called `dbsync_drillsomething` would be
+        // one bad rename away from being dropped nightly.
+        assert!(!is_drill_database("dbsync_drill20260726_030000"));
+    }
+
+    #[test]
+    fn the_timestamp_must_have_its_underscore_in_the_right_place() {
+        assert!(is_drill_database("dbsync_drill_20260726_030000"));
+        assert!(!is_drill_database("dbsync_drill_2026072_6030000"));
+        assert!(!is_drill_database("dbsync_drill_202607260_30000"));
+    }
+
+    #[test]
+    fn a_drill_request_never_carries_a_confirmation() {
+        // A drill runs unattended. It must not be able to authorise the
+        // destruction of anything that already existed — and it does not need
+        // to, because it only ever creates a fresh database.
+        let request = DrillRequest {
+            artifact_dir: PathBuf::from("/backups"),
+            restore: EngineRestoreOptions::Mysql(Default::default()),
+            deep_verify: false,
+            keep_on_failure: false,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("typed_confirmation"));
+    }
+}

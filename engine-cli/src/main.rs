@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use db_sync_engine::ENGINE_VERSION;
 use db_sync_engine::events::{EVENT_CHANNEL_CAPACITY, ProgressEvent, create_event_channel};
-use db_sync_engine::job::{JobOutcome, JobRegistry};
+use db_sync_engine::job::{JobContext, JobOutcome, JobRegistry};
 use db_sync_engine::schedule::Schedule;
 use db_sync_engine::scheduler::Scheduler;
 use db_sync_engine::store::Store;
@@ -57,6 +57,24 @@ enum Command {
     /// Inspect and run scheduled jobs.
     #[command(subcommand)]
     Schedule(ScheduleCommand),
+    /// Prove the newest backup in a directory actually restores.
+    ///
+    /// Restores it into a scratch database, checks it against its manifest,
+    /// then drops it. Exits non-zero if the restore or the check failed, so
+    /// cron and CI report a backup that has quietly stopped being restorable.
+    Drill {
+        /// Connection to restore into. Id, or a unique prefix of its name.
+        profile: String,
+        /// Directory holding the backups. Defaults to the app's backup folder.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Also read every row, not just count them.
+        #[arg(long)]
+        deep: bool,
+        /// Leave the scratch database behind when the drill fails.
+        #[arg(long)]
+        keep_on_failure: bool,
+    },
     /// Run the scheduler in the foreground until interrupted.
     ///
     /// The desktop app runs this same loop internally; use this to run
@@ -199,6 +217,17 @@ async fn main() -> Result<()> {
             store.close().await;
             result?;
         }
+        Command::Drill {
+            profile,
+            dir,
+            deep,
+            keep_on_failure,
+        } => {
+            let store = Store::open(&store_path).await?;
+            let result = run_drill(&store, &profile, dir, deep, keep_on_failure, cli.json).await;
+            store.close().await;
+            result?;
+        }
         Command::Daemon { interval } => {
             let store = Store::open(&store_path).await?;
             let (event_tx, _rx) = create_event_channel(EVENT_CHANNEL_CAPACITY);
@@ -228,6 +257,120 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Restore the newest backup into a scratch database and check it.
+async fn run_drill(
+    store: &Store,
+    needle: &str,
+    dir: Option<PathBuf>,
+    deep: bool,
+    keep_on_failure: bool,
+    json: bool,
+) -> Result<()> {
+    let profile = resolve_profile(store, needle).await?;
+
+    let artifact_dir = match dir {
+        Some(d) => d,
+        None => db_sync_engine::paths::app_data_dir()
+            .context("could not determine the backup directory")?
+            .join("backups"),
+    };
+
+    let (event_tx, rx) = create_event_channel(EVENT_CHANNEL_CAPACITY);
+    if json {
+        tokio::spawn(stream_channel_as_json(rx));
+    } else {
+        tokio::spawn(stream_channel_as_text(rx));
+    }
+
+    let ctx = JobContext::with_sender(Uuid::new_v4(), event_tx);
+    let outcome = db_sync_engine::ops::drill(
+        &profile,
+        &db_sync_engine::ops::DrillRequest {
+            artifact_dir,
+            restore: default_restore_options(profile.engine),
+            deep_verify: deep,
+            keep_on_failure,
+        },
+        store,
+        &ctx,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&outcome)?);
+    } else {
+        eprintln!();
+        eprintln!("{}", outcome.report.to_markdown());
+    }
+
+    // The exit code is the whole point of running this from cron.
+    if outcome.report.passed() {
+        eprintln!(
+            "drill passed: {} restored and verified ({} tables)",
+            outcome.artifact, outcome.report.tables_checked
+        );
+        Ok(())
+    } else {
+        bail!(
+            "drill FAILED: {} did not restore cleanly ({} problem(s)){}",
+            outcome.artifact,
+            outcome.report.failures,
+            if outcome.dropped {
+                String::new()
+            } else {
+                format!("; {} left in place", outcome.scratch_database)
+            }
+        )
+    }
+}
+
+/// Find a profile by id or by a unique prefix of its name.
+async fn resolve_profile(store: &Store, needle: &str) -> Result<db_sync_engine::ConnectionProfile> {
+    if let Ok(id) = Uuid::parse_str(needle) {
+        return Ok(store.require_profile(id).await?);
+    }
+
+    let all = store.list_profiles().await?;
+    let lowered = needle.to_lowercase();
+    let matches: Vec<_> = all
+        .iter()
+        .filter(|p| p.name.to_lowercase().starts_with(&lowered))
+        .collect();
+
+    match matches.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => bail!("no connection matches {needle:?}; `dbsync profiles` lists them"),
+        many => {
+            let names: Vec<&str> = many.iter().map(|p| p.name.as_str()).collect();
+            bail!(
+                "{needle:?} matches several connections: {}",
+                names.join(", ")
+            )
+        }
+    }
+}
+
+/// Conservative restore options for a drill.
+///
+/// A drill restores into a database it just created, so the destructive
+/// options that exist for real restores have nothing to act on and are left
+/// off rather than defaulted on.
+fn default_restore_options(
+    engine: db_sync_engine::Engine,
+) -> db_sync_engine::restore::EngineRestoreOptions {
+    match engine {
+        db_sync_engine::Engine::Mysql => db_sync_engine::restore::EngineRestoreOptions::Mysql(
+            db_sync_engine::restore::MysqlRestoreOptions::default(),
+        ),
+        db_sync_engine::Engine::Postgres => {
+            db_sync_engine::restore::EngineRestoreOptions::Postgres(
+                db_sync_engine::restore::PostgresRestoreOptions::default(),
+            )
+        }
+    }
 }
 
 // ── Schedules ───────────────────────────────────────────────────────────

@@ -1069,3 +1069,93 @@ db_test! {
             .await;
     }
 }
+
+// ── Restore drills ──────────────────────────────────────────────────────
+
+db_test! {
+    #[ignore = "requires an unlocked OS keychain"]
+    async fn a_drill_restores_the_newest_backup_and_cleans_up_after_itself() {
+        // A backup is a belief until it has been restored. This is the only
+        // check that turns it into a fact.
+        require_containers!();
+        let (store, _dir) = temp_store().await;
+        let out = tempfile::tempdir().unwrap();
+
+        let source = profile(&store, "drill-source", "root", "testroot").await;
+        let dest = profile(&store, "drill-dest", "dbsync", "testpass").await;
+        let _cleanup = Cleanup(vec![source.id, dest.id]);
+
+        let ctx = JobContext::new(Uuid::new_v4());
+        ops::backup(&source, &backup_request(out.path().to_path_buf()), &store, &ctx)
+            .await
+            .expect("backup");
+
+        let outcome = ops::drill(
+            &dest,
+            &ops::DrillRequest {
+                artifact_dir: out.path().to_path_buf(),
+                restore: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
+                deep_verify: true,
+                keep_on_failure: false,
+            },
+            &store,
+            &ctx,
+        )
+        .await
+        .expect("drill");
+
+        assert!(
+            outcome.report.passed(),
+            "the drill should prove the backup restores: {}",
+            outcome.report.to_markdown()
+        );
+        assert!(
+            outcome.scratch_database.starts_with("dbsync_drill_"),
+            "got {}",
+            outcome.scratch_database
+        );
+        assert!(outcome.dropped, "a passing drill must clean up after itself");
+
+        // And it really is gone — a drill that left databases behind would
+        // fill a server within a month of nightly runs.
+        let remaining = query_scalar(
+            "information_schema",
+            &format!(
+                "SELECT COUNT(*) FROM SCHEMATA WHERE SCHEMA_NAME = '{}'",
+                outcome.scratch_database
+            ),
+        )
+        .await;
+        assert_eq!(remaining, "0", "the scratch database was not dropped");
+    }
+}
+
+db_test! {
+    #[ignore = "requires an unlocked OS keychain"]
+    async fn a_drill_with_no_backups_says_so_rather_than_passing() {
+        // An empty directory must never read as "verified".
+        require_containers!();
+        let (store, _dir) = temp_store().await;
+        let empty = tempfile::tempdir().unwrap();
+
+        let dest = profile(&store, "drill-empty", "dbsync", "testpass").await;
+        let _cleanup = Cleanup(vec![dest.id]);
+
+        let ctx = JobContext::new(Uuid::new_v4());
+        let err = ops::drill(
+            &dest,
+            &ops::DrillRequest {
+                artifact_dir: empty.path().to_path_buf(),
+                restore: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
+                deep_verify: false,
+                keep_on_failure: false,
+            },
+            &store,
+            &ctx,
+        )
+        .await
+        .expect_err("a drill with nothing to restore must fail");
+
+        assert!(err.to_string().contains("no backups found"), "got: {err}");
+    }
+}

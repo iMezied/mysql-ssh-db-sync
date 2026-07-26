@@ -551,6 +551,34 @@ impl Introspector for PostgresIntrospector {
     }
 }
 
+/// Run a statement that returns nothing.
+///
+/// Deliberately narrow and deliberately not on [`Introspector`], which is
+/// documented as read-only catalog access. The only caller is the drill's
+/// cleanup, and keeping the write path out of the read trait means nothing
+/// else acquires the ability to execute DDL by accident.
+pub async fn execute_raw(params: &ConnectParams, sql: &str) -> Result<(), DbError> {
+    match params.engine {
+        Engine::Mysql => {
+            let introspector = MysqlIntrospector::connect(params).await?;
+            sqlx::query(sql)
+                .execute(&introspector.pool)
+                .await
+                .map_err(|e| DbError::Query(format!("executing statement: {e}")))?;
+            introspector.pool.close().await;
+        }
+        Engine::Postgres => {
+            let introspector = PostgresIntrospector::connect(params).await?;
+            sqlx::query(sql)
+                .execute(&introspector.pool)
+                .await
+                .map_err(|e| DbError::Query(format!("executing statement: {e}")))?;
+            introspector.pool.close().await;
+        }
+    }
+    Ok(())
+}
+
 /// Connect using whichever driver matches the engine.
 pub async fn connect(params: &ConnectParams) -> Result<Box<dyn Introspector>, DbError> {
     match params.engine {
