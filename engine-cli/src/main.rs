@@ -75,6 +75,9 @@ enum Command {
         #[arg(long)]
         keep_on_failure: bool,
     },
+    /// Manage the backup encryption key.
+    #[command(subcommand)]
+    Key(KeyCommand),
     /// Run the scheduler in the foreground until interrupted.
     ///
     /// The desktop app runs this same loop internally; use this to run
@@ -85,6 +88,33 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         interval: u64,
     },
+}
+
+#[derive(Subcommand)]
+enum KeyCommand {
+    /// Show whether a key exists, its public half, and who else can decrypt.
+    Status,
+    /// Create the installation's key if it does not already have one.
+    ///
+    /// Never replaces an existing key: doing so would orphan every artifact
+    /// already encrypted to it.
+    Generate,
+    /// Print the secret key so it can be stored somewhere safe.
+    ///
+    /// Encrypted backups are blocked until this has been done once. An
+    /// artifact encrypted to a key nobody has a copy of is worse than no
+    /// artifact: it passes every integrity check and is unreadable forever.
+    Export,
+    /// Adopt a key exported from elsewhere, replacing the current one.
+    ///
+    /// Reads the secret from stdin so it never appears in shell history or in
+    /// the process list.
+    Import,
+    /// Replace the additional recipients that can decrypt future backups.
+    ///
+    /// Pass `age1...` public keys. Passing none clears the list; the
+    /// installation's own key is always included regardless.
+    Recipients { keys: Vec<String> },
 }
 
 #[derive(Subcommand)]
@@ -225,6 +255,12 @@ async fn main() -> Result<()> {
         } => {
             let store = Store::open(&store_path).await?;
             let result = run_drill(&store, &profile, dir, deep, keep_on_failure, cli.json).await;
+            store.close().await;
+            result?;
+        }
+        Command::Key(cmd) => {
+            let store = Store::open(&store_path).await?;
+            let result = run_key_command(cmd, &store).await;
             store.close().await;
             result?;
         }
@@ -371,6 +407,95 @@ fn default_restore_options(
             )
         }
     }
+}
+
+// ── Backup key ──────────────────────────────────────────────────────────
+
+async fn run_key_command(cmd: KeyCommand, store: &Store) -> Result<()> {
+    use db_sync_engine::backupkey;
+
+    match cmd {
+        KeyCommand::Status => {
+            let status = backupkey::status(store).await?;
+            if !status.exists {
+                eprintln!("no backup key on this machine");
+                eprintln!("run `dbsync key generate` before taking an encrypted backup");
+                return Ok(());
+            }
+            println!("public key   {}", status.public.unwrap_or_default());
+            println!(
+                "escrowed     {}",
+                if status.exported {
+                    "yes"
+                } else {
+                    "NO — encrypted backups are blocked until `dbsync key export`"
+                }
+            );
+            if status.extra_recipients.is_empty() {
+                println!("recipients   (only this machine)");
+            } else {
+                for r in &status.extra_recipients {
+                    println!("recipient    {r}");
+                }
+            }
+        }
+
+        KeyCommand::Generate => {
+            let before = backupkey::status(store).await?;
+            let status = backupkey::ensure_exists(store).await?;
+            if before.exists {
+                eprintln!("a key already exists; leaving it alone");
+                eprintln!("replacing it would make every existing encrypted backup unreadable");
+            } else {
+                eprintln!("generated a backup key");
+            }
+            println!("{}", status.public.unwrap_or_default());
+            if !status.exported {
+                eprintln!();
+                eprintln!("Now run `dbsync key export` and store the result somewhere safe.");
+                eprintln!("Encrypted backups are blocked until you do.");
+            }
+        }
+
+        KeyCommand::Export => {
+            let secret = backupkey::export(store).await?;
+            // The secret goes to stdout so it can be redirected into a file or
+            // a password manager; the warning goes to stderr so it is not
+            // captured along with it.
+            eprintln!("This is the only thing that can decrypt your backups.");
+            eprintln!("Store it in a password manager. Anyone holding it can read every artifact.");
+            eprintln!();
+            println!("{}", secrecy::ExposeSecret::expose_secret(&secret));
+        }
+
+        KeyCommand::Import => {
+            // Read from stdin rather than an argument: a key on the command
+            // line lands in shell history and is visible in `ps`.
+            eprintln!("paste the secret key, then press Ctrl-D:");
+            let mut secret = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut secret)
+                .context("could not read the key from stdin")?;
+
+            let status = backupkey::import(store, &secret).await?;
+            eprintln!("imported");
+            println!("{}", status.public.unwrap_or_default());
+        }
+
+        KeyCommand::Recipients { keys } => {
+            backupkey::set_extra_recipients(store, &keys).await?;
+            if keys.is_empty() {
+                eprintln!("cleared the additional recipients");
+            } else {
+                eprintln!(
+                    "future backups will also be readable by {} key(s)",
+                    keys.len()
+                );
+            }
+            eprintln!("existing artifacts are unaffected — they were encrypted already");
+        }
+    }
+
+    Ok(())
 }
 
 // ── Schedules ───────────────────────────────────────────────────────────

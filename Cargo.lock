@@ -1313,6 +1313,7 @@ dependencies = [
  "clap",
  "db-sync-engine",
  "directories",
+ "secrecy",
  "serde",
  "serde_json",
  "tokio",

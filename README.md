@@ -227,6 +227,10 @@ Every schedule offers a `crontab` line, and `dbsync` runs the identical code
 path the app does:
 
 ```bash
+dbsync key generate                 # create the backup encryption key
+dbsync key export > key.txt         # required before any encrypted backup
+dbsync key recipients age1... age1... # let teammates decrypt future backups
+dbsync drill staging                # prove the newest backup restores
 dbsync schedule list                # what exists, and when it next runs
 dbsync schedule show nightly        # id or a unique name prefix
 dbsync schedule run nightly         # once, now; non-zero exit if it failed
