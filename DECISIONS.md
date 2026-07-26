@@ -255,34 +255,57 @@ That rule (`storage_engine == InnoDB`, or PostgreSQL) lives in Rust and is
 serialised as a field, because a method cannot cross the IPC boundary and
 re-deriving it in TypeScript would let the two drift.
 
-### Integration suites are sequenced, not run as one `cargo test`
+### SSH sessions must be closed politely, not dropped
 
-**Known issue.** When a container-backed, SSH-heavy suite starts within roughly
-30 seconds of the previous one, about half its SSH connects fail with
-`Disconnected` before authentication. `tests/run-integration.sh` inserts a
-settle gap between suites, and CI uses it instead of
-`cargo test --workspace`.
+**This was a real bug, found by a flaky test.**
 
-What was ruled out, with measurements:
+OpenSSH 9.8 added `PerSourcePenalties`, on by default. The server tracks source
+addresses that produce authentication failures or handshakes that end without a
+clean shutdown, and for a penalty period answers further connections from that
+address with `Not allowed at this time.` — before sending its version banner.
 
-| Hypothesis | Result |
-|---|---|
-| A suite is simply flaky | No — `tunnel` passes 12/12 across four consecutive standalone runs |
-| Server refusing connections | No — `ssh(1)` opens 20 parallel sessions in the same window, 20/20 |
-| sshd `MaxStartups` throttling | No — raised to 200:30:400; listener reports `0 of 200-400` used |
-| Leaked sshd sessions | No — session count is 0 before and after a run |
-| Client socket exhaustion | No — exactly one `TIME_WAIT` against the published port |
-| Test parallelism | No — `--test-threads=2` fails the same way |
-| Leaked sqlx pools | No — closing them deterministically changed nothing |
+The first implementation closed a tunnel by dropping the `Handle`, which closes
+the TCP socket without sending `SSH_MSG_DISCONNECT`. Every finished job looked
+to the server like a session that vanished. Against a modern bastion a user
+running several jobs would accrue penalties until connections were refused
+outright, and the message they would see is "connection failed" with no clue
+why.
 
-The mechanism is unidentified and recorded rather than hidden. It has not been
-observed to affect the application, which opens one tunnel per job rather than a
-dozen simultaneously, and the full profile → keychain → tunnel → introspection
-path passes end to end. Worth revisiting before M2′ leans harder on tunnels.
+`disconnect_politely` now sends `SSH_MSG_DISCONNECT` for the session, and for
+the jump-host session behind it, before anything is dropped.
 
-One self-inflicted aggravator *was* found and removed: adding
-`LogLevel VERBOSE` to the test sshd (while trying to instrument this) made the
-failure markedly worse.
+How it was found is worth recording, because five plausible theories were wrong
+first. The symptom was that a container-backed suite starting within ~30 s of
+the previous one lost about half its SSH connects to `Disconnect`. Ruled out
+with measurements: suite flakiness (`tunnel` passes 12/12 across four
+consecutive standalone runs), the server refusing everything (`ssh(1)` gets
+20/20 parallel in the same window), `MaxStartups` (raised to 200:30:400; the
+listener reported `0 of 200-400` in use), leaked sshd sessions (zero before and
+after), client socket exhaustion (exactly one `TIME_WAIT`), test parallelism
+(`--test-threads=2` failed identically), leaked sqlx pools (closing them
+deterministically changed nothing), and PAM (`UsePAM no` changed nothing).
+
+What settled it was dropping SSH entirely: a twelve-connection plain-TCP probe
+that just reads the greeting. Idle, it got twelve banners; immediately after a
+suite run, it got twelve copies of `Not allowed at this time.` That located the
+refusal in the server, before any SSH exchange, and named the mechanism. The
+same probe now returns banners after a run, which is how the fix was confirmed.
+
+`engine/tests/tunnel.rs::repeated_open_and_close_stays_healthy` opens and closes
+twenty tunnels in sequence, the shape that exposed this.
+
+### The test sshd disables PerSourcePenalties
+
+Separately from the fix above, the fixture sets `PerSourcePenalties no`.
+
+The tunnel suite deliberately generates the exact events penalties exist to
+punish — wrong keys, refused host keys, unreachable hosts. With penalties on it
+blocks itself, and unrelated suites that merely run afterwards fail for reasons
+that have nothing to do with what they are testing.
+
+This is a property of the fixture, not of the product. A real bastion is
+configured by whoever runs it, and the client-side half — not vanishing without
+saying goodbye — is fixed in the engine rather than configured away.
 
 ### Tunnel-owning tasks must outlive the runtime that created them
 

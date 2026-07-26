@@ -417,3 +417,24 @@ async fn real_connection_succeeds_once_the_key_is_pinned() {
     let greeting = read_mysql_handshake(handle.local_port()).await;
     assert_eq!(greeting[4], 10);
 }
+
+#[tokio::test]
+async fn repeated_open_and_close_stays_healthy() {
+    require_containers!();
+
+    // A tool that opens a tunnel per job does this all day. It is also the
+    // shape that exposed the graceful-disconnect bug: sessions that vanish
+    // instead of sending SSH_MSG_DISCONNECT make OpenSSH 9.8+ penalise the
+    // source address until it refuses connections outright.
+    for i in 0..20 {
+        let handle = provider()
+            .open(&ssh_config(), &SshCredentials::default(), "mysql", 3306)
+            .await
+            .unwrap_or_else(|e| panic!("tunnel {i} should open: {e}"));
+
+        let greeting = read_mysql_handshake(handle.local_port()).await;
+        assert_eq!(greeting[4], 10, "tunnel {i} should forward MySQL");
+
+        handle.close();
+    }
+}

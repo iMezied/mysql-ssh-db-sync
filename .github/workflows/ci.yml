@@ -41,9 +41,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # Unit tests and the SQLite-backed store suite only. The container-backed
-      # integration suites run in the `fixtures` job, sequenced — see
-      # tests/run-integration.sh for why they cannot share one cargo run.
+      # Unit tests only here; the container-backed integration suites need
+      # Docker and run in the `fixtures` job.
       - name: Test
         run: cargo test --workspace --lib --bins
 
@@ -118,10 +117,12 @@ jobs:
       - name: Verify DEFINER round-trip
         run: tests/verify-definer-roundtrip.sh
 
-      # Sequenced, not `cargo test --workspace`: consecutive SSH-heavy suites
-      # interfere. Documented in tests/run-integration.sh.
       - name: Integration suites (tunnel, introspection, end-to-end)
-        run: tests/run-integration.sh
+        run: cargo test --workspace
+        env:
+          # Turn a "containers not running" skip into a failure, so a broken
+          # harness cannot look like a green build forever.
+          DBSYNC_REQUIRE_CONTAINERS: "1"
 
       - name: Container logs on failure
         if: failure()

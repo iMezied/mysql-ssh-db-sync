@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use russh::Disconnect;
 use russh::client::{self, AuthResult, Handle};
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg, load_secret_key, ssh_key};
 use secrecy::{ExposeSecret, SecretString};
@@ -373,6 +374,23 @@ fn host_port(endpoint: &SshEndpoint) -> String {
     format!("{}:{}", endpoint.host, endpoint.port)
 }
 
+/// Close an SSH session politely.
+///
+/// Dropping the handle would close the TCP socket without sending
+/// SSH_MSG_DISCONNECT. OpenSSH 9.8+ enables `PerSourcePenalties` by default and
+/// treats an authenticated session that vanishes as a penalty-worthy event; a
+/// tool that opens a tunnel per job would steadily accrue penalties until the
+/// server starts refusing the user's address outright with "Not allowed at this
+/// time". Saying goodbye costs one message and avoids that entirely.
+async fn disconnect_politely(session: &Handle<ClientHandler>) {
+    if let Err(e) = session
+        .disconnect(Disconnect::ByApplication, "tunnel closed", "")
+        .await
+    {
+        tracing::debug!("could not send disconnect: {e}");
+    }
+}
+
 /// Wrap a connection failure without flattening host-key verdicts.
 ///
 /// `client::connect` returns the *handler's* error type, so a host-key
@@ -617,7 +635,7 @@ impl TunnelProvider for RusshTunnelProvider {
         tokio::spawn(async move {
             // `jump` is moved in deliberately: the bastion session must outlive
             // every forwarded connection.
-            let _jump = jump;
+            let jump = jump;
 
             loop {
                 tokio::select! {
@@ -648,6 +666,12 @@ impl TunnelProvider for RusshTunnelProvider {
                     }
                 }
             }
+
+            // Say goodbye on the way out, innermost hop first.
+            disconnect_politely(&session).await;
+            if let Some(jump) = jump {
+                disconnect_politely(&jump).await;
+            }
         });
 
         Ok(handle)
@@ -673,8 +697,12 @@ impl TunnelProvider for RusshTunnelProvider {
             fingerprint: "unknown".into(),
         });
 
-        // Dropping the session closes it; we only needed to prove we could
-        // authenticate.
+        // We only needed to prove we could authenticate, but still disconnect
+        // cleanly rather than vanishing.
+        disconnect_politely(&session).await;
+        if let Some(jump) = &_jump {
+            disconnect_politely(jump).await;
+        }
         drop(session);
 
         Ok(SshProbe {
