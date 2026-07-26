@@ -18,6 +18,7 @@ desktop app for DBAs, plus a headless CLI that does exactly the same things.
 - [How a backup job flows through the system](#how-a-backup-job-flows-through-the-system)
 - [Development setup](#development-setup)
 - [Scheduling](#scheduling)
+- [Packaging](#packaging)
 - [Testing](#testing)
 - [Security model](#security-model)
 - [Roadmap](#roadmap)
@@ -273,6 +274,78 @@ or directory ever leaves the machine — the artifact is named, not located.
 Redirects are not followed, delivery is a single 10-second attempt, and a
 failed webhook is logged against the job but never fails the run.
 
+## Packaging
+
+```bash
+cd apps/desktop
+npm run tauri build                 # everything for this platform
+npm run tauri build -- --bundles app,dmg
+```
+
+`beforeBuildCommand` builds the frontend **and** compiles `dbsync` into
+`src-tauri/binaries/`, so the CLI ships inside the bundle. On macOS it lands in
+`DBSync Studio.app/Contents/MacOS/dbsync`, next to the GUI binary — Settings →
+*Command-line tool* links it into `~/.local/bin` so a terminal and `cron` can
+find it.
+
+That matters because every schedule offers a crontab line, and `cron` runs with
+a bare `PATH`. The generated line uses an absolute path to whichever `dbsync`
+is actually resolvable, rather than a bare name that would fail at 03:00.
+
+### Signing and notarization
+
+Nothing is stored in the repository. Both are driven entirely by environment
+variables, so an unsigned build works out of the box and a signed one needs no
+config change:
+
+| Variable | Purpose |
+|---|---|
+| `APPLE_SIGNING_IDENTITY` | e.g. `Developer ID Application: Your Name (TEAMID)` |
+| `APPLE_CERTIFICATE` / `APPLE_CERTIFICATE_PASSWORD` | base64 `.p12`, for CI |
+| `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` | notarization; `APPLE_PASSWORD` is an **app-specific** password |
+| `WINDOWS_CERTIFICATE` / `WINDOWS_CERTIFICATE_PASSWORD` | Authenticode, for CI |
+
+```bash
+export APPLE_SIGNING_IDENTITY="Developer ID Application: … (TEAMID)"
+export APPLE_ID="you@example.com" APPLE_TEAM_ID="TEAMID"
+export APPLE_PASSWORD="abcd-efgh-ijkl-mnop"   # app-specific, not your Apple ID password
+npm run tauri build
+```
+
+Tauri turns on the hardened runtime automatically when signing, which
+notarization requires. [`entitlements.plist`](apps/desktop/src-tauri/entitlements.plist)
+deliberately requests **nothing** and records why each candidate entitlement was
+rejected.
+
+> **Keychain items are bound to the code signature.** Moving from a local
+> ad-hoc build to a Developer ID build — or rotating certificates — makes macOS
+> treat the app as a different application, and saved database passwords prompt
+> for access once more. Nothing is lost; this is macOS working correctly.
+
+Without any credentials the build still succeeds and is ad-hoc signed: it runs
+on the machine that built it, and needs right-click → Open elsewhere.
+
+### Releasing
+
+Push a `v*` tag and [`.github/workflows/release.yml`](.github/workflows/release.yml)
+builds macOS (Apple Silicon and Intel), Windows and Linux bundles, plus a
+standalone `dbsync` archive per platform, into a draft release. Signing
+activates only if the corresponding repository secrets exist.
+
+Run it from the Actions tab with *dry run* to rehearse the whole thing without
+creating a tag or a draft.
+
+Linux bundles are built on `ubuntu-22.04` on purpose: an AppImage linked
+against a newer glibc will not start on an older distribution.
+
+### Auto-update
+
+Not wired up. It needs a signing keypair and a release endpoint to serve the
+manifest, and shipping a plugin pointed at infrastructure that does not exist
+would fail at runtime for every user. `bundle.createUpdaterArtifacts` is
+`false`; turning it on, adding `tauri-plugin-updater` and setting the endpoint
+is the whole change once there is somewhere to publish to.
+
 ## Testing
 
 ```bash
@@ -356,7 +429,7 @@ a schedule that comes due, moves data, verifies it, and enforces retention.
 | **M3′** | PostgreSQL backup and restore, formats, parallel and selective restore | **Done** |
 | **M4′** | Sync wizard, sync plans, retention enforcement | **Done** |
 | **M4′** | Scheduler, tray mode, launch at login, notifications and webhooks | **Done** |
-| **M5′** | Packaging: bundle config, code signing, notarization, auto-update | Next |
+| **M5′** | Packaging: bundles, icons, bundled CLI, signing and notarization config, release workflow | **Done** |
 
 Not in scope for v1: data masking, incremental/binlog/WAL sync, cloud upload,
 multi-user access control. Trait seams are left where they would attach.

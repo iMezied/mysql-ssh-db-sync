@@ -73,14 +73,41 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
             }
         });
 
-    if let Some(icon) = app.default_window_icon() {
-        builder = builder.icon(icon.clone());
-    } else {
-        tracing::warn!("no default window icon; the tray will use a placeholder");
-    }
-
+    builder = with_icon(builder, app);
     builder.build(app)?;
     Ok(())
+}
+
+/// macOS wants a *template* image in the menu bar: a flat silhouette it tints
+/// for the current appearance and inverts when the menu is open. The full
+/// colour app tile reads as wrong there and stays dark against a dark menu bar.
+#[cfg(target_os = "macos")]
+fn with_icon<R: tauri::Runtime, M: tauri::Manager<R>>(
+    builder: TrayIconBuilder<R>,
+    _app: &M,
+) -> TrayIconBuilder<R> {
+    match tauri::image::Image::from_bytes(include_bytes!("../icons/tray-template.png")) {
+        Ok(icon) => builder.icon(icon).icon_as_template(true),
+        Err(e) => {
+            tracing::warn!("could not decode the menu-bar icon: {e}");
+            builder
+        }
+    }
+}
+
+/// Everywhere else the coloured application icon is the convention.
+#[cfg(not(target_os = "macos"))]
+fn with_icon<R: tauri::Runtime, M: tauri::Manager<R>>(
+    builder: TrayIconBuilder<R>,
+    app: &M,
+) -> TrayIconBuilder<R> {
+    match app.default_window_icon() {
+        Some(icon) => builder.icon(icon.clone()),
+        None => {
+            tracing::warn!("no default window icon; the tray will use a placeholder");
+            builder
+        }
+    }
 }
 
 /// Ask the frontend to route somewhere.

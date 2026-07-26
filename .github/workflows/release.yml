@@ -1,0 +1,148 @@
+name: Release
+
+# Tag-triggered, plus a manual button so a release can be rehearsed without
+# creating a tag that would have to be deleted afterwards.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build the bundles but do not publish a release"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bundle:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS (Apple Silicon)
+            os: macos-latest
+            target: aarch64-apple-darwin
+            args: --target aarch64-apple-darwin
+          # Built on the same arm64 runner via cross-compilation; GitHub no
+          # longer offers Intel macOS runners on the free tier.
+          - label: macOS (Intel)
+            os: macos-latest
+            target: x86_64-apple-darwin
+            args: --target x86_64-apple-darwin
+          - label: Linux
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            args: ""
+          - label: Windows
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            args: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      # ubuntu-22.04 rather than 24.04 on purpose: the AppImage produced on a
+      # newer glibc will not start on an older distribution, and building on the
+      # oldest supported base is the only reliable fix.
+      - name: Install Linux system dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            patchelf libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
+
+      - run: npm ci
+        working-directory: apps/desktop
+
+      - name: Build bundles
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+          # ── macOS signing and notarization ──────────────────────────────
+          # All optional. With none of these set the build still succeeds and
+          # produces an ad-hoc-signed app, which runs locally but shows
+          # Gatekeeper's "unidentified developer" warning on another machine.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # Notarization needs an app-specific password, never the Apple ID's
+          # own password.
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+          # ── Windows signing ─────────────────────────────────────────────
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        with:
+          projectPath: apps/desktop
+          args: ${{ matrix.args }}
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          releaseName: DBSync Studio __VERSION__
+          releaseBody: |
+            See CHANGELOG.md.
+
+            macOS builds are signed and notarized only when the repository has
+            Apple credentials configured; otherwise the first launch needs
+            right-click → Open.
+
+            `dbsync`, the command-line tool, ships inside the app. Install it
+            from Settings → Command-line tool, or take it from the standalone
+            archive attached below.
+          releaseDraft: true
+          prerelease: false
+          # A manual run builds and uploads nothing, so the packaging can be
+          # exercised without producing a half-finished draft release.
+          includeUpdaterJson: false
+          dryRun: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+
+      # The CLI is useful on machines that will never run the GUI — a backup
+      # server, a CI runner — so it is published on its own as well as inside
+      # the bundle.
+      - name: Package the standalone CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ matrix.args }}" ]; then
+            cargo build --release -p db-sync-cli --target ${{ matrix.target }}
+            bin_dir="target/${{ matrix.target }}/release"
+          else
+            cargo build --release -p db-sync-cli
+            bin_dir="target/release"
+          fi
+
+          mkdir -p dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "dist/dbsync-${{ matrix.target }}.zip" "./$bin_dir/dbsync.exe"
+          else
+            tar -czf "dist/dbsync-${{ matrix.target }}.tar.gz" -C "$bin_dir" dbsync
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dbsync-cli-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error

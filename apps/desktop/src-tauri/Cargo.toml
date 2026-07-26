@@ -14,9 +14,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 db-sync-engine = { path = "../../../engine" }
 # `tray-icon` is what lets the app keep running — and keep firing schedules —
-# after its window is closed. Without it, closing the window would silently
-# stop every backup the user configured.
-tauri = { version = "2", features = ["specta", "tray-icon"] }
+# after its window is closed. `image-png` decodes the menu-bar template icon.
+tauri = { version = "2", features = ["specta", "tray-icon", "image-png"] }
 tauri-plugin-notification = "2"
 tauri-plugin-autostart = "2"
 async-trait.workspace = true
@@ -24,6 +23,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+thiserror.workspace = true
 anyhow.workspace = true
 uuid.workspace = true
 chrono.workspace = true
@@ -32,3 +32,13 @@ tracing-subscriber.workspace = true
 specta.workspace = true
 specta-typescript.workspace = true
 tauri-specta.workspace = true
+
+# Keep target-specific sections LAST. A `[target.'cfg(...)'.dependencies]`
+# header captures every key that follows it, so one placed mid-file silently
+# makes the rest of the dependency list conditional — and the build only
+# breaks on the platform that was excluded, which is never the one in front of
+# you. This bit the engine crate once already; see DECISIONS.md.
+[target.'cfg(unix)'.dependencies]
+# `access(2)` is the honest way to ask whether a directory is writable; working
+# it out from ownership and group membership gets it wrong for ACLs.
+libc = "0.2"

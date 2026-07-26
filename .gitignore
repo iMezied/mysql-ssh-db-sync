@@ -30,6 +30,20 @@ node_modules/
 apps/desktop/dist/
 apps/desktop/src-tauri/gen/
 
+# ── Bundled CLI ──────────────────────────────────────────────────
+# `npm run bundle:cli` stages a compiled dbsync here for Tauri to pick up as an
+# external binary. Build output, not source; committing a binary would also go
+# stale silently against the engine it was built from.
+apps/desktop/src-tauri/binaries/
+
+# ── Signing material ─────────────────────────────────────────────
+# Nothing here should ever be committed. Certificates and the updater's private
+# key belong in the OS keychain or in CI secrets.
+*.p12
+*.cer
+*.mobileprovision
+.tauri/
+
 # ── macOS ────────────────────────────────────────────────────────
 .DS_Store
 .AppleDouble

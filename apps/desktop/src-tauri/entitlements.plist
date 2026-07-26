@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS entitlements.
+
+  This file deliberately requests NOTHING, and that is the point: every
+  entitlement weakens the hardened runtime, and each one has to be justified by
+  something the app actually cannot do without it. Notarization requires the
+  hardened runtime, which Tauri enables when signing; it does not require any
+  entitlement here.
+
+  Considered and rejected:
+
+  * `com.apple.security.cs.allow-jit` — the web view's JIT runs inside Apple's
+    own `com.apple.WebKit.WebContent` process, which carries its own
+    entitlements. The host process does not compile JavaScript.
+  * `com.apple.security.cs.disable-library-validation` — nothing is dlopen'd at
+    runtime; the Rust binary links the system frameworks and is otherwise
+    static. `mysqldump` and `pg_dump` are separate processes with their own
+    signatures, not libraries loaded into this one.
+  * App Sandbox entitlements — this app is distributed with Developer ID, not
+    through the App Store. Sandboxing it would break the two things it exists
+    to do: run `mysqldump`/`pg_dump` from wherever the user installed them, and
+    write backups to a directory the user chooses.
+
+  A NOTE ON THE KEYCHAIN, which is the one thing that genuinely surprises
+  people here: keychain items are bound to the code signature that created
+  them. Re-signing this app with a different identity — going from an ad-hoc
+  local build to a Developer ID build, or rotating certificates — makes macOS
+  treat it as a different application, and previously saved database passwords
+  will prompt for permission again. That is macOS working correctly, not a bug
+  in the app. Users re-grant access once; nothing is lost.
+-->
+<plist version="1.0">
+<dict>
+</dict>
+</plist>

@@ -33,8 +33,8 @@ use tauri::State;
 use tauri_plugin_autostart::ManagerExt;
 use uuid::Uuid;
 
-use crate::AppState;
 use crate::events::JobFinished;
+use crate::{AppState, cli_tool};
 use tauri_specta::Event as _;
 
 /// Error shape crossing into the webview.
@@ -842,12 +842,22 @@ pub async fn preview_cron(
 pub async fn crontab_line(state: State<'_, AppState>, id: Uuid) -> CmdResult<String> {
     let schedule = state.store.require_schedule(id).await?;
 
-    // The GUI binary is not the CLI. Naming `dbsync` plainly and letting the
-    // user place it on PATH is honest; printing this executable's own path
-    // would produce a line that silently does nothing.
+    // An absolute path, whenever one is known. `cron` runs with a bare `PATH`
+    // that usually contains neither ~/.local/bin nor the inside of an
+    // application bundle, so a line saying just `dbsync` is a line that fails
+    // at 03:00 with "command not found". Prefer whatever is already on the
+    // user's PATH, fall back to the copy shipped in the bundle, and only emit
+    // a bare name when neither exists.
+    let status = cli_tool::status();
+    let program = status
+        .installed_path
+        .or(status.bundled_path)
+        .unwrap_or_else(|| "dbsync".into());
+
     Ok(format!(
-        "{} dbsync --store {} schedule run {} >> {} 2>&1",
+        "{} {} --store {} schedule run {} >> {} 2>&1",
         schedule.cron.as_str(),
+        shell_quote(&program),
         shell_quote(&state.store_path.display().to_string()),
         schedule.id,
         shell_quote(
@@ -968,4 +978,24 @@ mod tests {
     fn an_embedded_quote_cannot_break_out_of_the_crontab_line() {
         assert_eq!(shell_quote("/tmp/it's here"), r"'/tmp/it'\''s here'");
     }
+}
+
+// ── Command-line tool ───────────────────────────────────────────────────
+
+#[tauri::command]
+#[specta::specta]
+pub async fn cli_status() -> CmdResult<cli_tool::CliStatus> {
+    Ok(cli_tool::status())
+}
+
+/// Link the bundled `dbsync` somewhere a terminal will find it.
+///
+/// Never escalates privileges. When nothing is writable the result carries the
+/// exact command for the user to run instead — an app that asks for an
+/// administrator password to write into a system directory is asking for more
+/// trust than this feature is worth.
+#[tauri::command]
+#[specta::specta]
+pub async fn install_cli() -> CmdResult<cli_tool::CliInstall> {
+    cli_tool::install().map_err(|e| CommandError::new("cli_install", e.to_string()))
 }

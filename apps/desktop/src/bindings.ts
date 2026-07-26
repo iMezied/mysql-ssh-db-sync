@@ -118,6 +118,16 @@ export const commands = {
 	schedulerStatus: () => typedError<SchedulerStatus, CommandError>(__TAURI_INVOKE("scheduler_status")),
 	getAppSettings: () => typedError<AppSettings, CommandError>(__TAURI_INVOKE("get_app_settings")),
 	setAppSettings: (next: AppSettings) => typedError<AppSettings, CommandError>(__TAURI_INVOKE("set_app_settings", { next })),
+	cliStatus: () => typedError<CliStatus, CommandError>(__TAURI_INVOKE("cli_status")),
+	/**
+	 *  Link the bundled `dbsync` somewhere a terminal will find it.
+	 * 
+	 *  Never escalates privileges. When nothing is writable the result carries the
+	 *  exact command for the user to run instead — an app that asks for an
+	 *  administrator password to write into a system directory is asking for more
+	 *  trust than this feature is worth.
+	 */
+	installCli: () => typedError<CliInstall, CommandError>(__TAURI_INVOKE("install_cli")),
 };
 
 /** Events */
@@ -182,6 +192,29 @@ export type Artifact = {
 export type BackupRequest = {
 	common: CommonBackupOptions,
 	engine: EngineBackupOptions,
+};
+
+export type CliInstall = {
+	path: string,
+	/**
+	 *  False when the directory is not on the user's `PATH`, so the UI can say
+	 *  what still has to be done rather than claiming success.
+	 */
+	on_path: boolean,
+	/**  Set when nothing could be written and the user has to do it themselves. */
+	manual_command: string | null,
+};
+
+/**  Where the CLI is, and whether a terminal can already find it. */
+export type CliStatus = {
+	/**  The copy shipped inside this application bundle, if it is there. */
+	bundled_path: string | null,
+	/**  An existing `dbsync` already on `PATH`, if any. */
+	installed_path: string | null,
+	/**  True when the thing on `PATH` is the copy this app ships. */
+	linked_to_bundle: boolean,
+	/**  Directories this app could write a link into, best first. */
+	install_targets: string[],
 };
 
 /**

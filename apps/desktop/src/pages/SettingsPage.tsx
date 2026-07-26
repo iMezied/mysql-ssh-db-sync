@@ -85,6 +85,8 @@ export default function SettingsPage() {
           )}
         </section>
 
+        <CommandLineSection />
+
         <section className="space-y-3">
           <h2 className="text-sm font-medium text-slate-200">About</h2>
           <dl className="panel divide-y divide-slate-800">
@@ -101,6 +103,102 @@ export default function SettingsPage() {
         </section>
       </div>
     </>
+  );
+}
+
+/**
+ * Install the bundled `dbsync` somewhere a terminal can find it.
+ *
+ * Worth its own section because every schedule offers a crontab line that
+ * invokes it — without this the first thing that line asks of the user is to
+ * go and find a binary they were never given.
+ */
+function CommandLineSection() {
+  const queryClient = useQueryClient();
+  const status = useQuery({ queryKey: ["cli-status"], queryFn: api.cliStatus });
+
+  const install = useMutation({
+    mutationFn: api.installCli,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["cli-status"] });
+      void queryClient.invalidateQueries({ queryKey: ["schedules"] });
+    },
+  });
+
+  const s = status.data;
+  const done = install.data;
+
+  return (
+    <section className="space-y-3">
+      <h2 className="text-sm font-medium text-slate-200">Command-line tool</h2>
+
+      <div className="panel space-y-3 p-4">
+        <p className="max-w-2xl text-xs leading-relaxed text-slate-500">
+          <code className="text-slate-400">dbsync</code> does everything this app
+          does, headlessly — it reads the same connections, plans and schedules.
+          Installing it puts it on your <code className="text-slate-400">PATH</code>{" "}
+          so the crontab line each schedule offers works as written.
+        </p>
+
+        {s?.linked_to_bundle ? (
+          <p className="text-xs text-emerald-400">
+            Installed at <code>{s.installed_path}</code> — pointing at this app.
+          </p>
+        ) : s?.installed_path ? (
+          <p className="text-xs text-amber-300/90">
+            A different <code>dbsync</code> is already on your PATH at{" "}
+            <code>{s.installed_path}</code>. Installing will not replace it
+            unless it is a link.
+          </p>
+        ) : s && !s.bundled_path ? (
+          <p className="text-xs text-slate-500">
+            This build does not ship the CLI. Build it with{" "}
+            <code className="text-slate-400">cargo build -p db-sync-cli</code>.
+          </p>
+        ) : null}
+
+        {s?.bundled_path && !s.linked_to_bundle && (
+          <button
+            onClick={() => install.mutate()}
+            disabled={install.isPending}
+            className="rounded-md bg-blue-600 px-3 py-1.5 text-sm font-medium text-white transition hover:bg-blue-500 disabled:opacity-50"
+          >
+            {install.isPending ? "Installing…" : "Install command-line tool"}
+          </button>
+        )}
+
+        {done && (
+          <div className="space-y-1.5">
+            <p className="text-xs text-slate-300">
+              Linked at <code className="text-slate-200">{done.path}</code>
+            </p>
+            {!done.on_path && !done.manual_command && (
+              <p className="text-xs text-amber-300/90">
+                That directory is not on your PATH yet. Add it with{" "}
+                <code>export PATH="$HOME/.local/bin:$PATH"</code> in your shell
+                profile.
+              </p>
+            )}
+            {done.manual_command && (
+              <>
+                <p className="text-xs text-amber-300/90">
+                  Nothing writable was available, so run this yourself:
+                </p>
+                <code className="block overflow-x-auto whitespace-pre rounded bg-slate-950 px-2 py-1.5 font-mono text-[11px] text-slate-300">
+                  {done.manual_command}
+                </code>
+              </>
+            )}
+          </div>
+        )}
+
+        {install.isError && (
+          <p className="text-xs text-red-400">
+            {(install.error as Error).message}
+          </p>
+        )}
+      </div>
+    </section>
   );
 }
 

@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!--
+    Master application icon.
+
+    Kept as vector so the 1024px slot macOS asks for on Retina is rendered
+    rather than upscaled from the old 512px raster, which went visibly soft on
+    the gradient. Regenerate every platform size with:
+
+        npm run tauri icon src-tauri/icons/source/icon.png
+  -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0.35" y2="1">
+      <stop offset="0" stop-color="#3b7ff5"/>
+      <stop offset="0.55" stop-color="#2563eb"/>
+      <stop offset="1" stop-color="#1d3fbf"/>
+    </linearGradient>
+
+    <linearGradient id="disc" x1="0" y1="0" x2="0.2" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#dfe6f5"/>
+    </linearGradient>
+
+    <!-- Lifts the cylinder off the tile so the shape reads at 32px. -->
+    <filter id="lift" x="-25%" y="-25%" width="150%" height="150%">
+      <feDropShadow dx="0" dy="10" stdDeviation="18" flood-color="#0b1f66" flood-opacity="0.28"/>
+    </filter>
+  </defs>
+
+  <!-- Squircle-ish tile, inset so the bundled icon keeps macOS's usual margin. -->
+  <rect x="72" y="72" width="880" height="880" rx="220" ry="220" fill="url(#tile)"/>
+
+  <!-- A touch of top-edge light, as every other tile icon on the dock has. -->
+  <rect x="72" y="72" width="880" height="880" rx="220" ry="220"
+        fill="none" stroke="#ffffff" stroke-opacity="0.18" stroke-width="6"/>
+
+  <g filter="url(#lift)">
+    <!-- Database cylinder: body plus the top ellipse. -->
+    <path d="M 262 330
+             a 250 74 0 0 1 500 0
+             v 364
+             a 250 74 0 0 1 -500 0
+             z"
+          fill="url(#disc)"/>
+    <ellipse cx="512" cy="330" rx="250" ry="74" fill="#ffffff"/>
+
+    <!-- The two platter divisions. Wider gaps than the old raster so they
+         survive being scaled down to a 16px tray glyph. -->
+    <path d="M 262 460 a 250 74 0 0 0 500 0 v 26 a 250 74 0 0 1 -500 0 z"
+          fill="#93a7cc" fill-opacity="0.55"/>
+    <path d="M 262 590 a 250 74 0 0 0 500 0 v 26 a 250 74 0 0 1 -500 0 z"
+          fill="#93a7cc" fill-opacity="0.55"/>
+  </g>
+</svg>

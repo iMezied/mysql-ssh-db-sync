@@ -83,4 +83,6 @@ export const api = {
   getAppSettings: () => unwrap(commands.getAppSettings()),
   setAppSettings: (...args: Parameters<typeof commands.setAppSettings>) =>
     unwrap(commands.setAppSettings(...args)),
+  cliStatus: () => unwrap(commands.cliStatus()),
+  installCli: () => unwrap(commands.installCli()),
 };

@@ -741,3 +741,103 @@ reads the expression in local time.
 Paths in that line are shell-quoted. `/Applications/DBSync Studio.app/…` is the
 normal macOS case, and an unquoted crontab line there silently runs the wrong
 command.
+
+## M5′ — Packaging
+
+### The CLI ships inside the app bundle
+
+Every schedule offers a crontab line that invokes `dbsync`. Without the CLI in
+the bundle, the first thing that line asks of the user is to go and obtain a
+second binary that was never published anywhere.
+
+`beforeBuildCommand` compiles it and stages it as a Tauri external binary, so it
+lands next to the GUI executable — `Contents/MacOS/dbsync` on macOS. Settings
+offers to link it somewhere a shell will look.
+
+The generated crontab line uses an **absolute path** to whichever `dbsync` is
+actually resolvable, preferring one already on `PATH` and falling back to the
+bundled copy. `cron` runs with a bare `PATH` that contains neither
+`~/.local/bin` nor the inside of an application bundle, so a line saying just
+`dbsync` is a line that fails at 03:00 with "command not found".
+
+Verified against a real bundle: the CLI inside `DBSync Studio.app` and the GUI
+resolve the same store path, which is the whole point of the engine/CLI split.
+
+### Installing the CLI never escalates privileges
+
+`~/.local/bin` is preferred: it needs no privileges, is per-user, and cannot
+collide with a package manager. `/usr/local/bin` and `/opt/homebrew/bin` are
+offered only when they already exist and `access(2)` says they are writable —
+asking the OS beats reasoning about ownership, groups and ACLs.
+
+When nothing is writable the result carries the exact `ln -s` command instead of
+a failure. Being handed a command you can read is better than being handed a
+password prompt from an application that wants to write to a system directory.
+
+An existing `dbsync` is replaced only if it is a symlink. A real file there was
+put there by someone, and silently destroying it would be worse than declining.
+
+The result also reports whether the directory is actually **on** `PATH`.
+Claiming success for a link no shell will ever look at is worse than saying
+nothing.
+
+### macOS gets a template menu-bar icon, not the app tile
+
+macOS menu-bar icons are template images: flat silhouettes the system tints for
+the current appearance and inverts when the menu is open. A full-colour tile
+there reads as wrong and stays dark against a dark menu bar. The tray uses a
+dedicated monochrome glyph on macOS and the coloured application icon
+everywhere else.
+
+The master icon is kept as SVG and rasterised at 1024 for the `.icns`, because
+the previous 512px raster went visibly soft on the gradient when macOS upscaled
+it for Retina. Quick Look is the only rasteriser available on this machine and
+it renders an SVG at its *declared* size without scaling small ones up, so both
+source files declare a large intrinsic size and are downsampled afterwards.
+
+### The entitlements file requests nothing
+
+Every entitlement weakens the hardened runtime and each has to be justified by
+something the app cannot do without. Notarization needs the hardened runtime,
+which Tauri enables when signing; it does not need an entitlement.
+
+`allow-jit` was rejected because the web view's JIT runs in Apple's own
+`WebContent` process. `disable-library-validation` was rejected because nothing
+is `dlopen`'d — `mysqldump` and `pg_dump` are separate processes with their own
+signatures, not libraries loaded into ours. App Sandbox entitlements were
+rejected because sandboxing would break both things the app exists to do: run
+the vendor tools from wherever the user installed them, and write backups where
+the user chooses.
+
+The file exists anyway, empty and commented, so the reasoning is recorded where
+someone would go looking to add one.
+
+### Keychain items are bound to the code signature
+
+Moving from an ad-hoc local build to a Developer ID build, or rotating
+certificates, makes macOS treat the app as a different application, and saved
+database passwords prompt for access again. This is documented in the README
+and in the entitlements file because it looks exactly like a bug the first time
+it happens, and the natural reaction — re-entering every password — is the
+right one but only if you know that is what is going on.
+
+### Signing is entirely environment-driven
+
+No identity, certificate path or team ID appears in `tauri.conf.json`. An
+unsigned build works out of the box and a signed one needs no config change,
+which also means a fork or a contributor without an Apple account can build the
+app without editing anything.
+
+### No auto-updater
+
+It needs a signing keypair and an endpoint serving an update manifest. Shipping
+`tauri-plugin-updater` pointed at infrastructure that does not exist would fail
+at runtime for every user, and a placeholder public key would fail signature
+verification on the first check. `createUpdaterArtifacts` is `false` until
+there is somewhere to publish to.
+
+### Linux bundles are built on the oldest supported base
+
+`ubuntu-22.04`, not `ubuntu-latest`. An AppImage linked against a newer glibc
+will not start on an older distribution, and there is no runtime fix — only
+building on the oldest base you intend to support.

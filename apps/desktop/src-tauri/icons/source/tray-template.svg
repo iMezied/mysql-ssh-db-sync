@@ -1,0 +1,43 @@
+<!--
+  Intrinsic size is 512 with a 64-unit viewBox: Quick Look renders an SVG at
+  its declared size and will not scale a small one up, so a 64x64 declaration
+  produced a glyph sitting in the corner of the canvas. Draw big, downsample.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 64 64">
+  <!--
+    macOS menu-bar icon.
+
+    A *template* image: macOS ignores the colour and uses only the alpha
+    channel, tinting it to match a light or dark menu bar and inverting it when
+    the menu is open. That is why this is a flat black silhouette rather than
+    the app icon — a full-colour tile in the menu bar reads as wrong on macOS
+    and stays dark-on-dark when the user switches appearance.
+
+    Drawn without the app icon's tile and shadow: at 16pt those become mud.
+    Regenerate with:
+
+        qlmanage -t -s 64 -o . tray-template.svg
+  -->
+  <g fill="#000000">
+    <!-- Top platter. -->
+    <ellipse cx="32" cy="15" rx="21" ry="7.5"/>
+
+    <!-- Body, drawn as two bands so the gaps read as platter divisions even
+         when the whole glyph is 16 pixels tall. -->
+    <path d="M 11 20
+             a 21 7.5 0 0 0 42 0
+             v 8
+             a 21 7.5 0 0 1 -42 0
+             z"/>
+    <path d="M 11 32
+             a 21 7.5 0 0 0 42 0
+             v 8
+             a 21 7.5 0 0 1 -42 0
+             z"/>
+    <path d="M 11 44
+             a 21 7.5 0 0 0 42 0
+             v 5
+             a 21 7.5 0 0 1 -42 0
+             z"/>
+  </g>
+</svg>

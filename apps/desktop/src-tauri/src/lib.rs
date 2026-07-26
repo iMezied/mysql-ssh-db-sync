@@ -17,6 +17,7 @@ use tauri::{Manager, RunEvent, WindowEvent};
 use tauri_specta::{Event as _, collect_commands, collect_events};
 use tokio_util::sync::CancellationToken;
 
+mod cli_tool;
 mod commands;
 mod events;
 mod hooks;
@@ -141,6 +142,8 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             commands::scheduler_status,
             commands::get_app_settings,
             commands::set_app_settings,
+            commands::cli_status,
+            commands::install_cli,
         ])
         .events(collect_events![
             JobProgress,
