@@ -288,11 +288,19 @@ impl BackupRequest {
             }
         }
 
+        // Not yet implemented, and refused rather than ignored.
+        //
+        // Ignoring it would be actively dangerous: `artifact_format()` returns
+        // `MydumperDir` whenever this is set, and `MydumperDir::is_directory()`
+        // is true — so a silently-ignored setting produces a single gzipped
+        // file carrying a manifest that declares it a directory, which the
+        // restore path then believes. A missing feature is a disappointment; a
+        // manifest that lies about the artifact is a corrupted restore.
         if let EngineBackupOptions::Mysql(o) = &self.engine
-            && o.parallel_threads == Some(0)
+            && o.parallel_threads.is_some()
         {
-            return Err(BackupError::Invalid(
-                "parallel_threads must be at least 1".into(),
+            return Err(BackupError::NotImplemented(
+                "parallel MySQL dumps (mydumper). Leave parallel_threads unset for a normal dump",
             ));
         }
 
@@ -487,17 +495,37 @@ mod tests {
     }
 
     #[test]
-    fn encryption_and_parallel_mysql_dump_are_mutually_exclusive() {
-        let mut c = common();
-        c.encrypt = true;
+    fn a_parallel_mysql_dump_is_refused_rather_than_ignored() {
+        // The dangerous shape this guards: `parallel_threads` flips
+        // `artifact_format()` to `MydumperDir`, whose `is_directory()` is true,
+        // but nothing in the MySQL backend reads the option. Ignoring it would
+        // write one gzipped file and label it a directory.
         let req = BackupRequest {
-            common: c,
+            common: common(),
             engine: EngineBackupOptions::Mysql(MysqlBackupOptions {
                 parallel_threads: Some(4),
                 ..Default::default()
             }),
         };
-        assert!(req.validate(&profile(Engine::Mysql)).is_err());
+        let err = req.validate(&profile(Engine::Mysql)).unwrap_err();
+        assert!(matches!(err, BackupError::NotImplemented(_)), "got: {err}");
+        assert!(err.to_string().contains("parallel_threads"), "got: {err}");
+    }
+
+    #[test]
+    fn the_format_a_refused_option_would_have_declared_is_a_directory() {
+        // Documents *why* the check above has to exist. If this ever stops
+        // being a directory format, the refusal can be revisited.
+        let parallel = EngineBackupOptions::Mysql(MysqlBackupOptions {
+            parallel_threads: Some(4),
+            ..Default::default()
+        });
+        assert!(parallel.artifact_format().is_directory());
+        assert!(
+            !EngineBackupOptions::Mysql(MysqlBackupOptions::default())
+                .artifact_format()
+                .is_directory()
+        );
     }
 
     #[test]

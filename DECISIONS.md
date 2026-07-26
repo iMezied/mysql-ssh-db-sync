@@ -903,3 +903,24 @@ works.
 
 `tauri.bundle.conf.json` carries the one line, and `npm run bundle` stages the
 CLI and applies the overlay in a single command that cannot forget either step.
+
+## M11 — Parallel MySQL dumps are refused, not ignored
+
+`MysqlBackupOptions::parallel_threads`, `Tool::Mydumper`,
+`ToolOverrides::mydumper` and `ArtifactFormat::MydumperDir` have all existed
+since M0. The MySQL backend never reads the option — but
+`EngineBackupOptions::artifact_format()` returns `MydumperDir` whenever it is
+set, and `MydumperDir::is_directory()` is `true`.
+
+So a silently-ignored setting produced a single gzipped file carrying a
+manifest that declared it a directory, and the restore path believes the
+manifest. A missing feature is a disappointment; a manifest that lies about
+the shape of the artifact is a corrupted restore.
+
+`validate` now returns `NotImplemented` for it. One test asserts the refusal,
+and a second documents the reason by asserting that the format it would have
+declared *is* a directory — so if that ever changes, the refusal gets
+revisited rather than silently outliving its cause.
+
+PostgreSQL's `parallel_jobs` is genuinely implemented (`pg_dump -j`, directory
+format only) and is unaffected.
