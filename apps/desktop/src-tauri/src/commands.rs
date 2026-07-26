@@ -11,14 +11,15 @@
 
 use std::path::PathBuf;
 
-use db_sync_engine::backup::BackupRequest;
+use db_sync_engine::backup::{BackupRequest, TableSelection};
 use db_sync_engine::connect::{self, ConnectionReport};
 use db_sync_engine::db::{DatabaseInfo, TableInfo};
 use db_sync_engine::events::{JobKind, JobPhase};
 use db_sync_engine::job::JobRecord;
 use db_sync_engine::job::{JobContext, JobOutcome};
 use db_sync_engine::library::{self, Artifact, IntegrityCheck};
-use db_sync_engine::ops;
+use db_sync_engine::ops::{self, SyncRequest};
+use db_sync_engine::plan::{self, SyncPlan, SyncPlanCreate};
 use db_sync_engine::profile::{ConnectionProfile, ProfileCreate, ProfileUpdate};
 use db_sync_engine::restore::RestoreRequest;
 use db_sync_engine::secrets::{self, SecretKind};
@@ -55,7 +56,7 @@ impl From<StoreError> for CommandError {
     fn from(e: StoreError) -> Self {
         let kind = match &e {
             StoreError::DuplicateName(_) => "duplicate_name",
-            StoreError::ProfileNotFound(_) => "not_found",
+            StoreError::ProfileNotFound(_) | StoreError::SyncPlanNotFound(_) => "not_found",
             StoreError::Corrupt { .. } => "corrupt",
             StoreError::Sqlx(_) | StoreError::Migrate(_) => "storage",
         };
@@ -528,4 +529,147 @@ pub async fn delete_artifact(path: String) -> CmdResult<()> {
         &artifact,
     ));
     Ok(())
+}
+
+// ── Sync plans ──────────────────────────────────────────────────────────
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_sync_plans(
+    state: State<'_, AppState>,
+    profile_id: Uuid,
+) -> CmdResult<Vec<SyncPlan>> {
+    Ok(state.store.list_sync_plans(profile_id).await?)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn create_sync_plan(
+    state: State<'_, AppState>,
+    input: SyncPlanCreate,
+) -> CmdResult<SyncPlan> {
+    if input.name.trim().is_empty() {
+        return Err(CommandError::new("invalid", "plan name cannot be empty"));
+    }
+    state.store.require_profile(input.profile_id).await?;
+    Ok(state.store.create_sync_plan(input).await?)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn update_sync_plan(
+    state: State<'_, AppState>,
+    id: Uuid,
+    selections: Vec<TableSelection>,
+) -> CmdResult<SyncPlan> {
+    Ok(state.store.update_sync_plan(id, selections).await?)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_sync_plan(state: State<'_, AppState>, id: Uuid) -> CmdResult<bool> {
+    Ok(state.store.delete_sync_plan(id).await?)
+}
+
+/// Parse a legacy `tables.conf` into selections.
+///
+/// Lets an existing Bash-tool setup be carried over without retyping a couple
+/// of hundred table names.
+#[tauri::command]
+#[specta::specta]
+pub async fn import_tables_conf(contents: String) -> CmdResult<Vec<TableSelection>> {
+    Ok(plan::parse_tables_conf(&contents))
+}
+
+// ── Sync ────────────────────────────────────────────────────────────────
+
+/// Start a source-to-destination sync and return its job id.
+#[tauri::command]
+#[specta::specta]
+pub async fn start_sync(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    source_id: Uuid,
+    dest_id: Uuid,
+    request: SyncRequest,
+) -> CmdResult<Uuid> {
+    let source = state.store.require_profile(source_id).await?;
+    let dest = state.store.require_profile(dest_id).await?;
+
+    // Everything checkable offline is checked before a job appears in history.
+    request
+        .backup
+        .validate(&source)
+        .map_err(|e| CommandError::new("invalid", e.to_string()))?;
+    if source.engine != dest.engine {
+        return Err(CommandError::new(
+            "engine_mismatch",
+            format!(
+                "cannot sync a {:?} source to a {:?} destination",
+                source.engine, dest.engine
+            ),
+        ));
+    }
+
+    let job_id = Uuid::new_v4();
+    let ctx = JobContext::with_sender(job_id, state.event_tx.clone());
+    state.jobs.register(&ctx).await;
+
+    let options_json = serde_json::to_string(&request).unwrap_or_else(|_| "{}".into());
+    ops::record_start(
+        &state.store,
+        &ctx,
+        JobKind::Sync,
+        source_id,
+        Some(dest_id),
+        options_json,
+    )
+    .await
+    .map_err(|e| CommandError::new("storage", e.to_string()))?;
+
+    let store = state.store.clone();
+    let jobs = state.jobs.clone();
+
+    tauri::async_runtime::spawn(async move {
+        let result = ops::sync(&source, &dest, &request, &store, &ctx).await;
+
+        let (outcome, artifact) = match &result {
+            Ok(o) => {
+                // A sync whose verification failed is not a success, even
+                // though every individual step reported one.
+                let verified = o.verification.as_ref().is_none_or(|r| r.passed());
+                let outcome = if verified {
+                    JobOutcome::Success
+                } else {
+                    ctx.emit_error(
+                        JobPhase::Done,
+                        "the data was restored but verification found discrepancies",
+                    )
+                    .await;
+                    JobOutcome::Failed
+                };
+                (outcome, Some(o.artifact_path.clone()))
+            }
+            Err(e) => {
+                ctx.emit_error(JobPhase::Done, e.to_string()).await;
+                let outcome = if ctx.is_cancelled() {
+                    JobOutcome::Cancelled
+                } else {
+                    JobOutcome::Failed
+                };
+                (outcome, None)
+            }
+        };
+
+        let _ = ops::record_finish(&store, &ctx, outcome, artifact).await;
+        jobs.unregister(job_id).await;
+
+        let _ = JobFinished {
+            job_id: job_id.to_string(),
+            outcome: outcome.as_str().to_string(),
+        }
+        .emit(&app);
+    });
+
+    Ok(job_id)
 }

@@ -57,6 +57,19 @@ export const commands = {
 	 *  finished would freeze the UI for the length of the job.
 	 */
 	startBackup: (profileId: string, request: BackupRequest) => typedError<string, CommandError>(__TAURI_INVOKE("start_backup", { profileId, request })),
+	/**  Start a source-to-destination sync and return its job id. */
+	startSync: (sourceId: string, destId: string, request: SyncRequest) => typedError<string, CommandError>(__TAURI_INVOKE("start_sync", { sourceId, destId, request })),
+	listSyncPlans: (profileId: string) => typedError<SyncPlan[], CommandError>(__TAURI_INVOKE("list_sync_plans", { profileId })),
+	createSyncPlan: (input: SyncPlanCreate) => typedError<SyncPlan, CommandError>(__TAURI_INVOKE("create_sync_plan", { input })),
+	updateSyncPlan: (id: string, selections: TableSelection[]) => typedError<SyncPlan, CommandError>(__TAURI_INVOKE("update_sync_plan", { id, selections })),
+	deleteSyncPlan: (id: string) => typedError<boolean, CommandError>(__TAURI_INVOKE("delete_sync_plan", { id })),
+	/**
+	 *  Parse a legacy `tables.conf` into selections.
+	 * 
+	 *  Lets an existing Bash-tool setup be carried over without retyping a couple
+	 *  of hundred table names.
+	 */
+	importTablesConf: (contents: string) => typedError<TableSelection[], CommandError>(__TAURI_INVOKE("import_tables_conf", { contents })),
 	/**  Start a restore and return its job id immediately. */
 	startRestore: (profileId: string, request: RestoreRequest) => typedError<string, CommandError>(__TAURI_INVOKE("start_restore", { profileId, request })),
 	backupDirectory: () => typedError<string, CommandError>(__TAURI_INVOKE("backup_directory")),
@@ -425,6 +438,13 @@ export type RestoreRequest = {
 	typed_confirmation: string | null,
 };
 
+export type RetentionPolicy = {
+	/**  Keep at most this many of the most recent artifacts. */
+	keep_last: number | null,
+	/**  Delete artifacts older than this many days. */
+	max_age_days: number | null,
+};
+
 /**  What the UI is allowed to know about stored secrets: whether they exist. */
 export type SecretStatus = {
 	has_db_password: boolean,
@@ -453,6 +473,41 @@ export type SshEndpoint = {
 };
 
 export type StepOutcome = { status: "ok"; detail: string } | { status: "failed"; detail: string } | { status: "skipped"; detail: string };
+
+export type SyncPlan = {
+	id: string,
+	profile_id: string,
+	name: string,
+	database: string,
+	selections: TableSelection[],
+	/**
+	 *  Bumped on every save, so a plan that changed under a schedule is
+	 *  visible rather than silent.
+	 */
+	revision: number,
+	created_at: string,
+	updated_at: string,
+};
+
+export type SyncPlanCreate = {
+	profile_id: string,
+	name: string,
+	database: string,
+	selections: TableSelection[],
+};
+
+/**  Back up a source and restore it to a destination as one job. */
+export type SyncRequest = {
+	backup: BackupRequest,
+	naming: TargetNaming,
+	restore: EngineRestoreOptions,
+	/**  Compare exact row counts once the restore finishes. */
+	verify: boolean,
+	/**  Applied to the source's backup directory after a successful run. */
+	retention: RetentionPolicy | null,
+	/**  Required when the destination naming strategy is destructive. */
+	typed_confirmation: string | null,
+};
 
 export type TableInfo = {
 	schema: string | null,

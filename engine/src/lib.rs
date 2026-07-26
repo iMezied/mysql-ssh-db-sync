@@ -23,6 +23,7 @@ pub mod library;
 pub mod manifest;
 pub mod ops;
 pub mod paths;
+pub mod plan;
 pub mod profile;
 pub mod restore;
 pub mod retention;

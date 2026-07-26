@@ -481,3 +481,66 @@ target block the same way.
 
 Worth checking the whole manifest after any edit near a `[target....]` header —
 appending to `[dependencies]` is not what a naive text insertion does.
+
+---
+
+## M4′ — Cross-server sync
+
+### Sync is composed, not reimplemented
+
+`ops::sync` calls the same `backup`, `restore` and `verify_restore` the
+standalone commands use. A second dump/restore implementation tuned for the
+pipeline would drift from the one the individual buttons run, and the
+difference would only show up on the day someone relies on it.
+
+The engine check comes first and fails before anything is dumped: copying
+MySQL to PostgreSQL is a migration, not a sync, and nothing here translates
+dialects. A test asserts no artifact is produced when the check trips.
+
+### Retention runs after verification, and only if it passed
+
+Deleting old backups is the last thing a sync does, and it is skipped entirely
+when verification found discrepancies — a failed verification is exactly the
+moment the older backups matter most.
+
+The plan is logged before it is acted on, so the job log records precisely
+which files went. Combined with the rule that the newest artifact is never
+deleted, a retention policy cannot leave a user with nothing.
+
+### A sync that restored but failed verification is not a success
+
+Every individual step can report success while the data is wrong. The job is
+recorded as `failed` when verification finds discrepancies, because the
+question a user asks the history is "did it work", not "did each command exit
+zero".
+
+### The sync wizard never offers a destructive target
+
+Standalone restore supports drop-and-recreate with typed confirmation. The
+wizard deliberately does not: it always creates a fresh timestamped database.
+This is the screen most likely to be aimed at production by mistake, and the
+non-destructive path costs nothing.
+
+The engine still enforces confirmation independently — a test drives
+`ops::sync` with a `DropAndRecreate` target and no confirmation and asserts it
+is refused, so the guarantee does not depend on the UI.
+
+### Sync plans replace tables.conf, and can import it
+
+The Bash tool required a hand-maintained `tables.conf`, git-ignored and
+therefore easy to drift from the schema. Plans live in the store, are attached
+to a profile, and carry a revision that bumps on save so a plan that changed
+under a schedule is visible.
+
+`plan::parse_tables_conf` reads the old format, matching the original loader's
+behaviour down to taking the first whitespace-delimited token per line (the old
+script piped it through `awk '{print $1}'`) and skipping duplicates. The
+repository's own `table.conf` has 215 entries; nobody should retype those.
+
+`missing_from` and `unlisted_in` report drift in both directions. A plan
+outlives the schema it was written against, and silently backing up less than
+the user believes is the failure worth preventing.
+
+The `sync_plans` table has existed since the M0 migration and was unused until
+now — schema written ahead of the code that needs it, so no migration was
+required here.

@@ -12,8 +12,10 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
+use crate::backup::TableSelection;
 use crate::events::JobKind;
 use crate::job::{JobOutcome, JobRecord};
+use crate::plan::{SyncPlan, SyncPlanCreate};
 use crate::profile::{
     ConnectionProfile, DbConfig, ProfileCreate, ProfileUpdate, SshConfig, ToolOverrides,
 };
@@ -35,6 +37,8 @@ pub enum StoreError {
     ProfileNotFound(Uuid),
     #[error("a profile named {0:?} already exists")]
     DuplicateName(String),
+    #[error("no sync plan with id {0}")]
+    SyncPlanNotFound(Uuid),
 }
 
 type Result<T> = std::result::Result<T, StoreError>;
@@ -447,5 +451,120 @@ fn row_to_job(row: sqlx::sqlite::SqliteRow) -> Result<JobRecord> {
         artifact_path: row.get("artifact_path"),
         options_json: row.get("options_json"),
         log: row.get("log"),
+    })
+}
+
+// ── Sync plans ──────────────────────────────────────────────────────────
+
+impl Store {
+    pub async fn list_sync_plans(&self, profile_id: Uuid) -> Result<Vec<SyncPlan>> {
+        let rows = sqlx::query(
+            "SELECT id, profile_id, name, database_name, table_selections, revision, \
+             created_at, updated_at FROM sync_plans WHERE profile_id = ?1 ORDER BY name",
+        )
+        .bind(profile_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(row_to_plan).collect()
+    }
+
+    pub async fn get_sync_plan(&self, id: Uuid) -> Result<Option<SyncPlan>> {
+        let row = sqlx::query(
+            "SELECT id, profile_id, name, database_name, table_selections, revision, \
+             created_at, updated_at FROM sync_plans WHERE id = ?1",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(row_to_plan).transpose()
+    }
+
+    pub async fn create_sync_plan(&self, input: SyncPlanCreate) -> Result<SyncPlan> {
+        let now = Utc::now();
+        let plan = SyncPlan {
+            id: Uuid::new_v4(),
+            profile_id: input.profile_id,
+            name: input.name,
+            database: input.database,
+            selections: input.selections,
+            revision: 1,
+            created_at: now,
+            updated_at: now,
+        };
+
+        sqlx::query(
+            "INSERT INTO sync_plans (id, profile_id, name, database_name, table_selections, \
+             revision, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )
+        .bind(plan.id.to_string())
+        .bind(plan.profile_id.to_string())
+        .bind(&plan.name)
+        .bind(&plan.database)
+        .bind(serde_json::to_string(&plan.selections).map_err(|e| corrupt("table_selections", e))?)
+        .bind(plan.revision)
+        .bind(plan.created_at.to_rfc3339())
+        .bind(plan.updated_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(plan)
+    }
+
+    /// Replace a plan's selections, bumping its revision.
+    ///
+    /// The revision is what makes a plan that changed under a schedule visible
+    /// rather than silent.
+    pub async fn update_sync_plan(
+        &self,
+        id: Uuid,
+        selections: Vec<TableSelection>,
+    ) -> Result<SyncPlan> {
+        let mut plan = self
+            .get_sync_plan(id)
+            .await?
+            .ok_or(StoreError::SyncPlanNotFound(id))?;
+
+        plan.selections = selections;
+        plan.revision += 1;
+        plan.updated_at = Utc::now();
+
+        sqlx::query(
+            "UPDATE sync_plans SET table_selections = ?2, revision = ?3, updated_at = ?4 \
+             WHERE id = ?1",
+        )
+        .bind(plan.id.to_string())
+        .bind(serde_json::to_string(&plan.selections).map_err(|e| corrupt("table_selections", e))?)
+        .bind(plan.revision)
+        .bind(plan.updated_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(plan)
+    }
+
+    pub async fn delete_sync_plan(&self, id: Uuid) -> Result<bool> {
+        let res = sqlx::query("DELETE FROM sync_plans WHERE id = ?1")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+}
+
+fn row_to_plan(row: sqlx::sqlite::SqliteRow) -> Result<SyncPlan> {
+    let selections_raw: String = row.get("table_selections");
+
+    Ok(SyncPlan {
+        id: parse_uuid(&row.get::<String, _>("id"), "id")?,
+        profile_id: parse_uuid(&row.get::<String, _>("profile_id"), "profile_id")?,
+        name: row.get("name"),
+        database: row.get("database_name"),
+        selections: serde_json::from_str(&selections_raw)
+            .map_err(|e| corrupt("table_selections", e))?,
+        revision: row.get::<i64, _>("revision").max(0) as u32,
+        created_at: parse_ts(&row.get::<String, _>("created_at"), "created_at")?,
+        updated_at: parse_ts(&row.get::<String, _>("updated_at"), "updated_at")?,
     })
 }

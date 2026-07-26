@@ -14,12 +14,18 @@ use crate::db::ConnectParams;
 use crate::events::{JobKind, JobPhase};
 use crate::job::{JobContext, JobOutcome, JobRecord};
 use crate::profile::ConnectionProfile;
-use crate::restore::{RestoreError, RestoreRequest, run_mysql_restore, run_postgres_restore};
+use crate::restore::{
+    EngineRestoreOptions, RestoreError, RestoreRequest, TargetNaming, run_mysql_restore,
+    run_postgres_restore,
+};
+use crate::retention::RetentionPolicy;
 use crate::secrets::{self, SecretKind};
 use crate::ssh::TunnelHandle;
 use crate::store::Store;
 use crate::types::Engine;
 use crate::verify::{self, VerificationReport};
+use serde::{Deserialize, Serialize};
+use specta::Type;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpError {
@@ -33,6 +39,15 @@ pub enum OpError {
     Db(#[from] crate::db::DbError),
     #[error(transparent)]
     Store(#[from] crate::store::StoreError),
+    // Field named `source_engine`, not `source`: thiserror treats a `source`
+    // field as the underlying error cause.
+    #[error("cannot sync a {source_engine:?} source to a {dest_engine:?} destination")]
+    EngineMismatch {
+        source_engine: Engine,
+        dest_engine: Engine,
+    },
+    #[error("job was cancelled")]
+    Cancelled,
 }
 
 /// A tunnel plus the local endpoint the tools should talk to.
@@ -275,4 +290,171 @@ pub async fn record_finish(
         .finish_job(ctx.job_id, outcome, artifact, ctx.log_snapshot().await)
         .await?;
     Ok(())
+}
+
+// ── Cross-server sync ───────────────────────────────────────────────────
+
+/// Back up a source and restore it to a destination as one job.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SyncRequest {
+    pub backup: BackupRequest,
+    pub naming: TargetNaming,
+    pub restore: EngineRestoreOptions,
+    /// Compare exact row counts once the restore finishes.
+    pub verify: bool,
+    /// Applied to the source's backup directory after a successful run.
+    pub retention: Option<RetentionPolicy>,
+    /// Required when the destination naming strategy is destructive.
+    pub typed_confirmation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SyncOutcome {
+    pub artifact_path: String,
+    pub target_database: String,
+    pub verification: Option<VerificationReport>,
+    /// Artifacts retention removed, if it ran.
+    pub removed_artifacts: Vec<String>,
+}
+
+/// Run a full source-to-destination sync.
+///
+/// Backup, restore, verify, retain — one job, one history record, cancellable
+/// at every stage. Each step reuses the same code path the standalone commands
+/// use, so there is no second implementation to drift.
+pub async fn sync(
+    source: &ConnectionProfile,
+    dest: &ConnectionProfile,
+    request: &SyncRequest,
+    store: &Store,
+    ctx: &JobContext,
+) -> Result<SyncOutcome, OpError> {
+    // Cross-engine sync is not a copy, it is a migration, and nothing here
+    // translates dialects. Fail before touching either server.
+    if source.engine != dest.engine {
+        return Err(OpError::EngineMismatch {
+            source_engine: source.engine,
+            dest_engine: dest.engine,
+        });
+    }
+
+    // ── Backup ──────────────────────────────────────────────────────────
+    let artifact = backup(source, &request.backup, store, ctx).await?;
+    ctx.bail_if_cancelled().map_err(|_| OpError::Cancelled)?;
+
+    // ── Restore ─────────────────────────────────────────────────────────
+    let restore_request = RestoreRequest {
+        artifact_path: artifact.clone(),
+        naming: request.naming.clone(),
+        engine: request.restore.clone(),
+        verify_checksum: true,
+        typed_confirmation: request.typed_confirmation.clone(),
+    };
+
+    let target = restore(dest, &restore_request, store, ctx).await?;
+    ctx.bail_if_cancelled().map_err(|_| OpError::Cancelled)?;
+
+    // ── Verify ──────────────────────────────────────────────────────────
+    let verification = if request.verify {
+        let with_data: Vec<String> = request
+            .backup
+            .common
+            .tables_with_data()
+            .into_iter()
+            .map(|s| s.name.clone())
+            .collect();
+        let schema_only: Vec<String> = request
+            .backup
+            .common
+            .selections
+            .iter()
+            .filter(|s| s.mode == crate::backup::TableMode::SchemaOnly)
+            .map(|s| s.name.clone())
+            .collect();
+
+        Some(
+            verify_restore(
+                VerifyRequest {
+                    source_profile: source,
+                    dest_profile: dest,
+                    source_database: &request.backup.common.database,
+                    dest_database: &target,
+                    tables_with_data: &with_data,
+                    schema_only: &schema_only,
+                },
+                store,
+                ctx,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    // ── Retention ───────────────────────────────────────────────────────
+    //
+    // Deliberately after verification: a failed verification is exactly when
+    // the older backups matter most.
+    let removed = match &request.retention {
+        Some(policy) if verification.as_ref().is_none_or(|r| r.passed()) => {
+            apply_retention(&request.backup.common.output_dir, *policy, ctx).await
+        }
+        Some(_) => {
+            ctx.emit_warn(
+                JobPhase::Cleanup,
+                "verification failed; keeping every existing backup",
+            )
+            .await;
+            Vec::new()
+        }
+        None => Vec::new(),
+    };
+
+    Ok(SyncOutcome {
+        artifact_path: artifact.display().to_string(),
+        target_database: target,
+        verification,
+        removed_artifacts: removed,
+    })
+}
+
+/// Apply a retention policy, reporting exactly what it removed.
+///
+/// Deleting backups is never silent: the plan is logged before it is acted on.
+pub async fn apply_retention(
+    directory: &std::path::Path,
+    policy: RetentionPolicy,
+    ctx: &JobContext,
+) -> Vec<String> {
+    if !policy.is_enabled() {
+        return Vec::new();
+    }
+
+    let plan = crate::library::plan_cleanup(directory, policy);
+    if plan.delete.is_empty() {
+        ctx.emit(JobPhase::Cleanup, "retention: nothing to remove")
+            .await;
+        return Vec::new();
+    }
+
+    for candidate in &plan.delete {
+        ctx.emit(
+            JobPhase::Cleanup,
+            format!("retention will remove {}", candidate.path),
+        )
+        .await;
+    }
+
+    let removed = crate::library::apply_cleanup(&plan);
+    ctx.emit(
+        JobPhase::Cleanup,
+        format!(
+            "retention removed {} artifact(s), reclaiming {} bytes",
+            removed.len(),
+            plan.bytes_reclaimed
+        ),
+    )
+    .await;
+
+    removed
 }

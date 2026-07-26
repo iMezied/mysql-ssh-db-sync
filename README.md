@@ -3,10 +3,11 @@
 Cross-server database backup, restore and sync for MySQL and PostgreSQL — a
 desktop app for DBAs, plus a headless CLI that does exactly the same things.
 
-> **Status: M3′.** MySQL and PostgreSQL backup and restore both work end to end
-> over SSH tunnels, with exact-count verification, parallel and selective
-> restore for PostgreSQL archives. The original Bash tool in this repo still
-> works and is unchanged; see [Legacy tool](#legacy-tool).
+> **Status: M4′ (partial).** MySQL and PostgreSQL backup and restore work end
+> to end over SSH tunnels, plus cross-server sync as a single job with
+> verification and retention. Scheduling, notifications and packaging are the
+> remaining M4′ items. The original Bash tool in this repo still works and is
+> unchanged; see [Legacy tool](#legacy-tool).
 
 ---
 
@@ -84,6 +85,7 @@ must be able to do.
 | `apps/desktop/src-tauri/` | Tauri commands, typed event bridge, app state |
 | `apps/desktop/src/` | React UI. `bindings.ts` is generated — never edit it |
 | `tests/fixtures/` | MySQL and PostgreSQL fixture schemas |
+| `legacy tables.conf` | Importable — `plan::parse_tables_conf` reads the old format |
 | `tests/*.sh` | Fixture and DEFINER round-trip verification |
 
 ## How a backup job flows through the system
@@ -239,7 +241,8 @@ cargo test -p db-sync-engine --test keychain -- --ignored
 | **M1′** | SSH tunnels (russh) with jump hosts and host-key pinning, table introspection, test-connection | **Done** |
 | **M2′** | MySQL backup and restore end to end, cancellation, backup library, verification | **Done** |
 | **M3′** | PostgreSQL backup and restore, formats, parallel and selective restore | **Done** |
-| **M4′** | Sync wizard, scheduler, notifications, retention enforcement, packaging | Next |
+| **M4′** | Sync wizard, retention enforcement | **Done** |
+| **M4′** | Scheduler, notifications and webhooks, packaging | Next |
 
 Not in scope for v1: data masking, incremental/binlog/WAL sync, cloud upload,
 multi-user access control. Trait seams are left where they would attach.

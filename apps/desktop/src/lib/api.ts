@@ -54,6 +54,16 @@ export const api = {
     unwrap(commands.listArtifacts(directory)),
   checkArtifact: (path: string) => unwrap(commands.checkArtifact(path)),
   deleteArtifact: (path: string) => unwrap(commands.deleteArtifact(path)),
+  startSync: (...args: Parameters<typeof commands.startSync>) =>
+    unwrap(commands.startSync(...args)),
+  listSyncPlans: (profileId: string) => unwrap(commands.listSyncPlans(profileId)),
+  createSyncPlan: (...args: Parameters<typeof commands.createSyncPlan>) =>
+    unwrap(commands.createSyncPlan(...args)),
+  updateSyncPlan: (...args: Parameters<typeof commands.updateSyncPlan>) =>
+    unwrap(commands.updateSyncPlan(...args)),
+  deleteSyncPlan: (id: string) => unwrap(commands.deleteSyncPlan(id)),
+  importTablesConf: (contents: string) =>
+    unwrap(commands.importTablesConf(contents)),
   listJobs: (limit: number) => unwrap(commands.listJobs(limit)),
   cancelJob: (id: string) => unwrap(commands.cancelJob(id)),
   appInfo: () => unwrap(commands.appInfo()),
