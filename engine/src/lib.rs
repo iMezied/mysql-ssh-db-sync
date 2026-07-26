@@ -13,6 +13,7 @@
 //!   * [`backup`], [`restore`], [`verify`], [`retention`] — operations.
 
 pub mod backup;
+pub mod connect;
 pub mod db;
 pub mod definer;
 pub mod events;

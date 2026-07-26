@@ -28,7 +28,12 @@ check() {
   fi
 }
 
-my() { docker exec "$MYSQL_CONTAINER" mysql -uroot -ptestroot -N -B -e "$1" 2>/dev/null; }
+# --default-character-set is required: without it the client mangles the
+# non-ASCII literals used in the assertions below.
+my() {
+  docker exec "$MYSQL_CONTAINER" mysql -uroot -ptestroot --default-character-set=utf8mb4 \
+    -N -B -e "$1" 2>/dev/null
+}
 
 echo "Taking a dump from the fixture database"
 docker exec "$MYSQL_CONTAINER" mysqldump -uroot -ptestroot \

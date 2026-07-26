@@ -36,6 +36,15 @@ export const api = {
     unwrap(commands.setProfileSecret(id, kind, value)),
   profileSecretStatus: (id: string) => unwrap(commands.profileSecretStatus(id)),
   testConnection: (id: string) => unwrap(commands.testConnection(id)),
+  trustHostKey: (
+    hostPort: string,
+    algorithm: string,
+    fingerprint: string,
+    replace: boolean,
+  ) => unwrap(commands.trustHostKey(hostPort, algorithm, fingerprint, replace)),
+  listDatabases: (id: string) => unwrap(commands.listDatabases(id)),
+  listTables: (id: string, database: string) =>
+    unwrap(commands.listTables(id, database)),
   listJobs: (limit: number) => unwrap(commands.listJobs(limit)),
   cancelJob: (id: string) => unwrap(commands.cancelJob(id)),
   appInfo: () => unwrap(commands.appInfo()),

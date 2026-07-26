@@ -9,6 +9,8 @@
 //! "get password" command — a value returned here would be readable by any
 //! script running in the webview.
 
+use db_sync_engine::connect::{self, ConnectionReport};
+use db_sync_engine::db::{DatabaseInfo, TableInfo};
 use db_sync_engine::job::JobRecord;
 use db_sync_engine::profile::{ConnectionProfile, ProfileCreate, ProfileUpdate};
 use db_sync_engine::secrets::{self, SecretKind};
@@ -72,22 +74,11 @@ pub struct AppInfo {
     pub store_path: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-#[serde(rename_all = "snake_case", tag = "status")]
-pub enum StepResult {
-    Ok { detail: String },
-    Failed { detail: String },
-    Skipped { detail: String },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-pub struct TestConnectionReport {
-    pub ssh: StepResult,
-    pub tunnel: StepResult,
-    pub db_ping: StepResult,
-    pub catalog_read: StepResult,
-    pub server_version: Option<String>,
-}
+/// How long a single introspection call may take before we give up.
+///
+/// A wedged tunnel would otherwise leave the UI spinning forever with no way
+/// to tell "slow" from "never".
+const INTROSPECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 // ── Profiles ────────────────────────────────────────────────────────────
 
@@ -200,38 +191,105 @@ pub async fn profile_secret_status(
     })
 }
 
+/// Test a profile, reporting each step separately.
+///
+/// Never returns `Err` for an unreachable server: a failed *connection* is a
+/// successful *test*, and the per-step detail is the whole point.
 #[tauri::command]
 #[specta::specta]
-pub async fn test_connection(
+pub async fn test_connection(state: State<'_, AppState>, id: Uuid) -> CmdResult<ConnectionReport> {
+    let profile = state.store.require_profile(id).await?;
+    Ok(connect::test_connection(&profile, &state.store).await)
+}
+
+/// Pin a host key after the user has verified its fingerprint.
+///
+/// `replace` must be set explicitly when a *different* key was already pinned —
+/// silently overwriting is indistinguishable from accepting a MITM.
+#[tauri::command]
+#[specta::specta]
+pub async fn trust_host_key(
     state: State<'_, AppState>,
-    id: Uuid,
-) -> CmdResult<TestConnectionReport> {
+    host_port: String,
+    algorithm: String,
+    fingerprint: String,
+    replace: bool,
+) -> CmdResult<()> {
+    let existing = state
+        .store
+        .get_known_host(&host_port)
+        .await?
+        .map(|(_, fp)| fp);
+
+    match existing {
+        Some(current) if current != fingerprint && !replace => Err(CommandError::new(
+            "host_key_changed",
+            format!(
+                "{host_port} already has a different key pinned ({current}); \
+                 confirm the replacement explicitly"
+            ),
+        )),
+        Some(_) => {
+            state
+                .store
+                .replace_host_key(&host_port, &algorithm, &fingerprint)
+                .await?;
+            Ok(())
+        }
+        None => {
+            state
+                .store
+                .remember_host(&host_port, &algorithm, &fingerprint)
+                .await?;
+            Ok(())
+        }
+    }
+}
+
+/// List the databases visible to a profile's user.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_databases(state: State<'_, AppState>, id: Uuid) -> CmdResult<Vec<DatabaseInfo>> {
     let profile = state.store.require_profile(id).await?;
 
-    // Honest placeholder: connectivity lands in M1'. Reporting a fake success
-    // here would be worse than reporting nothing.
-    let ssh = match profile.ssh {
-        Some(_) => StepResult::Skipped {
-            detail: "SSH tunnelling arrives in the next milestone".into(),
-        },
-        None => StepResult::Skipped {
-            detail: "profile connects directly; no SSH step".into(),
-        },
-    };
+    let connection = tokio::time::timeout(
+        INTROSPECT_TIMEOUT,
+        connect::open(&profile, &state.store, None),
+    )
+    .await
+    .map_err(|_| CommandError::new("timeout", "connecting timed out"))?
+    .map_err(|e| CommandError::new("connect", e.to_string()))?;
 
-    Ok(TestConnectionReport {
-        ssh,
-        tunnel: StepResult::Skipped {
-            detail: "not yet implemented".into(),
-        },
-        db_ping: StepResult::Skipped {
-            detail: "not yet implemented".into(),
-        },
-        catalog_read: StepResult::Skipped {
-            detail: "not yet implemented".into(),
-        },
-        server_version: None,
-    })
+    let result = connection.introspector.list_databases().await;
+    connection.close().await;
+
+    result.map_err(|e| CommandError::new("query", e.to_string()))
+}
+
+/// List the tables in one database, with the metadata the picker needs.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_tables(
+    state: State<'_, AppState>,
+    id: Uuid,
+    database: String,
+) -> CmdResult<Vec<TableInfo>> {
+    let profile = state.store.require_profile(id).await?;
+
+    // PostgreSQL can only introspect the database it is connected to, so the
+    // target database is part of opening the connection, not just the query.
+    let connection = tokio::time::timeout(
+        INTROSPECT_TIMEOUT,
+        connect::open(&profile, &state.store, Some(&database)),
+    )
+    .await
+    .map_err(|_| CommandError::new("timeout", "connecting timed out"))?
+    .map_err(|e| CommandError::new("connect", e.to_string()))?;
+
+    let result = connection.introspector.list_tables(&database).await;
+    connection.close().await;
+
+    result.map_err(|e| CommandError::new("query", e.to_string()))
 }
 
 // ── Jobs ────────────────────────────────────────────────────────────────

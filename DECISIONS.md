@@ -189,8 +189,109 @@ release candidates whose API has already moved under this project once —
 `tauri_specta::ts` no longer exists in rc.25, which is what stopped the earlier
 scaffold from compiling at all.
 
-### Tauri capabilities grant `core:default` only
+### Tauri capabilities grant `core:default` only (M0)
 
 The shell plugin was removed. Dump and restore processes are spawned by the Rust
 engine via `tokio::process`, so the webview needs no shell permission; granting
 one would be attack surface for no benefit.
+
+---
+
+## M1′ — Connectivity
+
+### Host keys are pinned between two attempts, not during one
+
+`check_server_key` is called mid-handshake. Blocking it while a dialog waits for
+a human would hold a half-open SSH connection open for as long as the user takes
+to answer.
+
+Instead an unknown key fails the attempt with `TunnelError::HostKeyUnknown`,
+carrying the algorithm and fingerprint. The UI shows those, and if the user
+confirms, `trust_host_key` pins the key and the test is re-run. A *changed* key
+produces `HostKeyChanged` with both fingerprints and is styled very differently
+in the UI — first contact is routine, a changed key is what interception looks
+like — and replacing a pin requires an explicit `replace` flag.
+
+`connect_error` deliberately does not flatten these into a generic
+`Connect`. `client::connect` returns the *handler's* error type, so an early
+version's blanket `map_err` destroyed exactly the fingerprint the user needed,
+and the UI could only say "connection failed". Caught by a test asserting the
+prompt is offered.
+
+### MySQL catalog reads need `CONVERT`, not `CAST`
+
+MySQL 8's data-dictionary columns report as `VARBINARY`, which will not decode
+into a `String`. The obvious fix, `CAST(TABLE_NAME AS CHAR)`, *transcodes* and
+mangles non-ASCII identifiers: `naïve_café` comes back as `naÃ¯ve_cafÃ©`.
+`CONVERT(TABLE_NAME USING utf8mb4)` reinterprets the bytes instead.
+
+The connection also sets `charset("utf8mb4")` explicitly. Without it, a
+`COUNT(*)` against a table whose name contains non-ASCII characters fails with
+"table doesn't exist".
+
+### The fixture had to be loaded with `SET NAMES utf8mb4`
+
+The same investigation turned up a corrupt fixture: the entrypoint sourced
+`01-schema.sql` with a non-UTF-8 client charset, so the unicode table names were
+*stored* double-encoded.
+
+`tests/verify-fixtures.sh` had passed anyway, because it compared rendered text
+using a client with the same mis-encoding — the corruption cancelled out on both
+sides. It now compares `HEX(TABLE_NAME)` against the expected UTF-8 bytes, which
+cannot cancel out, and the shell helpers pass
+`--default-character-set=utf8mb4`.
+
+### Identifiers are quoted, never interpolated
+
+`quote_mysql_ident` / `quote_pg_ident` escape embedded quote characters. Table
+names come from the catalog, but a table may legally be named
+``a`; DROP DATABASE app; SELECT `1`` — interpolating one unquoted into a
+`COUNT(*)` would execute it. Both are unit-tested against that exact string.
+
+### `transactional` is a serialised field, not a method
+
+The UI warns when a selected table is not covered by `--single-transaction`.
+That rule (`storage_engine == InnoDB`, or PostgreSQL) lives in Rust and is
+serialised as a field, because a method cannot cross the IPC boundary and
+re-deriving it in TypeScript would let the two drift.
+
+### Integration suites are sequenced, not run as one `cargo test`
+
+**Known issue.** When a container-backed, SSH-heavy suite starts within roughly
+30 seconds of the previous one, about half its SSH connects fail with
+`Disconnected` before authentication. `tests/run-integration.sh` inserts a
+settle gap between suites, and CI uses it instead of
+`cargo test --workspace`.
+
+What was ruled out, with measurements:
+
+| Hypothesis | Result |
+|---|---|
+| A suite is simply flaky | No — `tunnel` passes 12/12 across four consecutive standalone runs |
+| Server refusing connections | No — `ssh(1)` opens 20 parallel sessions in the same window, 20/20 |
+| sshd `MaxStartups` throttling | No — raised to 200:30:400; listener reports `0 of 200-400` used |
+| Leaked sshd sessions | No — session count is 0 before and after a run |
+| Client socket exhaustion | No — exactly one `TIME_WAIT` against the published port |
+| Test parallelism | No — `--test-threads=2` fails the same way |
+| Leaked sqlx pools | No — closing them deterministically changed nothing |
+
+The mechanism is unidentified and recorded rather than hidden. It has not been
+observed to affect the application, which opens one tunnel per job rather than a
+dozen simultaneously, and the full profile → keychain → tunnel → introspection
+path passes end to end. Worth revisiting before M2′ leans harder on tunnels.
+
+One self-inflicted aggravator *was* found and removed: adding
+`LogLevel VERBOSE` to the test sshd (while trying to instrument this) made the
+failure markedly worse.
+
+### Tunnel-owning tasks must outlive the runtime that created them
+
+A tunnel's accept loop and its forwarding tasks are spawned on the runtime that
+opened it. `#[tokio::test]` builds a runtime per test and drops it on return, so
+a tunnel shared between tests died with whichever test created it — every later
+test then saw `0 bytes at EOF`.
+
+The integration suites therefore use one process-lifetime runtime with an
+explicit `db_test!` macro. This mirrors the application, where tunnels run on
+the Tauri runtime and outlive any single query, and is the same class of bug as
+the dropped-runtime pool issue from M0.

@@ -31,7 +31,24 @@ export const commands = {
 	setProfileSecret: (id: string, kind: string, value: string) => typedError<null, CommandError>(__TAURI_INVOKE("set_profile_secret", { id, kind, value })),
 	/**  Report whether secrets exist — never their values. */
 	profileSecretStatus: (id: string) => typedError<SecretStatus, CommandError>(__TAURI_INVOKE("profile_secret_status", { id })),
-	testConnection: (id: string) => typedError<TestConnectionReport, CommandError>(__TAURI_INVOKE("test_connection", { id })),
+	/**
+	 *  Test a profile, reporting each step separately.
+	 * 
+	 *  Never returns `Err` for an unreachable server: a failed *connection* is a
+	 *  successful *test*, and the per-step detail is the whole point.
+	 */
+	testConnection: (id: string) => typedError<ConnectionReport, CommandError>(__TAURI_INVOKE("test_connection", { id })),
+	/**
+	 *  Pin a host key after the user has verified its fingerprint.
+	 * 
+	 *  `replace` must be set explicitly when a *different* key was already pinned —
+	 *  silently overwriting is indistinguishable from accepting a MITM.
+	 */
+	trustHostKey: (hostPort: string, algorithm: string, fingerprint: string, replace: boolean) => typedError<null, CommandError>(__TAURI_INVOKE("trust_host_key", { hostPort, algorithm, fingerprint, replace })),
+	/**  List the databases visible to a profile's user. */
+	listDatabases: (id: string) => typedError<DatabaseInfo[], CommandError>(__TAURI_INVOKE("list_databases", { id })),
+	/**  List the tables in one database, with the metadata the picker needs. */
+	listTables: (id: string, database: string) => typedError<TableInfo[], CommandError>(__TAURI_INVOKE("list_tables", { id, database })),
 	listJobs: (limit: number) => typedError<JobRecord[], CommandError>(__TAURI_INVOKE("list_jobs", { limit })),
 	/**
 	 *  Cancel a running job.
@@ -80,6 +97,26 @@ export type ConnectionProfile = {
 	updated_at: string,
 };
 
+/**  Step-by-step result of testing a profile. */
+export type ConnectionReport = {
+	ssh: StepOutcome,
+	tunnel: StepOutcome,
+	db_ping: StepOutcome,
+	catalog_read: StepOutcome,
+	server_version: string | null,
+	/**
+	 *  Present when the connection stopped on an unverified host key. The UI
+	 *  shows the fingerprint and, if the user accepts, pins it and retries.
+	 */
+	host_key_prompt: HostKeyPrompt | null,
+};
+
+export type DatabaseInfo = {
+	name: string,
+	charset: string | null,
+	collation: string | null,
+};
+
 /**
  *  Database coordinates *as seen from the SSH host* (or from this machine when
  *  `ConnectionProfile::ssh` is `None`).
@@ -107,6 +144,20 @@ export type Engine = "mysql" | "postgres";
  *  confirmations — production targets require typed confirmation.
  */
 export type EnvironmentTag = "prod" | "staging" | "dev";
+
+/**  An unverified host key the user must decide about. */
+export type HostKeyPrompt = {
+	host_port: string,
+	algorithm: string,
+	fingerprint: string,
+	/**
+	 *  True when a *different* key was previously pinned. Far more serious
+	 *  than first contact: it is what a machine-in-the-middle looks like.
+	 */
+	changed: boolean,
+	/**  The fingerprint we had pinned, when `changed`. */
+	previous_fingerprint: string | null,
+};
 
 /**
  *  Emitted when a job reaches a terminal state, so the UI can refresh history
@@ -256,14 +307,28 @@ export type SshEndpoint = {
 	auth: SshAuth,
 };
 
-export type StepResult = { status: "ok"; detail: string } | { status: "failed"; detail: string } | { status: "skipped"; detail: string };
+export type StepOutcome = { status: "ok"; detail: string } | { status: "failed"; detail: string } | { status: "skipped"; detail: string };
 
-export type TestConnectionReport = {
-	ssh: StepResult,
-	tunnel: StepResult,
-	db_ping: StepResult,
-	catalog_read: StepResult,
-	server_version: string | null,
+export type TableInfo = {
+	schema: string | null,
+	name: string,
+	/**  InnoDB/MyISAM for MySQL; `None` for PostgreSQL. */
+	storage_engine: string | null,
+	/**
+	 *  Planner estimate. Cheap but approximate — never use it to verify a
+	 *  restore. See [`crate::verify`].
+	 */
+	estimated_rows: number | null,
+	data_bytes: number | null,
+	index_bytes: number | null,
+	/**
+	 *  Whether a consistent snapshot is possible for this table.
+	 * 
+	 *  Serialised rather than left as a method so the UI cannot re-derive the
+	 *  rule and drift from it — this decides whether we warn that
+	 *  `--single-transaction` does not cover a selected table.
+	 */
+	transactional: boolean,
 };
 
 /**

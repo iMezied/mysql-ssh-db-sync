@@ -62,3 +62,6 @@ services:
       - "12222:2222"
     volumes:
       - ./tests/fixtures/ssh:/keys:ro
+      # Raises MaxStartups/MaxSessions so concurrent tunnels in the test suites
+      # are not randomly dropped by sshd. See the script for why.
+      - ./tests/fixtures/sshd-init:/custom-cont-init.d:ro

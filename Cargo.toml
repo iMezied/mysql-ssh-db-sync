@@ -23,7 +23,16 @@ thiserror = "2"
 secrecy = { version = "0.10", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate"] }
+sqlx = { version = "0.8", features = [
+    "runtime-tokio",
+    "sqlite",
+    "migrate",
+    # Introspection and verification queries. Bulk dump/restore still goes
+    # through the vendor tools; these drivers are for reading catalogs and
+    # counting rows.
+    "mysql",
+    "postgres",
+] }
 # NOTE: keyring is NOT declared here. Its backend is selected by feature flags,
 # and with default features it silently falls back to an in-memory *mock* store
 # — secrets appear to save and then vanish. It is declared per-target in

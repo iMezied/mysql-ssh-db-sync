@@ -6,6 +6,12 @@
 -- a MyISAM table (not covered by --single-transaction), and row data that
 -- contains the literal text "DEFINER=" to catch over-eager stripping.
 
+-- The entrypoint sources this file with the client's default charset, which is
+-- not utf8mb4 on every image. Without this line the non-ASCII identifiers below
+-- are read as latin1 and stored double-encoded ("naïve_café" becomes
+-- "naÃ¯ve_cafÃ©"), which a client doing the right thing then cannot find.
+SET NAMES utf8mb4;
+
 USE fixture;
 
 SET FOREIGN_KEY_CHECKS = 0;

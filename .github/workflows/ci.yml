@@ -41,8 +41,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Unit tests and the SQLite-backed store suite only. The container-backed
+      # integration suites run in the `fixtures` job, sequenced — see
+      # tests/run-integration.sh for why they cannot share one cargo run.
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --lib --bins
 
   frontend:
     name: Frontend
@@ -94,8 +97,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Start MySQL and PostgreSQL
-        run: docker compose -f docker-compose.test.yml up -d --wait mysql postgres
+      - name: Generate the test SSH key
+        run: |
+          mkdir -p tests/fixtures/ssh
+          ssh-keygen -t ed25519 -N "" -C dbsync-test -f tests/fixtures/ssh/id_ed25519
+          chmod 600 tests/fixtures/ssh/id_ed25519
+
+      - name: Start MySQL, PostgreSQL and sshd
+        run: docker compose -f docker-compose.test.yml up -d --wait
 
       - name: Build CLI
         run: cargo build -p db-sync-cli
@@ -108,6 +117,11 @@ jobs:
       # containing the literal text "DEFINER=" must survive untouched.
       - name: Verify DEFINER round-trip
         run: tests/verify-definer-roundtrip.sh
+
+      # Sequenced, not `cargo test --workspace`: consecutive SSH-heavy suites
+      # interfere. Documented in tests/run-integration.sh.
+      - name: Integration suites (tunnel, introspection, end-to-end)
+        run: tests/run-integration.sh
 
       - name: Container logs on failure
         if: failure()

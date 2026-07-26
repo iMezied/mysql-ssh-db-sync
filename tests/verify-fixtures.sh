@@ -37,7 +37,10 @@ check_contains() {
 }
 
 my() {
-  docker exec "$MYSQL_CONTAINER" mysql -uroot -ptestroot fixture -N -B -e "$1" 2>/dev/null
+  # --default-character-set matters: without it the client mangles non-ASCII
+  # literals in these queries and a unicode identifier appears to be missing.
+  docker exec "$MYSQL_CONTAINER" mysql -uroot -ptestroot --default-character-set=utf8mb4 \
+    fixture -N -B -e "$1" 2>/dev/null
 }
 
 pg() {
@@ -55,6 +58,11 @@ check "foreign-key cycle present" "2" "$(my "SELECT COUNT(*) FROM information_sc
 check "reserved-word table" "1" "$(my "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='fixture' AND TABLE_NAME='order';")"
 check "unicode table" "1" "$(my "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='fixture' AND TABLE_NAME='日本語テーブル';")"
 check "invalid-utf8 blob intact" "DEADBEEF00FF00FFC3289F" "$(my "SELECT HEX(payload) FROM attachments WHERE filename='binary.bin';")"
+# Compare the stored identifier *bytes*, not the rendered text: if the fixture
+# is loaded with the wrong client charset the name is stored double-encoded, and
+# a text comparison still matches because the same corruption applies on read.
+check "unicode identifier stored as real utf8" "6E61C3AF76655F636166C3A9" \
+  "$(my "SELECT HEX(TABLE_NAME) FROM information_schema.TABLES WHERE TABLE_SCHEMA='fixture' AND TABLE_NAME LIKE 'na%';")"
 check_contains "DEFINER text stored as row data" 'DEFINER=`root`@`localhost`' "$(my "SELECT \`value\` FROM settings WHERE \`key\`='definer_note';")"
 
 echo

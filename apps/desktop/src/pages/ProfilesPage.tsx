@@ -1,8 +1,10 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { KeyRound, Plus, Trash2 } from "lucide-react";
+import { ChevronDown, ChevronRight, KeyRound, Plus, Trash2 } from "lucide-react";
 
 import PageHeader from "@/components/PageHeader";
+import ConnectionTest from "@/components/ConnectionTest";
+import SshFields from "@/components/SshFields";
 import { api, ApiError } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import type {
@@ -243,6 +245,11 @@ export default function ProfilesPage() {
                 />
               </label>
 
+              <SshFields
+                value={draft.ssh}
+                onChange={(ssh) => setDraft({ ...draft, ssh })}
+              />
+
               <label className="col-span-2">
                 <span className="field-label">Password (stored in keychain)</span>
                 <input
@@ -294,14 +301,27 @@ function ProfileRow({
   onDelete: () => void;
   deleting: boolean;
 }) {
+  const [expanded, setExpanded] = useState(false);
   const secrets = useQuery({
     queryKey: ["secret-status", profile.id],
     queryFn: () => api.profileSecretStatus(profile.id),
   });
 
   return (
-    <div className="panel flex items-center justify-between gap-4 px-4 py-3">
-      <div className="min-w-0">
+    <div className="panel">
+      <div className="flex items-center justify-between gap-4 px-4 py-3">
+      <button
+        onClick={() => setExpanded((v) => !v)}
+        className="shrink-0 text-slate-500 transition hover:text-slate-300"
+        title={expanded ? "Hide details" : "Show details"}
+      >
+        {expanded ? (
+          <ChevronDown className="h-4 w-4" />
+        ) : (
+          <ChevronRight className="h-4 w-4" />
+        )}
+      </button>
+      <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
           <span className="truncate text-sm font-medium text-slate-100">
             {profile.name}
@@ -354,6 +374,13 @@ function ProfileRow({
           <Trash2 className="h-4 w-4" />
         </button>
       </div>
+      </div>
+
+      {expanded && (
+        <div className="border-t border-slate-800 px-4 py-3">
+          <ConnectionTest profileId={profile.id} />
+        </div>
+      )}
     </div>
   );
 }
