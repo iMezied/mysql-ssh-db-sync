@@ -3,10 +3,10 @@
 Cross-server database backup, restore and sync for MySQL and PostgreSQL — a
 desktop app for DBAs, plus a headless CLI that does exactly the same things.
 
-> **Status: M0 (foundation).** The engine, persistence, security model and test
-> harness are in place and tested. Connectivity and the dump/restore pipelines
-> land in the next milestones — see [Roadmap](#roadmap). The original Bash tool
-> in this repo still works and is unchanged; see [Legacy tool](#legacy-tool).
+> **Status: M2′.** MySQL backup and restore work end to end over SSH tunnels,
+> with exact-count verification. PostgreSQL support lands next — see
+> [Roadmap](#roadmap). The original Bash tool in this repo still works and is
+> unchanged; see [Legacy tool](#legacy-tool).
 
 ---
 
@@ -125,8 +125,14 @@ must be able to do.
 
 ## Development setup
 
-Requires Rust (stable, edition 2024 — 1.85+), Node 20+, and Docker for the
-integration fixtures.
+Requires Rust (stable, edition 2024 — 1.85+), Node 20+, Docker for the
+integration fixtures, and the MySQL client tools.
+
+The engine shells out to `mysqldump` and `mysql`; they are never bundled (see
+[DECISIONS.md](DECISIONS.md) on the GPL implications). Install them with
+`brew install mysql-client` on macOS or `apt install mysql-client` on Debian.
+Homebrew installs keg-only, which is fine — discovery searches that location
+even though it is not on `PATH`.
 
 ```bash
 cargo build --workspace
@@ -175,6 +181,17 @@ docker compose -f docker-compose.test.yml down -v
 without SUPER, confirms the filtered dump restores cleanly, and confirms rows
 whose data merely mentions `DEFINER=` come back byte-identical.
 
+The full backup/restore round-trip needs the OS keychain, so it is `#[ignore]`d
+alongside the other credential-touching suites:
+
+```bash
+cargo test -p db-sync-engine --test roundtrip -- --ignored
+```
+
+It dumps the fixture through a tunnel, restores it as a user without SUPER, and
+checks that binary payloads, unicode identifiers, a foreign-key cycle and rows
+containing the literal text `DEFINER=` all survive.
+
 Keychain tests touch the real OS credential store, so they are `#[ignore]`d —
 CI runners have no unlocked keychain. Run them locally after changing anything
 credential related:
@@ -202,9 +219,9 @@ cargo test -p db-sync-engine --test keychain -- --ignored
 | Milestone | Scope | State |
 |---|---|---|
 | **M0** | Engine/CLI/GUI split, persistence, secrets, options model, DEFINER filter, verification, retention, test harness, CI | **Done** |
-| **M1′** | SSH tunnels (russh) with jump hosts and host-key prompts, table introspection, test-connection | Next |
-| **M2′** | MySQL backup and restore end to end, real cancellation, backup library | |
-| **M3′** | PostgreSQL backup and restore, formats, parallel and selective restore | |
+| **M1′** | SSH tunnels (russh) with jump hosts and host-key pinning, table introspection, test-connection | **Done** |
+| **M2′** | MySQL backup and restore end to end, cancellation, backup library, verification | **Done** |
+| **M3′** | PostgreSQL backup and restore, formats, parallel and selective restore | Next |
 | **M4′** | Sync wizard, scheduler, notifications, retention enforcement, packaging | |
 
 Not in scope for v1: data masking, incremental/binlog/WAL sync, cloud upload,

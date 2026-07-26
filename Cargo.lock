@@ -1184,6 +1184,7 @@ dependencies = [
  "directories",
  "flate2",
  "keyring",
+ "libc",
  "russh",
  "secrecy",
  "serde",

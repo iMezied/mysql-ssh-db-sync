@@ -9,10 +9,18 @@
 //! "get password" command — a value returned here would be readable by any
 //! script running in the webview.
 
+use std::path::PathBuf;
+
+use db_sync_engine::backup::BackupRequest;
 use db_sync_engine::connect::{self, ConnectionReport};
 use db_sync_engine::db::{DatabaseInfo, TableInfo};
+use db_sync_engine::events::{JobKind, JobPhase};
 use db_sync_engine::job::JobRecord;
+use db_sync_engine::job::{JobContext, JobOutcome};
+use db_sync_engine::library::{self, Artifact, IntegrityCheck};
+use db_sync_engine::ops;
 use db_sync_engine::profile::{ConnectionProfile, ProfileCreate, ProfileUpdate};
+use db_sync_engine::restore::RestoreRequest;
 use db_sync_engine::secrets::{self, SecretKind};
 use db_sync_engine::store::StoreError;
 use serde::{Deserialize, Serialize};
@@ -21,6 +29,8 @@ use tauri::State;
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::events::JobFinished;
+use tauri_specta::Event as _;
 
 /// Error shape crossing into the webview.
 ///
@@ -326,4 +336,196 @@ pub async fn app_info(state: State<'_, AppState>) -> CmdResult<AppInfo> {
         engine_version: db_sync_engine::ENGINE_VERSION.to_string(),
         store_path: state.store_path.display().to_string(),
     })
+}
+
+// ── Running jobs ────────────────────────────────────────────────────────
+
+/// Where backups are written when the caller does not say otherwise.
+fn default_backup_dir() -> PathBuf {
+    db_sync_engine::paths::app_data_dir()
+        .map(|d| d.join("backups"))
+        .unwrap_or_else(|_| PathBuf::from("backups"))
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn backup_directory() -> CmdResult<String> {
+    Ok(default_backup_dir().display().to_string())
+}
+
+/// Start a backup and return its job id immediately.
+///
+/// The work runs in the background; progress arrives as `JobProgress` events
+/// and the terminal state as `JobFinished`. Blocking the command until the dump
+/// finished would freeze the UI for the length of the job.
+#[tauri::command]
+#[specta::specta]
+pub async fn start_backup(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    profile_id: Uuid,
+    request: BackupRequest,
+) -> CmdResult<Uuid> {
+    let profile = state.store.require_profile(profile_id).await?;
+    // Fail fast on an invalid plan, before a job appears in history.
+    request
+        .validate(&profile)
+        .map_err(|e| CommandError::new("invalid", e.to_string()))?;
+
+    let job_id = Uuid::new_v4();
+    let ctx = JobContext::with_sender(job_id, state.event_tx.clone());
+    state.jobs.register(&ctx).await;
+
+    let options_json = serde_json::to_string(&request).unwrap_or_else(|_| "{}".into());
+    ops::record_start(
+        &state.store,
+        &ctx,
+        JobKind::Backup,
+        profile_id,
+        None,
+        options_json,
+    )
+    .await
+    .map_err(|e| CommandError::new("storage", e.to_string()))?;
+
+    let store = state.store.clone();
+    let jobs = state.jobs.clone();
+
+    tauri::async_runtime::spawn(async move {
+        let result = ops::backup(&profile, &request, &store, &ctx).await;
+
+        let (outcome, artifact) = match &result {
+            Ok(path) => (JobOutcome::Success, Some(path.display().to_string())),
+            Err(e) => {
+                // The full error, including the tool's stderr, belongs in the log.
+                ctx.emit_error(JobPhase::Done, e.to_string()).await;
+                let outcome = if ctx.is_cancelled() {
+                    JobOutcome::Cancelled
+                } else {
+                    JobOutcome::Failed
+                };
+                (outcome, None)
+            }
+        };
+
+        let _ = ops::record_finish(&store, &ctx, outcome, artifact).await;
+        jobs.unregister(job_id).await;
+
+        let _ = JobFinished {
+            job_id: job_id.to_string(),
+            outcome: outcome.as_str().to_string(),
+        }
+        .emit(&app);
+    });
+
+    Ok(job_id)
+}
+
+/// Start a restore and return its job id immediately.
+#[tauri::command]
+#[specta::specta]
+pub async fn start_restore(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    profile_id: Uuid,
+    request: RestoreRequest,
+) -> CmdResult<Uuid> {
+    let profile = state.store.require_profile(profile_id).await?;
+
+    // Typed confirmation and format rules are checked here so a destructive
+    // restore cannot even start without them.
+    let manifest = db_sync_engine::manifest::BackupManifest::read(&request.artifact_path).ok();
+    request
+        .validate(&profile, manifest.as_ref())
+        .map_err(|e| CommandError::new("invalid", e.to_string()))?;
+
+    let job_id = Uuid::new_v4();
+    let ctx = JobContext::with_sender(job_id, state.event_tx.clone());
+    state.jobs.register(&ctx).await;
+
+    let options_json = serde_json::to_string(&request).unwrap_or_else(|_| "{}".into());
+    ops::record_start(
+        &state.store,
+        &ctx,
+        JobKind::Restore,
+        profile_id,
+        Some(profile_id),
+        options_json,
+    )
+    .await
+    .map_err(|e| CommandError::new("storage", e.to_string()))?;
+
+    let store = state.store.clone();
+    let jobs = state.jobs.clone();
+
+    tauri::async_runtime::spawn(async move {
+        let result = ops::restore(&profile, &request, &store, &ctx).await;
+
+        let outcome = match &result {
+            Ok(target) => {
+                ctx.emit(JobPhase::Done, format!("restored into {target}"))
+                    .await;
+                JobOutcome::Success
+            }
+            Err(e) => {
+                ctx.emit_error(JobPhase::Done, e.to_string()).await;
+                if ctx.is_cancelled() {
+                    JobOutcome::Cancelled
+                } else {
+                    JobOutcome::Failed
+                }
+            }
+        };
+
+        let _ = ops::record_finish(&store, &ctx, outcome, None).await;
+        jobs.unregister(job_id).await;
+
+        let _ = JobFinished {
+            job_id: job_id.to_string(),
+            outcome: outcome.as_str().to_string(),
+        }
+        .emit(&app);
+    });
+
+    Ok(job_id)
+}
+
+// ── Library ─────────────────────────────────────────────────────────────
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_artifacts(directory: Option<String>) -> CmdResult<Vec<Artifact>> {
+    let dir = directory
+        .map(PathBuf::from)
+        .unwrap_or_else(default_backup_dir);
+    Ok(library::list_artifacts(dir))
+}
+
+/// Hash an artifact and compare it against its manifest.
+#[tauri::command]
+#[specta::specta]
+pub async fn check_artifact(path: String) -> CmdResult<IntegrityCheck> {
+    // Hashing a multi-gigabyte file blocks; keep it off the async runtime.
+    tokio::task::spawn_blocking(move || library::check_integrity(path))
+        .await
+        .map_err(|e| CommandError::new("io", e.to_string()))
+}
+
+/// Delete an artifact and its manifest.
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_artifact(path: String) -> CmdResult<()> {
+    let artifact = PathBuf::from(&path);
+    if !artifact.is_file() {
+        return Err(CommandError::new(
+            "not_found",
+            format!("no such file: {path}"),
+        ));
+    }
+    std::fs::remove_file(&artifact).map_err(|e| CommandError::new("io", e.to_string()))?;
+    // Leaving the manifest behind would show a phantom entry in the library.
+    let _ = std::fs::remove_file(db_sync_engine::manifest::BackupManifest::path_for(
+        &artifact,
+    ));
+    Ok(())
 }

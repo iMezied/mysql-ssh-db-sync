@@ -21,6 +21,10 @@ chrono.workspace = true
 sqlx.workspace = true
 async-trait.workspace = true
 directories = "5"
+
+[target.'cfg(unix)'.dependencies]
+# Process-group signalling: killing only the direct child orphans a pipeline.
+libc = "0.2"
 sha2.workspace = true
 flate2.workspace = true
 specta.workspace = true

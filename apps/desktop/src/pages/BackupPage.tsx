@@ -1,11 +1,11 @@
 import { useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { AlertTriangle, Database, Search } from "lucide-react";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { AlertTriangle, Database, Play, Search } from "lucide-react";
 
 import PageHeader from "@/components/PageHeader";
 import { api } from "@/lib/api";
 import { cn, formatBytes } from "@/lib/utils";
-import type { TableInfo } from "@/bindings";
+import type { BackupRequest, TableInfo } from "@/bindings";
 
 type TableMode = "schema_and_data" | "schema_only" | "exclude";
 
@@ -36,8 +36,13 @@ export default function BackupPage() {
   const [database, setDatabase] = useState("");
   const [filter, setFilter] = useState("");
   const [modes, setModes] = useState<Record<string, TableMode>>({});
+  const [started, setStarted] = useState<string | null>(null);
 
   const profiles = useQuery({ queryKey: ["profiles"], queryFn: api.listProfiles });
+  const backupDir = useQuery({
+    queryKey: ["backup-dir"],
+    queryFn: api.backupDirectory,
+  });
 
   const databases = useQuery({
     queryKey: ["databases", profileId],
@@ -78,6 +83,50 @@ export default function BackupPage() {
       ),
     [tables.data, modes],
   );
+
+  const start = useMutation({
+    mutationFn: () => {
+      const rows = tables.data ?? [];
+      const request: BackupRequest = {
+        common: {
+          database,
+          selections: rows.map((t) => ({
+            name: t.name,
+            mode: modes[keyOf(t)] ?? "schema_only",
+            where_filter: null,
+          })),
+          output_dir: backupDir.data ?? "",
+          compress: true,
+          encrypt: false,
+        },
+        engine: {
+          engine: "mysql",
+          single_transaction: true,
+          hex_blob: true,
+          set_gtid_purged_off: true,
+          add_drop_table: true,
+          extended_insert: true,
+          routines: true,
+          triggers: true,
+          events: true,
+          default_character_set: "utf8mb4",
+          disable_column_statistics: false,
+          strip_definer: true,
+          parallel_threads: null,
+          extra_flags: [],
+        },
+      };
+      return api.startBackup(profileId, request);
+    },
+    onSuccess: (jobId) => setStarted(jobId),
+  });
+
+  const selectedProfile = profiles.data?.find((p) => p.id === profileId);
+  const canRun =
+    profileId !== "" &&
+    database !== "" &&
+    (tables.data?.length ?? 0) > 0 &&
+    selectedProfile?.engine === "mysql";
 
   const setVisibleTo = (mode: TableMode) => {
     setModes((prev) => {
@@ -244,9 +293,45 @@ export default function BackupPage() {
               )}
             </div>
 
+            <div className="flex flex-wrap items-center gap-3 border-t border-slate-800 pt-4">
+              <button
+                onClick={() => start.mutate()}
+                disabled={!canRun || start.isPending}
+                className="flex items-center gap-1.5 rounded-md bg-blue-600 px-3 py-2 text-sm font-medium text-white transition hover:bg-blue-500 disabled:opacity-50"
+              >
+                <Play className="h-4 w-4" />
+                {start.isPending ? "Starting…" : "Run backup"}
+              </button>
+
+              {selectedProfile?.engine === "postgres" && (
+                <span className="text-xs text-amber-400">
+                  PostgreSQL backup arrives in the next milestone.
+                </span>
+              )}
+
+              {backupDir.data && (
+                <span className="font-mono text-xs text-slate-600">
+                  → {backupDir.data}
+                </span>
+              )}
+            </div>
+
+            {start.isError && (
+              <ErrorNote
+                title="Could not start the backup"
+                detail={(start.error as Error).message}
+              />
+            )}
+
+            {started && (
+              <p className="text-xs text-emerald-400">
+                Backup started. Watch it on the Jobs page — job {started.slice(0, 8)}.
+              </p>
+            )}
+
             <p className="text-xs text-slate-600">
-              Saving these as a reusable sync plan, and running the backup
-              itself, arrive in the next milestone.
+              Saving these selections as a reusable sync plan arrives in a later
+              milestone.
             </p>
           </>
         )}

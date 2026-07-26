@@ -318,3 +318,90 @@ The integration suites therefore use one process-lifetime runtime with an
 explicit `db_test!` macro. This mirrors the application, where tunnels run on
 the Tauri runtime and outlive any single query, and is the same class of bug as
 the dropped-runtime pool issue from M0.
+
+---
+
+## M2′ — MySQL backup and restore
+
+### Triggers are dumped after the data, not with the schema
+
+A trigger created before its table's rows fires once per restored row. The
+fixture has an `AFTER INSERT ON orders` trigger that writes to `audit_log`;
+restoring two orders turned two audit rows into four.
+
+The dump is therefore three passes — schema (with `--skip-triggers`), then
+data, then triggers — which is the order `mysqldump` itself uses for a single
+table. The Bash predecessor had the same defect, unnoticed because it never
+compared row counts afterwards.
+
+Found by verification, not by review. It is the clearest argument for exact
+`COUNT(*)` checking: a plausible-looking restore was quietly wrong.
+
+### Credentials reach child processes through the environment
+
+`MYSQL_PWD`, never `-p<password>`. argv is world-readable through `ps`, so the
+Bash predecessor leaked the production password to every user on the machine
+for the duration of each dump.
+
+`ToolCommand::display()` renders the command for the job log and is safe to log
+precisely because secrets are not in argv. Both the backup and restore command
+builders have a test asserting no argument looks like an inline password flag —
+naively checking for the substring `-p` matches `--port` and `--protocol`, so
+the assertion matches whole arguments.
+
+### stderr is captured on a thread, and never discarded
+
+Reading a child's stderr after its stdout deadlocks as soon as the stderr pipe
+fills — which a chatty `mysql` client will do. A background thread collects it
+and keeps the last 50 lines, which is what a failure message actually needs.
+
+A test pushes 5000 lines through to prove the deadlock is gone.
+
+### Cancellation kills the process group
+
+Children are spawned with `process_group(0)` and cancelled with a negative-PID
+signal, so a pipeline dies as a unit rather than leaving orphans. A test spawns
+a grandchild and asserts it is gone afterwards.
+
+A cancelled child is reported as `Cancelled`, not as a failure — "exited with
+signal 15" is not something a user should have to interpret.
+
+### A failed backup deletes its artifact
+
+A partial `.sql.gz` looks restorable: right name, right extension, plausible
+size. It is deleted on failure so the library cannot offer it. The
+corresponding test asserts no `.sql.gz` survives a cancelled backup.
+
+### The restore checksum is verified before the destination is touched
+
+`verify_checksum` runs first, so a corrupted artifact fails without a
+destination database having been created. A test truncates an artifact and
+asserts the schema count on the server is unchanged.
+
+### Restore session settings are restored afterwards
+
+`FOREIGN_KEY_CHECKS=0`, `UNIQUE_CHECKS=0` and `AUTOCOMMIT=0` are worth 5–10x on
+a large import, and the first is required for correctness — the fixture's
+foreign-key cycle cannot be inserted in any order. All three are re-enabled and
+committed in a postamble rather than left off for the rest of the connection.
+
+The stream is fed line by line so that cancellation lands between statements
+rather than mid-statement.
+
+### The test user has restore privileges but not SUPER
+
+The fixture grants `dbsync` everything a restore needs, listed explicitly.
+`GRANT ALL ON *.*` would include SUPER and silently invalidate the point of the
+round-trip test, which is that a DEFINER-stripped dump restores for a user who
+*cannot* set a definer.
+
+### MySQL client tools are a dependency, not a bundle
+
+The round-trip cannot be verified without `mysqldump` and `mysql` on the host.
+CI installs `mysql-client` via apt; locally they came from Homebrew, which
+installs keg-only into `/opt/homebrew/opt/mysql-client/bin` — not on `PATH`.
+
+`find_tool` searches that path explicitly, along with the other common install
+locations, because a GUI app launched from Finder does not inherit the shell's
+`PATH` at all. Discovery finding a keg-only install is a small proof that the
+search list is doing real work.

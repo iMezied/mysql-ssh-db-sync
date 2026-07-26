@@ -49,6 +49,22 @@ export const commands = {
 	listDatabases: (id: string) => typedError<DatabaseInfo[], CommandError>(__TAURI_INVOKE("list_databases", { id })),
 	/**  List the tables in one database, with the metadata the picker needs. */
 	listTables: (id: string, database: string) => typedError<TableInfo[], CommandError>(__TAURI_INVOKE("list_tables", { id, database })),
+	/**
+	 *  Start a backup and return its job id immediately.
+	 * 
+	 *  The work runs in the background; progress arrives as `JobProgress` events
+	 *  and the terminal state as `JobFinished`. Blocking the command until the dump
+	 *  finished would freeze the UI for the length of the job.
+	 */
+	startBackup: (profileId: string, request: BackupRequest) => typedError<string, CommandError>(__TAURI_INVOKE("start_backup", { profileId, request })),
+	/**  Start a restore and return its job id immediately. */
+	startRestore: (profileId: string, request: RestoreRequest) => typedError<string, CommandError>(__TAURI_INVOKE("start_restore", { profileId, request })),
+	backupDirectory: () => typedError<string, CommandError>(__TAURI_INVOKE("backup_directory")),
+	listArtifacts: (directory: string | null) => typedError<Artifact[], CommandError>(__TAURI_INVOKE("list_artifacts", { directory })),
+	/**  Hash an artifact and compare it against its manifest. */
+	checkArtifact: (path: string) => typedError<IntegrityCheck, CommandError>(__TAURI_INVOKE("check_artifact", { path })),
+	/**  Delete an artifact and its manifest. */
+	deleteArtifact: (path: string) => typedError<null, CommandError>(__TAURI_INVOKE("delete_artifact", { path })),
 	listJobs: (limit: number) => typedError<JobRecord[], CommandError>(__TAURI_INVOKE("list_jobs", { limit })),
 	/**
 	 *  Cancel a running job.
@@ -73,6 +89,27 @@ export type AppInfo = {
 	store_path: string,
 };
 
+/**  One artifact, as the library lists it. */
+export type Artifact = {
+	path: string,
+	filename: string,
+	size_bytes: number | null,
+	modified_at: string,
+	/**  Populated when a readable manifest sits beside the artifact. */
+	database: string | null,
+	engine: Engine | null,
+	source_profile_name: string | null,
+	table_count: number | null,
+	tables_with_data: number | null,
+	/**  `None` when there is no manifest to check against. */
+	has_manifest: boolean,
+};
+
+export type BackupRequest = {
+	common: CommonBackupOptions,
+	engine: EngineBackupOptions,
+};
+
 /**
  *  Error shape crossing into the webview.
  * 
@@ -82,6 +119,19 @@ export type AppInfo = {
 export type CommandError = {
 	kind: string,
 	message: string,
+};
+
+export type CommonBackupOptions = {
+	database: string,
+	selections: TableSelection[],
+	output_dir: string,
+	/**  Gzip the stream. Ignored for formats that compress internally. */
+	compress: boolean,
+	/**
+	 *  Encrypt at rest with age. Wired in a later milestone; the manifest
+	 *  already records the flag.
+	 */
+	encrypt: boolean,
 };
 
 export type ConnectionProfile = {
@@ -137,6 +187,18 @@ export type DbConfig = {
  */
 export type Engine = "mysql" | "postgres";
 
+export type EngineBackupOptions = {
+	engine: "mysql",
+} & MysqlBackupOptions | {
+	engine: "postgres",
+} & PostgresBackupOptions;
+
+export type EngineRestoreOptions = {
+	engine: "mysql",
+} & MysqlRestoreOptions | {
+	engine: "postgres",
+} & PostgresRestoreOptions;
+
 /**
  *  Environment classification for a connection profile.
  * 
@@ -158,6 +220,9 @@ export type HostKeyPrompt = {
 	/**  The fingerprint we had pinned, when `changed`. */
 	previous_fingerprint: string | null,
 };
+
+/**  Result of checking an artifact against its manifest. */
+export type IntegrityCheck = { status: "ok" } | { status: "mismatch"; expected: string; actual: string } | { status: "no_manifest" } | { status: "unreadable"; detail: string };
 
 /**
  *  Emitted when a job reaches a terminal state, so the UI can refresh history
@@ -200,6 +265,76 @@ export type JobRecord = {
 };
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
+
+export type MysqlBackupOptions = {
+	/**  Consistent snapshot without locking. Only meaningful for InnoDB. */
+	single_transaction: boolean,
+	/**  Emit binary columns as hex. Without this, BLOBs can corrupt in transit. */
+	hex_blob: boolean,
+	set_gtid_purged_off: boolean,
+	add_drop_table: boolean,
+	extended_insert: boolean,
+	routines: boolean,
+	triggers: boolean,
+	events: boolean,
+	default_character_set: string,
+	/**
+	 *  Send `--column-statistics=0`, required when an 8.x client talks to a
+	 *  pre-8.0 server.
+	 */
+	disable_column_statistics: boolean,
+	/**  Strip `DEFINER=` clauses so restores need no SUPER privilege. */
+	strip_definer: boolean,
+	/**  Use mydumper for a parallel dump when the binary is available. */
+	parallel_threads: number | null,
+	extra_flags: string[],
+};
+
+export type MysqlRestoreOptions = {
+	foreign_key_checks_off: boolean,
+	unique_checks_off: boolean,
+	autocommit_off: boolean,
+	/**  Skip writing the restore to the destination's binary log. */
+	disable_binlog: boolean,
+	charset: string,
+	collation: string,
+};
+
+export type PgDumpFormat = 
+/**
+ *  `-Fc`. Default: the only format supporting both selective and parallel
+ *  restore.
+ */
+"custom" | 
+/**  `-Fd`. Adds parallel *dump*. */
+"directory" | 
+/**  `-Fp`. Plain SQL; no selective restore. */
+"plain";
+
+export type PostgresBackupOptions = {
+	format: PgDumpFormat,
+	no_owner: boolean,
+	no_privileges: boolean,
+	blobs: boolean,
+	/**  Restrict to these schemas; empty means all. */
+	schemas: string[],
+	serializable_deferrable: boolean,
+	/**  Parallel dump jobs. Only honoured for `Directory`. */
+	parallel_jobs: number | null,
+	/**  Additionally dump roles/globals via `pg_dumpall --globals-only`. */
+	include_globals: boolean,
+	extra_flags: string[],
+};
+
+export type PostgresRestoreOptions = {
+	no_owner: boolean,
+	no_privileges: boolean,
+	/**  `pg_restore -j`. Only valid for archive formats. */
+	parallel_jobs: number | null,
+	/**  Restore only these tables. Requires an archive format. */
+	only_tables: string[],
+	clean: boolean,
+};
 
 export type ProfileCreate = {
 	name: string,
@@ -280,6 +415,16 @@ export type ProgressEvent = {
 	percent: number | null,
 };
 
+export type RestoreRequest = {
+	artifact_path: string,
+	naming: TargetNaming,
+	engine: EngineRestoreOptions,
+	/**  Verify the artifact checksum before touching the destination. */
+	verify_checksum: boolean,
+	/**  Typed confirmation supplied by the user for a destructive restore. */
+	typed_confirmation: string | null,
+};
+
 /**  What the UI is allowed to know about stored secrets: whether they exist. */
 export type SecretStatus = {
 	has_db_password: boolean,
@@ -330,6 +475,31 @@ export type TableInfo = {
 	 */
 	transactional: boolean,
 };
+
+/**  What to do with one table. */
+export type TableMode = 
+/**  Structure and rows. */
+"schema_and_data" | 
+/**  Structure only — the default for everything not explicitly selected. */
+"schema_only" | 
+/**  Omit entirely. */
+"exclude";
+
+export type TableSelection = {
+	name: string,
+	mode: TableMode,
+	/**  Optional row filter applied only when `mode` is `SchemaAndData`. */
+	where_filter: string | null,
+};
+
+/**  How the destination database is chosen. */
+export type TargetNaming = 
+/**  Create `{prefix}_{YYYYMMDD_HHMMSS}`. Non-destructive; the default. */
+{ strategy: "new_timestamped"; prefix: string } | 
+/**  Use a fixed name, dropping it first if it exists. */
+{ strategy: "drop_and_recreate"; name: string } | 
+/**  Restore into an existing database without dropping. */
+{ strategy: "into_existing"; name: string };
 
 /**
  *  Per-profile overrides for external client binaries.

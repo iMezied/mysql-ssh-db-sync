@@ -45,6 +45,15 @@ export const api = {
   listDatabases: (id: string) => unwrap(commands.listDatabases(id)),
   listTables: (id: string, database: string) =>
     unwrap(commands.listTables(id, database)),
+  startBackup: (...args: Parameters<typeof commands.startBackup>) =>
+    unwrap(commands.startBackup(...args)),
+  startRestore: (...args: Parameters<typeof commands.startRestore>) =>
+    unwrap(commands.startRestore(...args)),
+  backupDirectory: () => unwrap(commands.backupDirectory()),
+  listArtifacts: (directory: string | null = null) =>
+    unwrap(commands.listArtifacts(directory)),
+  checkArtifact: (path: string) => unwrap(commands.checkArtifact(path)),
+  deleteArtifact: (path: string) => unwrap(commands.deleteArtifact(path)),
   listJobs: (limit: number) => unwrap(commands.listJobs(limit)),
   cancelJob: (id: string) => unwrap(commands.cancelJob(id)),
   appInfo: () => unwrap(commands.appInfo()),

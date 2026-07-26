@@ -261,3 +261,18 @@ BEGIN
 END //
 
 DELIMITER ;
+
+-- ── Restore-user privileges ─────────────────────────────────────────────
+--
+-- The `dbsync` user is what the restore tests authenticate as. It needs enough
+-- to create a database and load a dump into it, but deliberately NOT SUPER or
+-- SET_USER_ID: that is the whole point — a dump still carrying DEFINER clauses
+-- must be rejected for this user, while a filtered one must restore cleanly.
+--
+-- `GRANT ALL ON *.*` would hand over SUPER and quietly invalidate that test,
+-- so the privileges are listed explicitly.
+GRANT CREATE, DROP, SELECT, INSERT, UPDATE, DELETE, INDEX, ALTER,
+      CREATE VIEW, SHOW VIEW, CREATE ROUTINE, ALTER ROUTINE, EXECUTE,
+      TRIGGER, REFERENCES, LOCK TABLES, CREATE TEMPORARY TABLES
+    ON *.* TO 'dbsync'@'%';
+FLUSH PRIVILEGES;

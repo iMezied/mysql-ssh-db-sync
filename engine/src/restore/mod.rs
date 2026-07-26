@@ -5,10 +5,13 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
-use crate::job::JobContext;
 use crate::manifest::{ArtifactFormat, BackupManifest};
 use crate::profile::ConnectionProfile;
 use crate::types::{Engine, EnvironmentTag};
+
+pub mod mysql;
+
+pub use mysql::run_mysql_restore;
 
 /// How the destination database is chosen.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -133,8 +136,12 @@ pub enum RestoreError {
     ParallelRestoreUnsupported(ArtifactFormat),
     #[error("{0}")]
     Invalid(String),
-    #[error("not implemented until M2': {0}")]
+    #[error("{0} is not implemented yet")]
     NotImplemented(&'static str),
+    #[error(transparent)]
+    Exec(#[from] crate::exec::ExecError),
+    #[error("job was cancelled")]
+    Cancelled,
 }
 
 impl RestoreRequest {
@@ -206,14 +213,6 @@ impl RestoreRequest {
 
         Ok(())
     }
-}
-
-pub async fn run_restore(
-    _profile: &ConnectionProfile,
-    _request: &RestoreRequest,
-    _ctx: &JobContext,
-) -> Result<String, RestoreError> {
-    Err(RestoreError::NotImplemented("run_restore"))
 }
 
 /// Environments where an accidental restore is most costly get the strictest

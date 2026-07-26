@@ -11,10 +11,13 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
-use crate::job::JobContext;
 use crate::manifest::ArtifactFormat;
 use crate::profile::ConnectionProfile;
 use crate::types::Engine;
+
+pub mod mysql;
+
+pub use mysql::run_mysql_backup;
 
 /// What to do with one table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -233,8 +236,18 @@ pub enum BackupError {
     EngineMismatch { profile: Engine, options: Engine },
     #[error("{0}")]
     Invalid(String),
-    #[error("not implemented until M2': {0}")]
+    #[error("{0} is not implemented yet")]
     NotImplemented(&'static str),
+    #[error("could not find {tool}; install it or set an override on the profile")]
+    ToolMissing { tool: String },
+    #[error(transparent)]
+    Exec(#[from] crate::exec::ExecError),
+    #[error("io error: {0}")]
+    Io(String),
+    #[error(transparent)]
+    Connect(#[from] Box<crate::connect::ConnectError>),
+    #[error("job was cancelled")]
+    Cancelled,
 }
 
 impl BackupRequest {
@@ -294,14 +307,6 @@ impl BackupRequest {
 
         Ok(())
     }
-}
-
-pub async fn run_backup(
-    _profile: &ConnectionProfile,
-    _request: &BackupRequest,
-    _ctx: &JobContext,
-) -> Result<PathBuf, BackupError> {
-    Err(BackupError::NotImplemented("run_backup"))
 }
 
 #[cfg(test)]
