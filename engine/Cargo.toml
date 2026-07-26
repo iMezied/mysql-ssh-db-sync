@@ -27,6 +27,10 @@ directories = "5"
 russh = "0.62"
 # Used at runtime for pg_restore's TOC filter, not just in tests.
 tempfile = "3"
+# Webhook URLs are user-supplied; parsing them properly at the point of entry
+# beats a string check that lets a typo through until 03:00 three weeks later.
+url = "2"
+reqwest.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # Process-group signalling: killing only the direct child orphans a pipeline.
@@ -49,3 +53,9 @@ keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 secrecy.workspace = true
+# Test-only. The cron scan is generic over `chrono::TimeZone`, and daylight
+# saving is the part most likely to be wrong — but this machine's zone has had
+# no DST since 2016, so asserting against `Local` would assert nothing. Real
+# IANA zones let the spring-forward gap and the autumn repeat be tested for
+# real. Not a runtime dependency: nothing shipped needs the tz database.
+chrono-tz = "0.10"

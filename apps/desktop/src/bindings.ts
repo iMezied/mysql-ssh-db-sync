@@ -88,18 +88,79 @@ export const commands = {
 	cancelJob: (jobId: string) => typedError<boolean, CommandError>(__TAURI_INVOKE("cancel_job", { jobId })),
 	activeJobIds: () => typedError<string[], CommandError>(__TAURI_INVOKE("active_job_ids")),
 	appInfo: () => typedError<AppInfo, CommandError>(__TAURI_INVOKE("app_info")),
+	listSchedules: () => typedError<ScheduleView[], CommandError>(__TAURI_INVOKE("list_schedules")),
+	getSchedule: (id: string) => typedError<{
+	schedule: Schedule,
+	description: string,
+	next_run_at: string | null,
+	/**  True while a run started by this schedule is still going. */
+	running: boolean,
+} | null, CommandError>(__TAURI_INVOKE("get_schedule", { id })),
+	createSchedule: (input: ScheduleCreate) => typedError<ScheduleView, CommandError>(__TAURI_INVOKE("create_schedule", { input })),
+	updateSchedule: (id: string, patch: ScheduleUpdate_Deserialize) => typedError<ScheduleView, CommandError>(__TAURI_INVOKE("update_schedule", { id, patch })),
+	deleteSchedule: (id: string) => typedError<boolean, CommandError>(__TAURI_INVOKE("delete_schedule", { id })),
+	/**
+	 *  Run a schedule immediately, returning its job id.
+	 * 
+	 *  Deliberately does not move the schedule's high-water mark: testing a
+	 *  schedule now must not cancel the occurrence it was created for.
+	 */
+	runScheduleNow: (id: string) => typedError<string, CommandError>(__TAURI_INVOKE("run_schedule_now", { id })),
+	previewCron: (expression: string, timezone: ScheduleTimezone) => typedError<CronPreview, CommandError>(__TAURI_INVOKE("preview_cron", { expression, timezone })),
+	/**
+	 *  The `dbsync` invocation that runs this schedule from system cron.
+	 * 
+	 *  Offered because plenty of DBAs would rather their backups were driven by the
+	 *  same cron that runs everything else on the box than by a desktop app that
+	 *  has to stay open.
+	 */
+	crontabLine: (id: string) => typedError<string, CommandError>(__TAURI_INVOKE("crontab_line", { id })),
+	schedulerStatus: () => typedError<SchedulerStatus, CommandError>(__TAURI_INVOKE("scheduler_status")),
+	getAppSettings: () => typedError<AppSettings, CommandError>(__TAURI_INVOKE("get_app_settings")),
+	setAppSettings: (next: AppSettings) => typedError<AppSettings, CommandError>(__TAURI_INVOKE("set_app_settings", { next })),
 };
 
 /** Events */
 export const events = {
 	jobFinished: makeEvent<JobFinished>("job-finished"),
 	jobProgress: makeEvent<JobProgress>("job-progress"),
+	navigateTo: makeEvent<NavigateTo>("navigate-to"),
+	scheduledRunFinished: makeEvent<ScheduledRunFinished>("scheduled-run-finished"),
 };
 
 /* Types */
 export type AppInfo = {
 	engine_version: string,
 	store_path: string,
+};
+
+export type AppSettings = {
+	/**
+	 *  Whether the app runs schedules itself.
+	 * 
+	 *  On by default: someone who creates a schedule in the app expects the app
+	 *  to run it. Turning it off is for people driving schedules from system
+	 *  cron who do not want two copies firing.
+	 */
+	scheduler_enabled: boolean,
+	/**
+	 *  Whether closing the window leaves the app running in the tray.
+	 * 
+	 *  On by default, because with it off a closed window silently stops every
+	 *  schedule — the app would appear to be configured for nightly backups
+	 *  that never happen.
+	 */
+	close_to_tray: boolean,
+	/**
+	 *  Launch at login. Read from the OS rather than from the store, since the
+	 *  user can change it outside the app.
+	 */
+	launch_at_login: boolean,
+	/**
+	 *  Whether the user has already been told that closing the window does not
+	 *  quit. Shown once, not every time.
+	 */
+	background_notice_shown: boolean,
 };
 
 /**  One artifact, as the library lists it. */
@@ -172,6 +233,18 @@ export type ConnectionReport = {
 	 *  shows the fingerprint and, if the user accepts, pins it and retries.
 	 */
 	host_key_prompt: HostKeyPrompt | null,
+};
+
+/**
+ *  What a cron expression means, and the next few times it fires.
+ * 
+ *  This is what the schedule form shows as the user types. Seeing the next five
+ *  real timestamps is the only reliable way to catch a mistyped expression
+ *  before it silently backs up at the wrong time for a month.
+ */
+export type CronPreview = {
+	description: string,
+	next_runs: string[],
 };
 
 export type DatabaseInfo = {
@@ -313,6 +386,22 @@ export type MysqlRestoreOptions = {
 	collation: string,
 };
 
+/**
+ *  The tray asking the open window to show a particular page.
+ * 
+ *  An event rather than a navigation, so a window that is already showing live
+ *  job progress does not get reloaded out from under the user.
+ */
+export type NavigateTo = string;
+
+/**  When to raise a notification for a scheduled run. */
+export type NotifyPolicy = "never" | 
+/**
+ *  The default. A nightly backup that worked is not news; one that failed
+ *  is the only thing the user needs to see.
+ */
+"on_failure" | "always";
+
 export type PgDumpFormat = 
 /**
  *  `-Fc`. Default: the only format supporting both selective and parallel
@@ -445,6 +534,175 @@ export type RetentionPolicy = {
 	max_age_days: number | null,
 };
 
+/**  What happened on one scheduled run. */
+export type RunReport = {
+	/**  Always `"dbsync.run.finished"`, so a receiving endpoint can route on it. */
+	event: string,
+	schedule_id: string,
+	schedule_name: string,
+	job_id: string,
+	kind: JobKind,
+	outcome: JobOutcome,
+	/**
+	 *  The occurrence this run was for, which is not the same as when it
+	 *  started if the tick was late or it was a catch-up run.
+	 */
+	scheduled_for: string,
+	started_at: string,
+	finished_at: string,
+	duration_seconds: number | null,
+	/**  Profile *name*. Never the host, port, user or password. */
+	source_profile: string,
+	dest_profile: string | null,
+	database: string,
+	target_database: string | null,
+	/**  File name only — never the directory. See the module docs. */
+	artifact_name: string | null,
+	artifact_bytes: number | null,
+	verification: VerificationSummary | null,
+	removed_artifacts: number | null,
+	error: string | null,
+};
+
+/**  A named, recurring job. */
+export type Schedule = {
+	id: string,
+	name: string,
+	/**  The plan supplies the source profile, database and table selection. */
+	plan_id: string,
+	/**
+	 *  `None` makes this a backup-only schedule.
+	 * 
+	 *  Deliberately not a foreign key. If the destination profile is deleted,
+	 *  the schedule must fail loudly at its next run rather than have the
+	 *  column quietly set to NULL — which would silently downgrade a
+	 *  replication job to a local backup and nobody would notice for months.
+	 */
+	dest_profile_id: string | null,
+	cron: string,
+	timezone: ScheduleTimezone,
+	enabled: boolean,
+	action: ScheduleAction,
+	webhook_url: string | null,
+	notify: NotifyPolicy,
+	/**
+	 *  Run an occurrence that was missed while the machine was asleep or the
+	 *  app was closed. At most one make-up run, however many were missed.
+	 */
+	catch_up: boolean,
+	last_run_at: string | null,
+	last_outcome: JobOutcome | null,
+	last_job_id: string | null,
+	created_at: string,
+	updated_at: string,
+};
+
+/**  Everything a scheduled run does, beyond what the plan already says. */
+export type ScheduleAction = {
+	output_dir: string,
+	compress: boolean,
+	encrypt: boolean,
+	backup: EngineBackupOptions,
+	/**  Present exactly when the schedule has a destination profile. */
+	restore: ScheduleRestore | null,
+	verify: boolean,
+	retention: RetentionPolicy | null,
+};
+
+export type ScheduleCreate = {
+	name: string,
+	plan_id: string,
+	dest_profile_id: string | null,
+	cron: string,
+	timezone?: ScheduleTimezone,
+	action: ScheduleAction,
+	webhook_url: string | null,
+	notify?: NotifyPolicy,
+	catch_up?: boolean,
+	enabled?: boolean,
+};
+
+/**  The restore half of a scheduled sync. */
+export type ScheduleRestore = {
+	naming: TargetNaming,
+	options: EngineRestoreOptions,
+};
+
+/**  Which clock a cron expression is read against. */
+export type ScheduleTimezone = 
+/**
+ *  The machine's local time. What "back up at 2am" normally means, at the
+ *  cost of the daylight-saving behaviour described in the module docs.
+ */
+"local" | 
+/**
+ *  UTC. Immune to daylight saving; the right choice for a schedule that
+ *  must fire exactly once every 24 hours.
+ */
+"utc";
+
+/**  A partial update. Absent fields are left as they are. */
+export type ScheduleUpdate = ScheduleUpdate_Serialize | ScheduleUpdate_Deserialize;
+
+/**  A partial update. Absent fields are left as they are. */
+export type ScheduleUpdate_Deserialize = {
+	name: string | null,
+	cron: string | null,
+	timezone: ScheduleTimezone | null,
+	enabled: boolean | null,
+	action: ScheduleAction | null,
+	/**  Doubly optional so the webhook can be cleared as well as changed. */
+	webhook_url?: string | null,
+	notify: NotifyPolicy | null,
+	catch_up: boolean | null,
+	dest_profile_id?: string | null,
+};
+
+/**  A partial update. Absent fields are left as they are. */
+export type ScheduleUpdate_Serialize = {
+	name: string | null,
+	cron: string | null,
+	timezone: ScheduleTimezone | null,
+	enabled: boolean | null,
+	action: ScheduleAction | null,
+	/**  Doubly optional so the webhook can be cleared as well as changed. */
+	webhook_url: string | null,
+	notify: NotifyPolicy | null,
+	catch_up: boolean | null,
+	dest_profile_id: string | null,
+};
+
+/**
+ *  A schedule plus the things the list view needs but the record does not hold:
+ *  when it next runs, and what the cron expression means in English.
+ * 
+ *  Computed here rather than in TypeScript so there is exactly one cron
+ *  implementation. A second one in the frontend would eventually disagree with
+ *  the scheduler, and the UI would confidently show a time nothing happens at.
+ */
+export type ScheduleView = {
+	schedule: Schedule,
+	description: string,
+	next_run_at: string | null,
+	/**  True while a run started by this schedule is still going. */
+	running: boolean,
+};
+
+/**
+ *  A scheduled run finished, carrying everything the UI needs to show it.
+ * 
+ *  Separate from [`JobFinished`] because a scheduled run has a schedule behind
+ *  it: the schedules list has to update its "last outcome" column, which a bare
+ *  job id would not tell it.
+ */
+export type ScheduledRunFinished = RunReport;
+
+export type SchedulerStatus = {
+	/**  Whether the in-app scheduler loop is running right now. */
+	running: boolean,
+	in_flight: string[],
+};
+
 /**  What the UI is allowed to know about stored secrets: whether they exist. */
 export type SecretStatus = {
 	has_db_password: boolean,
@@ -571,6 +829,20 @@ export type ToolOverrides = {
 	pg_dumpall: string | null,
 	pg_restore: string | null,
 	psql: string | null,
+};
+
+/**
+ *  The compact form of a verification, for people rather than for diffing.
+ * 
+ *  The counts are exported to TypeScript as `number`. specta refuses to emit
+ *  `usize` as anything else, and rightly: JS has no 64-bit integer. A table
+ *  count that needed one would be a bigger problem than its representation.
+ */
+export type VerificationSummary = {
+	passed: boolean,
+	tables_checked: number | null,
+	failures: number | null,
+	skipped: number | null,
 };
 
 /* Tauri Specta runtime */

@@ -536,3 +536,285 @@ db_test! {
         }
     }
 }
+
+// ── Scheduled runs ──────────────────────────────────────────────────────
+//
+// The scheduler is only worth anything if a schedule coming due produces the
+// same real backup that pressing the button does. These drive it through
+// `tick_once` — the exact path the running app takes — rather than calling
+// `ops::sync` directly, so the due-detection, profile resolution, history
+// recording and reporting are all exercised together.
+
+/// Captures the reports the scheduler produces, so a test can assert on what
+/// the user would actually have been told.
+#[derive(Default)]
+struct Reports(tokio::sync::Mutex<Vec<db_sync_engine::notify::RunReport>>);
+
+struct Recorder(Arc<Reports>);
+
+#[async_trait::async_trait]
+impl db_sync_engine::scheduler::SchedulerHooks for Recorder {
+    async fn run_finished(&self, report: &db_sync_engine::notify::RunReport) {
+        self.0.0.lock().await.push(report.clone());
+    }
+}
+
+/// Wait for the scheduler to go idle, failing rather than hanging.
+async fn settle(scheduler: &db_sync_engine::scheduler::Scheduler) {
+    for _ in 0..600 {
+        if scheduler.in_flight_ids().await.is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("a scheduled run never finished");
+}
+
+db_test! {
+    #[ignore = "requires an unlocked OS keychain"]
+    async fn a_due_schedule_runs_a_real_sync_and_reports_it() {
+        require_containers!();
+        let (store, _dir) = temp_store().await;
+        let out = tempfile::tempdir().unwrap();
+
+        let source = profile(&store, "sched-source", "root", "testroot").await;
+        let dest = profile(&store, "sched-dest", "dbsync", "testpass").await;
+        let _cleanup = Cleanup(vec![source.id, dest.id]);
+
+        let plan = store
+            .create_sync_plan(db_sync_engine::plan::SyncPlanCreate {
+                profile_id: source.id,
+                name: "nightly".into(),
+                database: "fixture".into(),
+                selections: backup_request(out.path().to_path_buf()).common.selections,
+            })
+            .await
+            .unwrap();
+
+        let schedule = store
+            .create_schedule(db_sync_engine::schedule::ScheduleCreate {
+                name: "nightly staging refresh".into(),
+                plan_id: plan.id,
+                dest_profile_id: Some(dest.id),
+                // Every minute, with catch-up on, so a single tick a little
+                // later is guaranteed to find an occurrence.
+                cron: "* * * * *".parse().unwrap(),
+                timezone: db_sync_engine::cron::ScheduleTimezone::Utc,
+                action: db_sync_engine::schedule::ScheduleAction {
+                    output_dir: out.path().to_path_buf(),
+                    compress: true,
+                    encrypt: false,
+                    backup: EngineBackupOptions::Mysql(MysqlBackupOptions::default()),
+                    restore: Some(db_sync_engine::schedule::ScheduleRestore {
+                        naming: TargetNaming::NewTimestamped {
+                            prefix: "scheduled".into(),
+                        },
+                        options: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
+                    }),
+                    verify: true,
+                    retention: None,
+                },
+                webhook_url: None,
+                notify: db_sync_engine::schedule::NotifyPolicy::Always,
+                catch_up: true,
+                enabled: true,
+            })
+            .await
+            .unwrap();
+
+        let reports = Arc::new(Reports::default());
+        let (tx, _rx) = db_sync_engine::events::create_event_channel(
+            db_sync_engine::events::EVENT_CHANNEL_CAPACITY,
+        );
+        let scheduler = db_sync_engine::scheduler::Scheduler::new(
+            store.clone(),
+            db_sync_engine::job::JobRegistry::new(),
+            tx,
+        )
+        .with_hooks(Arc::new(Recorder(reports.clone())));
+
+        // Two minutes on from creation, so an occurrence has definitely passed.
+        scheduler
+            .tick_once(schedule.created_at + chrono::Duration::minutes(2))
+            .await;
+        assert_eq!(
+            scheduler.in_flight_ids().await.len(),
+            1,
+            "the tick should have started exactly one run"
+        );
+        settle(&scheduler).await;
+
+        // ── What the user was told ──────────────────────────────────────
+        let reports = reports.0.lock().await;
+        assert_eq!(reports.len(), 1);
+        let report = &reports[0];
+
+        assert_eq!(
+            report.outcome,
+            JobOutcome::Success,
+            "the scheduled sync failed: {:?}",
+            report.error
+        );
+        assert_eq!(report.kind, JobKind::Sync);
+        assert_eq!(report.source_profile, "sched-source");
+        assert_eq!(report.dest_profile.as_deref(), Some("sched-dest"));
+        assert!(
+            report.artifact_bytes.is_some_and(|b| b > 0),
+            "the report should carry a real artifact size"
+        );
+
+        let verification = report
+            .verification
+            .as_ref()
+            .expect("verification was requested");
+        assert!(verification.passed, "row counts did not match");
+        assert!(verification.tables_checked >= 9);
+
+        // ── What actually landed on the destination ─────────────────────
+        let target = report
+            .target_database
+            .as_deref()
+            .expect("a sync names the database it wrote");
+        assert!(target.starts_with("scheduled_"), "got {target}");
+
+        let users = query_scalar(target, "SELECT COUNT(*) FROM users").await;
+        assert_ne!(users, "0", "the scheduled run restored no rows");
+        assert_eq!(
+            users,
+            query_scalar("fixture", "SELECT COUNT(*) FROM users").await,
+            "the restored row count must match the source"
+        );
+
+        // Non-ASCII table names survive the scheduled path too.
+        assert_eq!(
+            query_scalar(target, "SELECT COUNT(*) FROM `日本語テーブル`").await,
+            query_scalar("fixture", "SELECT COUNT(*) FROM `日本語テーブル`").await
+        );
+
+        // ── What the schedule recorded ──────────────────────────────────
+        let after = store.get_schedule(schedule.id).await.unwrap().unwrap();
+        assert_eq!(after.last_outcome, Some(JobOutcome::Success));
+        assert!(
+            after.last_run_at.is_some(),
+            "a scheduled run must move the high-water mark"
+        );
+        assert_eq!(after.last_job_id, Some(report.job_id));
+
+        // And a second tick at the same instant must not run it again.
+        scheduler
+            .tick_once(schedule.created_at + chrono::Duration::minutes(2))
+            .await;
+        assert!(
+            scheduler.in_flight_ids().await.is_empty(),
+            "one occurrence must produce exactly one run"
+        );
+
+        // Leave the fixture server as we found it.
+        let _ = tokio::process::Command::new("docker")
+            .args([
+                "exec",
+                "db-sync-mysql-1",
+                "mysql",
+                "-uroot",
+                "-ptestroot",
+                "-e",
+                &format!("DROP DATABASE IF EXISTS `{target}`"),
+            ])
+            .output()
+            .await;
+    }
+}
+
+db_test! {
+    #[ignore = "requires an unlocked OS keychain"]
+    async fn a_scheduled_backup_enforces_its_retention_policy() {
+        require_containers!();
+        let (store, _dir) = temp_store().await;
+        let out = tempfile::tempdir().unwrap();
+
+        let source = profile(&store, "retain-source", "root", "testroot").await;
+        let _cleanup = Cleanup(vec![source.id]);
+
+        let plan = store
+            .create_sync_plan(db_sync_engine::plan::SyncPlanCreate {
+                profile_id: source.id,
+                name: "hourly".into(),
+                database: "fixture".into(),
+                selections: vec![TableSelection::with_data("users")],
+            })
+            .await
+            .unwrap();
+
+        let schedule = store
+            .create_schedule(db_sync_engine::schedule::ScheduleCreate {
+                name: "hourly backup".into(),
+                plan_id: plan.id,
+                dest_profile_id: None,
+                cron: "@hourly".parse().unwrap(),
+                timezone: db_sync_engine::cron::ScheduleTimezone::Utc,
+                action: db_sync_engine::schedule::ScheduleAction {
+                    output_dir: out.path().to_path_buf(),
+                    compress: true,
+                    encrypt: false,
+                    backup: EngineBackupOptions::Mysql(MysqlBackupOptions::default()),
+                    restore: None,
+                    verify: false,
+                    // Keep one. The newest is never deleted, so after two runs
+                    // exactly one artifact must remain.
+                    retention: Some(db_sync_engine::retention::RetentionPolicy {
+                        keep_last: Some(1),
+                        max_age_days: None,
+                    }),
+                },
+                webhook_url: None,
+                notify: db_sync_engine::schedule::NotifyPolicy::Never,
+                catch_up: false,
+                enabled: true,
+            })
+            .await
+            .unwrap();
+
+        let (tx, _rx) = db_sync_engine::events::create_event_channel(
+            db_sync_engine::events::EVENT_CHANNEL_CAPACITY,
+        );
+        let scheduler = db_sync_engine::scheduler::Scheduler::new(
+            store.clone(),
+            db_sync_engine::job::JobRegistry::new(),
+            tx,
+        );
+
+        let artifacts = || {
+            std::fs::read_dir(out.path())
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".sql.gz"))
+                .collect::<Vec<_>>()
+        };
+
+        scheduler.run_now(schedule.id).await.unwrap().unwrap();
+        settle(&scheduler).await;
+        assert_eq!(artifacts().len(), 1, "the first run produced no artifact");
+
+        // Artifact names carry a whole-second timestamp; without this the
+        // second run would collide with the first rather than replace it.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        scheduler.run_now(schedule.id).await.unwrap().unwrap();
+        settle(&scheduler).await;
+
+        let remaining = artifacts();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "retention should have left exactly one artifact, found {remaining:?}"
+        );
+
+        let after = store.get_schedule(schedule.id).await.unwrap().unwrap();
+        assert_eq!(after.last_outcome, Some(JobOutcome::Success));
+        assert!(
+            after.last_run_at.is_none(),
+            "manual runs must not move the high-water mark"
+        );
+    }
+}

@@ -2,6 +2,7 @@ import { NavLink } from "react-router-dom";
 import {
   Archive,
   ArrowLeftRight,
+  CalendarClock,
   Database,
   DownloadCloud,
   ListChecks,
@@ -16,6 +17,7 @@ const links = [
   { to: "/backup", label: "Backup", icon: DownloadCloud },
   { to: "/restore", label: "Restore", icon: UploadCloud },
   { to: "/sync", label: "Sync", icon: ArrowLeftRight },
+  { to: "/schedules", label: "Schedules", icon: CalendarClock },
   { to: "/library", label: "Library", icon: Archive },
   { to: "/jobs", label: "Jobs", icon: ListChecks },
   { to: "/settings", label: "Settings", icon: Settings },

@@ -19,6 +19,8 @@ use crate::plan::{SyncPlan, SyncPlanCreate};
 use crate::profile::{
     ConnectionProfile, DbConfig, ProfileCreate, ProfileUpdate, SshConfig, ToolOverrides,
 };
+use crate::schedule::{NotifyPolicy, Schedule, ScheduleCreate, ScheduleUpdate};
+use crate::settings;
 use crate::types::{Engine, EnvironmentTag};
 
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +41,10 @@ pub enum StoreError {
     DuplicateName(String),
     #[error("no sync plan with id {0}")]
     SyncPlanNotFound(Uuid),
+    #[error("no schedule with id {0}")]
+    ScheduleNotFound(Uuid),
+    #[error(transparent)]
+    InvalidSchedule(crate::schedule::ScheduleError),
 }
 
 type Result<T> = std::result::Result<T, StoreError>;
@@ -57,16 +63,27 @@ pub struct Store {
 
 impl Store {
     /// Open (creating if absent) the store at `path` and run migrations.
+    ///
+    /// `:memory:` is accepted and gives an ephemeral store, which tests use.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+
         let options = SqliteConnectOptions::new()
-            .filename(path.as_ref())
+            .filename(path)
             .create_if_missing(true)
             // Referential integrity is off by default in SQLite; sync_plans
             // depends on it to clean up when a profile is deleted.
             .foreign_keys(true);
 
+        // Every connection to `:memory:` opens a *separate* database, so a
+        // multi-connection pool would run the migrations on one connection and
+        // then serve queries from empty ones — surfacing as "no such table"
+        // long after the mistake. Pinning to a single connection makes an
+        // in-memory store behave the way anyone writing one would expect.
+        let max_connections = if path == Path::new(":memory:") { 1 } else { 5 };
+
         let pool = SqlitePoolOptions::new()
-            .max_connections(5)
+            .max_connections(max_connections)
             .connect_with(options)
             .await?;
 
@@ -551,6 +568,294 @@ impl Store {
             .await?;
         Ok(res.rows_affected() > 0)
     }
+}
+
+// ── Application settings ────────────────────────────────────────────────
+
+impl Store {
+    pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT value FROM app_settings WHERE key = ?1")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get::<String, _>("value")))
+    }
+
+    pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO app_settings (key, value) VALUES (?1, ?2) \
+             ON CONFLICT (key) DO UPDATE SET value = ?2",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Every stored preference, with defaults filled in.
+    ///
+    /// `launch_at_login` is left at its default here: the OS owns that state,
+    /// and the desktop layer overwrites it with what the OS actually reports.
+    pub async fn app_settings(&self) -> Result<settings::AppSettings> {
+        let defaults = settings::AppSettings::default();
+        Ok(settings::AppSettings {
+            scheduler_enabled: settings::parse_flag(
+                self.get_setting(settings::SCHEDULER_ENABLED)
+                    .await?
+                    .as_deref(),
+                defaults.scheduler_enabled,
+            ),
+            close_to_tray: settings::parse_flag(
+                self.get_setting(settings::CLOSE_TO_TRAY).await?.as_deref(),
+                defaults.close_to_tray,
+            ),
+            background_notice_shown: settings::parse_flag(
+                self.get_setting(settings::BACKGROUND_NOTICE_SHOWN)
+                    .await?
+                    .as_deref(),
+                defaults.background_notice_shown,
+            ),
+            ..defaults
+        })
+    }
+
+    pub async fn set_flag(&self, key: &str, value: bool) -> Result<()> {
+        self.set_setting(key, settings::flag_str(value)).await
+    }
+}
+
+// ── Schedules ───────────────────────────────────────────────────────────
+
+/// Every column the row mapper needs, in one place, so the four queries below
+/// cannot drift apart from each other or from [`row_to_schedule`].
+const SCHEDULE_COLUMNS: &str = "id, name, sync_plan_id, dest_profile_id, cron_expression, \
+     timezone, enabled, action_json, webhook_url, notify, catch_up, last_run_at, last_outcome, \
+     last_job_id, created_at, updated_at";
+
+impl Store {
+    pub async fn list_schedules(&self) -> Result<Vec<Schedule>> {
+        let sql = format!("SELECT {SCHEDULE_COLUMNS} FROM schedules ORDER BY name");
+        let rows = sqlx::query(&sql).fetch_all(&self.pool).await?;
+        rows.into_iter().map(row_to_schedule).collect()
+    }
+
+    /// Only the schedules the scheduler needs to consider on a tick.
+    pub async fn list_enabled_schedules(&self) -> Result<Vec<Schedule>> {
+        let sql =
+            format!("SELECT {SCHEDULE_COLUMNS} FROM schedules WHERE enabled = 1 ORDER BY name");
+        let rows = sqlx::query(&sql).fetch_all(&self.pool).await?;
+        rows.into_iter().map(row_to_schedule).collect()
+    }
+
+    pub async fn get_schedule(&self, id: Uuid) -> Result<Option<Schedule>> {
+        let sql = format!("SELECT {SCHEDULE_COLUMNS} FROM schedules WHERE id = ?1");
+        let row = sqlx::query(&sql)
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(row_to_schedule).transpose()
+    }
+
+    pub async fn require_schedule(&self, id: Uuid) -> Result<Schedule> {
+        self.get_schedule(id)
+            .await?
+            .ok_or(StoreError::ScheduleNotFound(id))
+    }
+
+    pub async fn create_schedule(&self, input: ScheduleCreate) -> Result<Schedule> {
+        // Refuse to persist something that could never safely run. Validating
+        // only in the UI would leave the CLI able to write an unattended
+        // drop-and-recreate straight into the table.
+        input.validate().map_err(StoreError::InvalidSchedule)?;
+
+        let now = Utc::now();
+        let schedule = Schedule {
+            id: Uuid::new_v4(),
+            name: input.name,
+            plan_id: input.plan_id,
+            dest_profile_id: input.dest_profile_id,
+            cron: input.cron,
+            timezone: input.timezone,
+            enabled: input.enabled,
+            action: input.action,
+            webhook_url: input.webhook_url,
+            notify: input.notify,
+            catch_up: input.catch_up,
+            last_run_at: None,
+            last_outcome: None,
+            last_job_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        sqlx::query(
+            "INSERT INTO schedules (id, name, sync_plan_id, dest_profile_id, cron_expression, \
+             timezone, enabled, action_json, webhook_url, notify, catch_up, created_at, \
+             updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        )
+        .bind(schedule.id.to_string())
+        .bind(&schedule.name)
+        .bind(schedule.plan_id.to_string())
+        .bind(schedule.dest_profile_id.map(|u| u.to_string()))
+        .bind(schedule.cron.as_str())
+        .bind(schedule.timezone.as_str())
+        .bind(schedule.enabled)
+        .bind(serde_json::to_string(&schedule.action).map_err(|e| corrupt("action_json", e))?)
+        .bind(&schedule.webhook_url)
+        .bind(schedule.notify.as_str())
+        .bind(schedule.catch_up)
+        .bind(schedule.created_at.to_rfc3339())
+        .bind(schedule.updated_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(schedule)
+    }
+
+    pub async fn update_schedule(&self, id: Uuid, patch: ScheduleUpdate) -> Result<Schedule> {
+        let mut s = self.require_schedule(id).await?;
+
+        if let Some(v) = patch.name {
+            s.name = v;
+        }
+        if let Some(v) = patch.cron {
+            s.cron = v;
+        }
+        if let Some(v) = patch.timezone {
+            s.timezone = v;
+        }
+        if let Some(v) = patch.enabled {
+            s.enabled = v;
+        }
+        if let Some(v) = patch.action {
+            s.action = v;
+        }
+        // Doubly-optional: Some(None) clears, None leaves alone.
+        if let Some(v) = patch.webhook_url {
+            s.webhook_url = v;
+        }
+        if let Some(v) = patch.notify {
+            s.notify = v;
+        }
+        if let Some(v) = patch.catch_up {
+            s.catch_up = v;
+        }
+        if let Some(v) = patch.dest_profile_id {
+            s.dest_profile_id = v;
+        }
+        s.updated_at = Utc::now();
+
+        // Re-checked after the patch, not before: a patch that only changes the
+        // naming strategy would otherwise slip a destructive target past the
+        // check that create_schedule applies.
+        s.validate().map_err(StoreError::InvalidSchedule)?;
+
+        sqlx::query(
+            "UPDATE schedules SET name = ?2, dest_profile_id = ?3, cron_expression = ?4, \
+             timezone = ?5, enabled = ?6, action_json = ?7, webhook_url = ?8, notify = ?9, \
+             catch_up = ?10, updated_at = ?11 WHERE id = ?1",
+        )
+        .bind(s.id.to_string())
+        .bind(&s.name)
+        .bind(s.dest_profile_id.map(|u| u.to_string()))
+        .bind(s.cron.as_str())
+        .bind(s.timezone.as_str())
+        .bind(s.enabled)
+        .bind(serde_json::to_string(&s.action).map_err(|e| corrupt("action_json", e))?)
+        .bind(&s.webhook_url)
+        .bind(s.notify.as_str())
+        .bind(s.catch_up)
+        .bind(s.updated_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(s)
+    }
+
+    /// Record that a schedule fired, against the occurrence it fired *for*.
+    ///
+    /// Stamping the occurrence rather than "now" is what makes the high-water
+    /// mark exact: a run that started 40 seconds late must not leave a mark 40
+    /// seconds past its own occurrence, or a schedule finer than that would
+    /// skip its next tick.
+    pub async fn mark_schedule_started(
+        &self,
+        id: Uuid,
+        occurrence: DateTime<Utc>,
+        job_id: Uuid,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE schedules SET last_run_at = ?2, last_job_id = ?3, last_outcome = NULL \
+             WHERE id = ?1",
+        )
+        .bind(id.to_string())
+        .bind(occurrence.to_rfc3339())
+        .bind(job_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn mark_schedule_finished(&self, id: Uuid, outcome: JobOutcome) -> Result<()> {
+        sqlx::query("UPDATE schedules SET last_outcome = ?2 WHERE id = ?1")
+            .bind(id.to_string())
+            .bind(outcome.as_str())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_schedule(&self, id: Uuid) -> Result<bool> {
+        let res = sqlx::query("DELETE FROM schedules WHERE id = ?1")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+}
+
+fn row_to_schedule(row: sqlx::sqlite::SqliteRow) -> Result<Schedule> {
+    let action_raw: String = row.get("action_json");
+    let cron_raw: String = row.get("cron_expression");
+    let tz_raw: String = row.get("timezone");
+    let notify_raw: String = row.get("notify");
+    let dest_raw: Option<String> = row.get("dest_profile_id");
+    let last_run_raw: Option<String> = row.get("last_run_at");
+    let last_outcome_raw: Option<String> = row.get("last_outcome");
+    let last_job_raw: Option<String> = row.get("last_job_id");
+
+    Ok(Schedule {
+        id: parse_uuid(&row.get::<String, _>("id"), "id")?,
+        name: row.get("name"),
+        plan_id: parse_uuid(&row.get::<String, _>("sync_plan_id"), "sync_plan_id")?,
+        dest_profile_id: dest_raw
+            .map(|s| parse_uuid(&s, "dest_profile_id"))
+            .transpose()?,
+        // A cron expression that no longer parses is corruption, not "never
+        // run". Reporting it beats a schedule that silently stops firing.
+        cron: cron_raw
+            .parse()
+            .map_err(|e: crate::cron::CronError| corrupt("cron_expression", anyhow::anyhow!(e)))?,
+        timezone: tz_raw
+            .parse()
+            .map_err(|e: crate::cron::CronError| corrupt("timezone", anyhow::anyhow!(e)))?,
+        enabled: row.get::<i64, _>("enabled") != 0,
+        action: serde_json::from_str(&action_raw).map_err(|e| corrupt("action_json", e))?,
+        webhook_url: row.get("webhook_url"),
+        notify: NotifyPolicy::parse(&notify_raw)
+            .ok_or_else(|| corrupt("notify", anyhow::anyhow!("unknown policy {notify_raw:?}")))?,
+        catch_up: row.get::<i64, _>("catch_up") != 0,
+        last_run_at: last_run_raw
+            .map(|s| parse_ts(&s, "last_run_at"))
+            .transpose()?,
+        last_outcome: last_outcome_raw.as_deref().and_then(parse_outcome),
+        last_job_id: last_job_raw
+            .map(|s| parse_uuid(&s, "last_job_id"))
+            .transpose()?,
+        created_at: parse_ts(&row.get::<String, _>("created_at"), "created_at")?,
+        updated_at: parse_ts(&row.get::<String, _>("updated_at"), "updated_at")?,
+    })
 }
 
 fn row_to_plan(row: sqlx::sqlite::SqliteRow) -> Result<SyncPlan> {

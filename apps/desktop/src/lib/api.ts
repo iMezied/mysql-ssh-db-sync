@@ -67,4 +67,20 @@ export const api = {
   listJobs: (limit: number) => unwrap(commands.listJobs(limit)),
   cancelJob: (id: string) => unwrap(commands.cancelJob(id)),
   appInfo: () => unwrap(commands.appInfo()),
+
+  listSchedules: () => unwrap(commands.listSchedules()),
+  getSchedule: (id: string) => unwrap(commands.getSchedule(id)),
+  createSchedule: (...args: Parameters<typeof commands.createSchedule>) =>
+    unwrap(commands.createSchedule(...args)),
+  updateSchedule: (...args: Parameters<typeof commands.updateSchedule>) =>
+    unwrap(commands.updateSchedule(...args)),
+  deleteSchedule: (id: string) => unwrap(commands.deleteSchedule(id)),
+  runScheduleNow: (id: string) => unwrap(commands.runScheduleNow(id)),
+  previewCron: (...args: Parameters<typeof commands.previewCron>) =>
+    unwrap(commands.previewCron(...args)),
+  crontabLine: (id: string) => unwrap(commands.crontabLine(id)),
+  schedulerStatus: () => unwrap(commands.schedulerStatus()),
+  getAppSettings: () => unwrap(commands.getAppSettings()),
+  setAppSettings: (...args: Parameters<typeof commands.setAppSettings>) =>
+    unwrap(commands.setAppSettings(...args)),
 };

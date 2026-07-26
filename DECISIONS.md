@@ -544,3 +544,200 @@ the user believes is the failure worth preventing.
 The `sync_plans` table has existed since the M0 migration and was unused until
 now — schema written ahead of the code that needs it, so no migration was
 required here.
+
+## M4′ — Scheduling
+
+### The cron parser is written here, not taken from a crate
+
+This code decides when unattended production backups run, and its semantics
+have to be the ones already in the user's head. Standard five-field cron is a
+small, fully specifiable language, and its genuinely surprising parts are worth
+owning and testing directly rather than trusting to a dependency's
+interpretation of them.
+
+Two behaviours are implemented deliberately, matching Vixie cron:
+
+* **Day-of-month / day-of-week combine with OR** when neither field is a star,
+  and with AND when either is. So `0 0 13 * 5` is "the 13th, and also every
+  Friday", not "Friday the 13th". This astonishes people, but it is what every
+  crontab on every Unix does.
+* **A leading `*` is what makes a field a star**, including `*/2`. That is
+  where Vixie sets its flag, so that is where we set ours.
+
+Six- and seven-field expressions are *rejected*, not reinterpreted. A Quartz
+user pasting `0 0 2 * * *` means 02:00 daily; read as five fields it becomes
+midnight on the 2nd. Silently shifting every field by one is the worst
+available outcome, so the error names the problem.
+
+`@reboot` is rejected too. Accepting it and never firing would silently lose
+every backup that schedule was meant to make.
+
+### Matching is the primitive; "next run" is a scan over it
+
+`CronExpression::matches` answers "does this wall-clock minute satisfy the
+expression", exactly as `cron(8)` works. `next_after` and `prev_at_or_before`
+are scans over that same predicate rather than separate arithmetic.
+
+One implementation means the "next run at …" shown in the UI cannot disagree
+with what the scheduler actually does. A separately-derived next-occurrence
+calculation would eventually diverge, and the UI would confidently display a
+time at which nothing happens.
+
+The scan walks day by day and only descends into the minutes a matching day
+actually names, which keeps the worst case (`0 0 29 2 *`, up to four years
+out) to about 1,600 cheap date checks rather than two million minute checks.
+
+### Daylight saving is handled by choosing, not by hoping
+
+A local-time expression is evaluated against the wall clock:
+
+* A time inside the **spring-forward gap does not exist**, so it does not fire
+  that day. `30 2 * * *` skips the transition day in New York.
+* A time in the **autumn repeat fires once**, on the first pass.
+
+`ScheduleTimezone::Utc` exists as the escape hatch for schedules that must fire
+every 24 hours exactly.
+
+The ambiguous case compares the two candidate instants directly rather than
+trusting `LocalResult::Ambiguous`'s field order: chrono orders that pair by UTC
+*offset*, not by instant, so its `.earliest()` is the later instant at every
+autumn transition. Verified by probe, not assumed.
+
+The scan is generic over `chrono::TimeZone` and `chrono-tz` is a
+**dev-dependency** so these can be tested against real IANA zones in both
+hemispheres. This machine's own zone has had no DST since 2016, so asserting
+against `Local` would have asserted nothing.
+
+### A schedule cannot carry a destructive target
+
+Every destructive path in the app is gated on the user typing the name of the
+thing being destroyed. Nobody is at the keyboard at 03:00, so a schedule cannot
+supply that confirmation — and a schedule that *could* drop a database would be
+a standing instruction to destroy production on a timer.
+
+Three layers, none of which depends on the UI:
+
+1. `Schedule::validate` rejects `DropAndRecreate` outright.
+2. The store re-validates on both create **and** update, so a safe schedule
+   cannot be edited into a dangerous one.
+3. `Schedule::sync_request` never populates `typed_confirmation`, so even a
+   schedule that somehow reached the table would be refused by the restore
+   layer.
+
+### Due detection, and what happens when the laptop was shut
+
+`due_at` fires for an occurrence strictly newer than `max(last_run_at,
+created_at)`. Creating a nightly 03:00 backup at 09:00 must not immediately run
+last night's, and the high-water mark then stops one occurrence firing twice.
+
+The mark is stamped with the **occurrence**, not with "now". A run that starts
+40 seconds late must not leave a mark 40 seconds past its own occurrence, or a
+schedule finer than that lateness would skip its next tick.
+
+Beyond a 90-second grace window an occurrence is only run if `catch_up` is on.
+This is a desktop app: the machine sleeping through 03:00 is the common case,
+not the exception. But catch-up makes up **one** run however many were missed —
+a week away with an hourly schedule produces one backup, not 168 — and it is
+off by default, because starting a production backup at 09:00 is not what "at
+3am" meant.
+
+Manual "Run now" deliberately does not move the mark at all. Testing a schedule
+at 14:00 must not cancel the occurrence it was created for.
+
+### A schedule that outlives what it points at fails loudly
+
+`sync_plan_id` cascades: a schedule whose plan is gone can never run, and
+leaving it to fail nightly would be noise.
+
+`dest_profile_id` is deliberately **not** a foreign key. `ON DELETE SET NULL`
+would silently downgrade a cross-server sync to a local-backup-only job, and
+nobody would find out until they needed the replica; `ON DELETE CASCADE` would
+delete the schedule outright. Instead the run fails with a message naming the
+schedule and stating that nothing was backed up or restored, and notifies.
+
+The same principle covers a corrupt `cron_expression` in the store: it is
+reported as corruption rather than treated as "never run".
+
+### One run at a time, per schedule
+
+A backup slower than its own interval must not start a second copy of itself:
+two `mysqldump`s against the same source writing into the same directory is how
+a backup set gets corrupted. The scheduler claims a schedule id before spawning
+and releases it when the run finishes; a second request is refused rather than
+queued, because running it later would be worse than not running it.
+
+### Webhooks carry no connection details
+
+A webhook body leaves the machine for a URL the user has merely pasted. The
+payload carries profile *names*, an outcome, a duration and a verification
+summary — never a host, port, username, password or key path.
+
+The artifact appears as its **file name only**. The full path would carry the
+user's home directory, and with it their account name, to a third-party
+endpoint. A test asserts the serialised payload contains neither.
+
+Redirects are not followed: a 302 is enough for a compromised or merely
+misconfigured endpoint to forward a description of the user's infrastructure to
+a host they never agreed to send anything to.
+
+Delivery is one attempt with a 10-second timeout, and a failure never fails the
+run. The backup either happened or it did not, and that is already recorded;
+losing the courtesy copy must not turn a good backup into a bad one. Whether it
+landed is written into the job log, before the log is snapshotted.
+
+### Notification defaults to failures only
+
+A nightly backup that worked is not news. A failed one is the only thing the
+user needs to see, and burying it under thirty successes is how it gets missed.
+
+The engine builds the title and body; the desktop layer shows them. Showing a
+native notification needs Tauri, and the engine has to stay usable from
+`dbsync`.
+
+### Closing the window must not stop the backups
+
+With a tray icon, closing the window hides it and schedules keep running; the
+tray's Quit item is labelled "Quit (stops schedules)" so the difference is
+visible. Without it, "close the window" and "cancel every backup" would be the
+same gesture.
+
+A window that vanishes with no explanation reads as a crash, so the first time
+it happens the app says once that it is still running. Once, not every time.
+
+The two flags the window-close handler reads are mirrored into atomics on
+`AppState`. That handler runs on the main thread, and reading them from SQLite
+there would block the UI behind a connection pool a running backup may be
+holding. Closing a window must never be able to hang behind a dump.
+
+### The scheduler's shutdown token is a parameter, not a field
+
+A cancelled `CancellationToken` stays cancelled. The desktop app stops and
+starts the loop as the user toggles the scheduler, so it needs a fresh token
+each time — a stale one would produce a loop that exits on its first poll and a
+setting that appears to do nothing. A test asserts a restarted loop keeps
+running.
+
+### `:memory:` opens one connection, not five
+
+Every connection to `:memory:` gets its own separate database, so a
+multi-connection pool runs migrations on one connection and then serves queries
+from empty ones. It surfaces as "no such table" a long way from the cause — as
+it did, in a scheduler test. `Store::open` now pins an in-memory store to a
+single connection so it behaves the way anyone writing one would expect.
+
+### The CLI can run schedules but not create them
+
+`dbsync schedule list/show/run/tick/crontab` and `dbsync daemon` cover running
+schedules headlessly, under systemd, or from system cron. Creating one is done
+in the app: the option surface is large, and a second construction path would be
+a second place for the destructive-target check to be forgotten.
+
+`schedule crontab` prints the line *and* the three things that actually go
+wrong when people move a schedule into system cron — cron's bare `PATH`, the
+keychain needing an unlocked login session, and the app's own scheduler running
+the same schedule concurrently. A UTC schedule additionally warns that cron
+reads the expression in local time.
+
+Paths in that line are shell-quoted. `/Applications/DBSync Studio.app/…` is the
+normal macOS case, and an unquoted crontab line there silently runs the wrong
+command.

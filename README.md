@@ -17,6 +17,7 @@ desktop app for DBAs, plus a headless CLI that does exactly the same things.
 - [Architecture](#architecture)
 - [How a backup job flows through the system](#how-a-backup-job-flows-through-the-system)
 - [Development setup](#development-setup)
+- [Scheduling](#scheduling)
 - [Testing](#testing)
 - [Security model](#security-model)
 - [Roadmap](#roadmap)
@@ -69,6 +70,9 @@ Reasoning for the non-obvious choices is in [DECISIONS.md](DECISIONS.md).
                  │ backup   restore      │
                  │ verify   retention    │
                  │ manifest definer      │
+                 │ plan     settings     │
+                 │ cron  schedule        │
+                 │ scheduler  notify     │
                  └───────────────────────┘
 ```
 
@@ -171,6 +175,104 @@ changing any `#[tauri::command]`:
 cargo test -p db-sync-desktop --lib export_typescript_bindings
 ```
 
+## Scheduling
+
+A **schedule** binds a saved sync plan to a cron expression. The plan already
+carries the source, the database and the table selection, so a schedule only
+adds *when*, *where to*, and *who to tell*.
+
+```
+Sync plan  ──▶  Schedule  ──▶  backup [→ restore → verify] → retention → notify
+ (what)          (when)              the same code path the buttons run
+```
+
+Expressions are standard five-field cron, plus `@hourly`, `@daily`, `@weekly`,
+`@monthly` and `@yearly`. The form previews the next five real timestamps as
+you type — the only reliable way to catch a mistyped expression before it backs
+up at the wrong time for a month.
+
+Two cron behaviours are worth knowing, both matching `cron(8)`:
+
+- If **neither** the day-of-month nor the day-of-week field is `*`, they combine
+  with **OR**. `0 0 13 * 5` means "the 13th, and also every Friday" — not
+  "Friday the 13th".
+- Six-field (Quartz-style) expressions are **rejected**, not reinterpreted.
+  `0 0 2 * * *` read as five fields would mean midnight on the 2nd.
+
+**Daylight saving.** A local-time schedule follows the wall clock, so a time
+inside the spring-forward hour does not exist and does not run that day, and a
+time in the autumn repeat runs once. Pick **UTC** for anything that must fire
+every 24 hours exactly.
+
+**Missed runs.** Off by default, a schedule does not make up an occurrence it
+slept through — opening a laptop at 09:00 should not start a production backup
+meant for 03:00. Turn on *catch up* and it makes up **one** run, however many
+were missed.
+
+**Unattended means no confirmation is possible.** A schedule cannot use a
+destructive restore target; it always creates a fresh timestamped database.
+This is enforced in the engine, on create and on update, and the request a
+schedule builds never carries a confirmation at all.
+
+### Keeping it running
+
+Closing the window leaves the app in the tray and schedules keep firing; the
+tray's **Quit** stops them, and says so. Settings has toggles for the in-app
+scheduler, close-to-tray, and launch at login.
+
+### Or drive it from cron
+
+Every schedule offers a `crontab` line, and `dbsync` runs the identical code
+path the app does:
+
+```bash
+dbsync schedule list                # what exists, and when it next runs
+dbsync schedule show nightly        # id or a unique name prefix
+dbsync schedule run nightly         # once, now; non-zero exit if it failed
+dbsync schedule tick                # run whatever is due, then exit
+dbsync schedule crontab nightly     # a line for system cron, plus the caveats
+dbsync daemon                       # the scheduler loop, headless
+```
+
+Pause the schedule in the app first, or both will run it. Cron reads the
+expression in **local time** regardless of the schedule's setting, runs with a
+bare `PATH`, and can only reach the keychain while your login session is
+unlocked — `schedule crontab` prints all of this alongside the line.
+
+Schedules are created in the app, not the CLI: the option surface is large, and
+a second construction path would be a second place for the destructive-target
+check to be forgotten.
+
+### Notifications and webhooks
+
+Native notification on failure by default; every run or never are the other
+options. A webhook URL receives a JSON POST per run:
+
+```json
+{
+  "event": "dbsync.run.finished",
+  "schedule_name": "nightly staging refresh",
+  "outcome": "success",
+  "kind": "sync",
+  "scheduled_for": "2026-07-27T02:30:00Z",
+  "duration_seconds": 42.0,
+  "source_profile": "prod-mysql",
+  "dest_profile": "staging-mysql",
+  "database": "app",
+  "target_database": "app_staging_20260727_023004",
+  "artifact_name": "app_20260727_023000.sql.gz",
+  "artifact_bytes": 1048576,
+  "verification": { "passed": true, "tables_checked": 12, "failures": 0, "skipped": 0 },
+  "removed_artifacts": 1,
+  "error": null
+}
+```
+
+Profiles appear **by name only**. No host, port, username, password, key path
+or directory ever leaves the machine — the artifact is named, not located.
+Redirects are not followed, delivery is a single 10-second attempt, and a
+failed webhook is logged against the job but never fails the run.
+
 ## Testing
 
 ```bash
@@ -219,6 +321,17 @@ credential related:
 cargo test -p db-sync-engine --test keychain -- --ignored
 ```
 
+Scheduler behaviour that needs no database server — a schedule whose
+destination profile was deleted, a plan that cannot run, the one-run-at-a-time
+guard, notification policy — runs in the normal suite:
+
+```bash
+cargo test -p db-sync-engine --test scheduler --test schedules
+```
+
+The scheduled path is also exercised against real containers, in `roundtrip`:
+a schedule that comes due, moves data, verifies it, and enforces retention.
+
 ## Security model
 
 - **Secrets never cross the IPC boundary.** The webview can store a secret and
@@ -241,8 +354,9 @@ cargo test -p db-sync-engine --test keychain -- --ignored
 | **M1′** | SSH tunnels (russh) with jump hosts and host-key pinning, table introspection, test-connection | **Done** |
 | **M2′** | MySQL backup and restore end to end, cancellation, backup library, verification | **Done** |
 | **M3′** | PostgreSQL backup and restore, formats, parallel and selective restore | **Done** |
-| **M4′** | Sync wizard, retention enforcement | **Done** |
-| **M4′** | Scheduler, notifications and webhooks, packaging | Next |
+| **M4′** | Sync wizard, sync plans, retention enforcement | **Done** |
+| **M4′** | Scheduler, tray mode, launch at login, notifications and webhooks | **Done** |
+| **M5′** | Packaging: bundle config, code signing, notarization, auto-update | Next |
 
 Not in scope for v1: data masking, incremental/binlog/WAL sync, cloud upload,
 multi-user access control. Trait seams are left where they would attach.
@@ -261,8 +375,8 @@ for MySQL.
 ```
 
 It reads `.env` and `table.conf` from the repository root; both are git-ignored.
-Its table list is a good starting point for a sync plan once the GUI can import
-one.
+Its 215-entry table list imports directly into a sync plan — Sync → *Import
+tables.conf* — so nothing has to be retyped.
 
 ## Licence
 

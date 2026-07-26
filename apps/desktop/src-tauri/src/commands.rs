@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 use db_sync_engine::backup::{BackupRequest, TableSelection};
 use db_sync_engine::connect::{self, ConnectionReport};
+use db_sync_engine::cron::{CronExpression, ScheduleTimezone};
 use db_sync_engine::db::{DatabaseInfo, TableInfo};
 use db_sync_engine::events::{JobKind, JobPhase};
 use db_sync_engine::job::JobRecord;
@@ -22,11 +23,14 @@ use db_sync_engine::ops::{self, SyncRequest};
 use db_sync_engine::plan::{self, SyncPlan, SyncPlanCreate};
 use db_sync_engine::profile::{ConnectionProfile, ProfileCreate, ProfileUpdate};
 use db_sync_engine::restore::RestoreRequest;
+use db_sync_engine::schedule::{Schedule, ScheduleCreate, ScheduleUpdate};
 use db_sync_engine::secrets::{self, SecretKind};
+use db_sync_engine::settings::{self, AppSettings};
 use db_sync_engine::store::StoreError;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri::State;
+use tauri_plugin_autostart::ManagerExt;
 use uuid::Uuid;
 
 use crate::AppState;
@@ -56,8 +60,11 @@ impl From<StoreError> for CommandError {
     fn from(e: StoreError) -> Self {
         let kind = match &e {
             StoreError::DuplicateName(_) => "duplicate_name",
-            StoreError::ProfileNotFound(_) | StoreError::SyncPlanNotFound(_) => "not_found",
+            StoreError::ProfileNotFound(_)
+            | StoreError::SyncPlanNotFound(_)
+            | StoreError::ScheduleNotFound(_) => "not_found",
             StoreError::Corrupt { .. } => "corrupt",
+            StoreError::InvalidSchedule(_) => "invalid",
             StoreError::Sqlx(_) | StoreError::Migrate(_) => "storage",
         };
         Self::new(kind, e.to_string())
@@ -672,4 +679,293 @@ pub async fn start_sync(
     });
 
     Ok(job_id)
+}
+
+// ── Schedules ───────────────────────────────────────────────────────────
+
+/// A schedule plus the things the list view needs but the record does not hold:
+/// when it next runs, and what the cron expression means in English.
+///
+/// Computed here rather than in TypeScript so there is exactly one cron
+/// implementation. A second one in the frontend would eventually disagree with
+/// the scheduler, and the UI would confidently show a time nothing happens at.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct ScheduleView {
+    pub schedule: Schedule,
+    pub description: String,
+    pub next_run_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// True while a run started by this schedule is still going.
+    pub running: bool,
+}
+
+impl From<db_sync_engine::schedule::ScheduleError> for CommandError {
+    fn from(e: db_sync_engine::schedule::ScheduleError) -> Self {
+        use db_sync_engine::schedule::ScheduleError as E;
+        let kind = match &e {
+            E::DestructiveTarget(_) => "destructive_schedule",
+            E::BadWebhook(..) => "bad_webhook",
+            E::NameRequired | E::RestoreMismatch | E::EngineMismatch { .. } => "invalid",
+        };
+        Self::new(kind, e.to_string())
+    }
+}
+
+async fn view(state: &AppState, schedule: Schedule) -> ScheduleView {
+    let running = state.scheduler.in_flight_ids().await.contains(&schedule.id);
+    let now = chrono::Utc::now();
+    ScheduleView {
+        description: schedule.cron.describe(),
+        next_run_at: schedule.next_run_at(now),
+        running,
+        schedule,
+    }
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_schedules(state: State<'_, AppState>) -> CmdResult<Vec<ScheduleView>> {
+    let schedules = state.store.list_schedules().await?;
+    let mut out = Vec::with_capacity(schedules.len());
+    for s in schedules {
+        out.push(view(&state, s).await);
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn get_schedule(state: State<'_, AppState>, id: Uuid) -> CmdResult<Option<ScheduleView>> {
+    match state.store.get_schedule(id).await? {
+        Some(s) => Ok(Some(view(&state, s).await)),
+        None => Ok(None),
+    }
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn create_schedule(
+    state: State<'_, AppState>,
+    input: ScheduleCreate,
+) -> CmdResult<ScheduleView> {
+    // Checked here as well as in the store so the message names the field the
+    // form should highlight, rather than arriving as a generic storage error.
+    input.validate()?;
+    let created = state.store.create_schedule(input).await?;
+    Ok(view(&state, created).await)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn update_schedule(
+    state: State<'_, AppState>,
+    id: Uuid,
+    patch: ScheduleUpdate,
+) -> CmdResult<ScheduleView> {
+    let updated = state.store.update_schedule(id, patch).await?;
+    Ok(view(&state, updated).await)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_schedule(state: State<'_, AppState>, id: Uuid) -> CmdResult<bool> {
+    Ok(state.store.delete_schedule(id).await?)
+}
+
+/// Run a schedule immediately, returning its job id.
+///
+/// Deliberately does not move the schedule's high-water mark: testing a
+/// schedule now must not cancel the occurrence it was created for.
+#[tauri::command]
+#[specta::specta]
+pub async fn run_schedule_now(state: State<'_, AppState>, id: Uuid) -> CmdResult<Uuid> {
+    match state.scheduler.run_now(id).await? {
+        Some(job_id) => Ok(job_id),
+        None => Err(CommandError::new(
+            "already_running",
+            "that schedule is already running",
+        )),
+    }
+}
+
+/// What a cron expression means, and the next few times it fires.
+///
+/// This is what the schedule form shows as the user types. Seeing the next five
+/// real timestamps is the only reliable way to catch a mistyped expression
+/// before it silently backs up at the wrong time for a month.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct CronPreview {
+    pub description: String,
+    pub next_runs: Vec<chrono::DateTime<chrono::Utc>>,
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn preview_cron(
+    expression: String,
+    timezone: ScheduleTimezone,
+) -> CmdResult<CronPreview> {
+    let parsed: CronExpression =
+        expression
+            .parse()
+            .map_err(|e: db_sync_engine::cron::CronError| {
+                CommandError::new("invalid_cron", e.to_string())
+            })?;
+
+    let mut next_runs = Vec::new();
+    let mut cursor = chrono::Utc::now();
+    for _ in 0..5 {
+        match parsed.next_after(timezone, cursor) {
+            Some(t) => {
+                next_runs.push(t);
+                cursor = t;
+            }
+            // An expression that resolves a few times and then stops is
+            // possible (`0 0 29 2 *` runs out of the scan window); showing
+            // what there is beats showing nothing.
+            None => break,
+        }
+    }
+
+    Ok(CronPreview {
+        description: parsed.describe(),
+        next_runs,
+    })
+}
+
+/// The `dbsync` invocation that runs this schedule from system cron.
+///
+/// Offered because plenty of DBAs would rather their backups were driven by the
+/// same cron that runs everything else on the box than by a desktop app that
+/// has to stay open.
+#[tauri::command]
+#[specta::specta]
+pub async fn crontab_line(state: State<'_, AppState>, id: Uuid) -> CmdResult<String> {
+    let schedule = state.store.require_schedule(id).await?;
+
+    // The GUI binary is not the CLI. Naming `dbsync` plainly and letting the
+    // user place it on PATH is honest; printing this executable's own path
+    // would produce a line that silently does nothing.
+    Ok(format!(
+        "{} dbsync --store {} schedule run {} >> {} 2>&1",
+        schedule.cron.as_str(),
+        shell_quote(&state.store_path.display().to_string()),
+        schedule.id,
+        shell_quote(
+            &schedule
+                .action
+                .output_dir
+                .join("dbsync-cron.log")
+                .display()
+                .to_string()
+        ),
+    ))
+}
+
+/// Quote a path for a crontab line, which `/bin/sh` interprets.
+fn shell_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-:".contains(c))
+    {
+        return s.to_string();
+    }
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SchedulerStatus {
+    /// Whether the in-app scheduler loop is running right now.
+    pub running: bool,
+    pub in_flight: Vec<Uuid>,
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn scheduler_status(state: State<'_, AppState>) -> CmdResult<SchedulerStatus> {
+    Ok(SchedulerStatus {
+        running: state.scheduler_running(),
+        in_flight: state.scheduler.in_flight_ids().await,
+    })
+}
+
+// ── Application settings ────────────────────────────────────────────────
+
+#[tauri::command]
+#[specta::specta]
+pub async fn get_app_settings(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> CmdResult<AppSettings> {
+    let mut stored = state.store.app_settings().await?;
+    // The OS owns this one: the user can remove the login item outside the app,
+    // and reporting our stale copy would show a toggle that lies.
+    stored.launch_at_login = app.autolaunch().is_enabled().unwrap_or(false);
+    Ok(stored)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn set_app_settings(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    next: AppSettings,
+) -> CmdResult<AppSettings> {
+    state
+        .store
+        .set_flag(settings::SCHEDULER_ENABLED, next.scheduler_enabled)
+        .await?;
+    state
+        .store
+        .set_flag(settings::CLOSE_TO_TRAY, next.close_to_tray)
+        .await?;
+    // Keep the copy the window-close handler reads in step with the stored one.
+    state
+        .close_to_tray
+        .store(next.close_to_tray, std::sync::atomic::Ordering::SeqCst);
+
+    // Applied immediately rather than at next launch: a user who turns the
+    // scheduler on expects tonight's backup to run, not tomorrow's.
+    if next.scheduler_enabled {
+        if !state.scheduler_running() {
+            state.start_scheduler();
+        }
+    } else {
+        state.stop_scheduler();
+    }
+
+    let autolaunch = app.autolaunch();
+    let result = if next.launch_at_login {
+        autolaunch.enable()
+    } else {
+        autolaunch.disable()
+    };
+    if let Err(e) = result {
+        return Err(CommandError::new(
+            "autostart",
+            format!("could not change the launch-at-login setting: {e}"),
+        ));
+    }
+
+    get_app_settings(app, state).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_store_path_with_spaces_is_quoted_for_cron() {
+        // "~/Library/Application Support/..." is the normal macOS path, and an
+        // unquoted crontab line there runs with the wrong arguments.
+        assert_eq!(
+            shell_quote("/Users/a/Library/Application Support/DBSync/store.db"),
+            "'/Users/a/Library/Application Support/DBSync/store.db'"
+        );
+        assert_eq!(shell_quote("/opt/dbsync/store.db"), "/opt/dbsync/store.db");
+    }
+
+    #[test]
+    fn an_embedded_quote_cannot_break_out_of_the_crontab_line() {
+        assert_eq!(shell_quote("/tmp/it's here"), r"'/tmp/it'\''s here'");
+    }
 }

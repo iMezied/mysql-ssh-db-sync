@@ -13,10 +13,17 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 db-sync-engine = { path = "../../../engine" }
-tauri = { version = "2", features = ["specta"] }
+# `tray-icon` is what lets the app keep running — and keep firing schedules —
+# after its window is closed. Without it, closing the window would silently
+# stop every backup the user configured.
+tauri = { version = "2", features = ["specta", "tray-icon"] }
+tauri-plugin-notification = "2"
+tauri-plugin-autostart = "2"
+async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 anyhow.workspace = true
 uuid.workspace = true
 chrono.workspace = true

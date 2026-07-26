@@ -130,7 +130,7 @@ pub struct ProfileUpdate {
 /// arrive as `None`. Running the inner `Option<T>` through and wrapping the
 /// result in `Some` preserves the distinction: this function only runs when the
 /// key is present, so absence still falls through to `Default`.
-fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+pub(crate) fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     T: Deserialize<'de>,
     D: serde::Deserializer<'de>,

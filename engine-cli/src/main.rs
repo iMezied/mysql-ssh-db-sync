@@ -5,13 +5,17 @@
 //! log collector; human-readable output goes to stderr.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use db_sync_engine::ENGINE_VERSION;
-use db_sync_engine::events::ProgressEvent;
-use db_sync_engine::job::JobContext;
+use db_sync_engine::events::{EVENT_CHANNEL_CAPACITY, ProgressEvent, create_event_channel};
+use db_sync_engine::job::{JobOutcome, JobRegistry};
+use db_sync_engine::schedule::Schedule;
+use db_sync_engine::scheduler::Scheduler;
 use db_sync_engine::store::Store;
+use uuid::Uuid;
 
 #[derive(Parser)]
 #[command(
@@ -50,6 +54,47 @@ enum Command {
     /// with "you need SUPER privilege". Unlike a `sed` one-liner, this is
     /// quote-aware and leaves the text alone inside string literals.
     StripDefiners,
+    /// Inspect and run scheduled jobs.
+    #[command(subcommand)]
+    Schedule(ScheduleCommand),
+    /// Run the scheduler in the foreground until interrupted.
+    ///
+    /// The desktop app runs this same loop internally; use this to run
+    /// schedules on a server, under systemd or in a container, with no GUI.
+    Daemon {
+        /// Seconds between due checks. Cron's resolution is one minute, so
+        /// there is nothing to gain below about 30.
+        #[arg(long, default_value_t = 30)]
+        interval: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum ScheduleCommand {
+    /// List configured schedules and when they next run.
+    List,
+    /// Show one schedule in full.
+    Show {
+        /// Schedule id, or a unique prefix of its name.
+        schedule: String,
+    },
+    /// Run a schedule once, right now, and wait for it to finish.
+    ///
+    /// Exits non-zero if the run failed, so `cron` and CI report it.
+    Run {
+        /// Schedule id, or a unique prefix of its name.
+        schedule: String,
+    },
+    /// Run any schedules that are currently due, then exit.
+    ///
+    /// The building block for driving schedules from an external timer instead
+    /// of leaving the app or the daemon running.
+    Tick,
+    /// Print a crontab line that runs a schedule from system cron.
+    Crontab {
+        /// Schedule id, or a unique prefix of its name.
+        schedule: String,
+    },
 }
 
 fn emit_json(event: &ProgressEvent) {
@@ -148,18 +193,333 @@ async fn main() -> Result<()> {
             }
             store.close().await;
         }
+        Command::Schedule(cmd) => {
+            let store = Store::open(&store_path).await?;
+            let result = run_schedule_command(cmd, &store, cli.json).await;
+            store.close().await;
+            result?;
+        }
+        Command::Daemon { interval } => {
+            let store = Store::open(&store_path).await?;
+            let (event_tx, _rx) = create_event_channel(EVENT_CHANNEL_CAPACITY);
+
+            let scheduler = Scheduler::new(store.clone(), JobRegistry::new(), event_tx.clone())
+                .with_tick(Duration::from_secs(interval.max(1)));
+            let shutdown = tokio_util::sync::CancellationToken::new();
+
+            if cli.json {
+                tokio::spawn(stream_channel_as_json(event_tx.subscribe()));
+            }
+
+            // Without this, Ctrl-C and `systemctl stop` kill the process
+            // mid-dump and leave a half-written artifact behind.
+            let signal_token = shutdown.clone();
+            tokio::spawn(async move {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    eprintln!("shutting down; in-flight jobs are being left to finish");
+                    signal_token.cancel();
+                }
+            });
+
+            eprintln!("dbsync daemon running; {interval}s between checks. Ctrl-C to stop.");
+            scheduler.run(shutdown).await;
+            store.close().await;
+        }
     }
 
     Ok(())
 }
 
-/// Bridge a job's live events onto stdout as JSON-lines.
+// ── Schedules ───────────────────────────────────────────────────────────
+
+/// Find a schedule by id or by a unique prefix of its name.
 ///
-/// Broadcast receivers can lag; lagging must skip the missed messages and keep
-/// going, never terminate the bridge. The durable record is the job log.
-#[allow(dead_code)]
-async fn stream_events_as_json(ctx: &JobContext) {
-    let mut rx = ctx.subscribe();
+/// Requiring a full UUID on the command line would make every one of these
+/// commands a copy-and-paste exercise; ambiguity is reported rather than
+/// guessed at, because the wrong guess here runs the wrong backup.
+async fn resolve_schedule(store: &Store, needle: &str) -> Result<Schedule> {
+    if let Ok(id) = Uuid::parse_str(needle) {
+        return Ok(store.require_schedule(id).await?);
+    }
+
+    let all = store.list_schedules().await?;
+    let lowered = needle.to_lowercase();
+    let matches: Vec<&Schedule> = all
+        .iter()
+        .filter(|s| s.name.to_lowercase().starts_with(&lowered))
+        .collect();
+
+    match matches.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => bail!("no schedule matches {needle:?}; `dbsync schedule list` shows them all"),
+        many => {
+            let names: Vec<&str> = many.iter().map(|s| s.name.as_str()).collect();
+            bail!("{needle:?} matches several schedules: {}", names.join(", "))
+        }
+    }
+}
+
+async fn run_schedule_command(cmd: ScheduleCommand, store: &Store, json: bool) -> Result<()> {
+    match cmd {
+        ScheduleCommand::List => {
+            let schedules = store.list_schedules().await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&schedules)?);
+                return Ok(());
+            }
+            if schedules.is_empty() {
+                eprintln!("no schedules configured");
+                return Ok(());
+            }
+
+            let now = chrono::Utc::now();
+            for s in &schedules {
+                let next = match s.next_run_at(now) {
+                    Some(t) => t
+                        .with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d %H:%M")
+                        .to_string(),
+                    None => "—".into(),
+                };
+                let last =
+                    s.last_outcome
+                        .map(|o| o.as_str())
+                        .unwrap_or(if s.last_run_at.is_some() {
+                            "running"
+                        } else {
+                            "never run"
+                        });
+
+                println!(
+                    "{}  {:<24} {:<16} {:<7} next {:<17} last {}",
+                    s.id,
+                    truncate(&s.name, 24),
+                    s.cron.as_str(),
+                    if s.enabled { "on" } else { "off" },
+                    next,
+                    last
+                );
+            }
+        }
+
+        ScheduleCommand::Show { schedule } => {
+            let s = resolve_schedule(store, &schedule).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&s)?);
+                return Ok(());
+            }
+
+            let now = chrono::Utc::now();
+            println!("{}", s.name);
+            println!("  id           {}", s.id);
+            println!(
+                "  when         {} ({}, {})",
+                s.cron.as_str(),
+                s.cron.describe(),
+                s.timezone.as_str()
+            );
+            println!("  enabled      {}", s.enabled);
+            println!("  catch up     {}", s.catch_up);
+            println!(
+                "  next run     {}",
+                s.next_run_at(now)
+                    .map(|t| t.with_timezone(&chrono::Local).to_rfc3339())
+                    .unwrap_or_else(|| "—".into())
+            );
+            println!(
+                "  last run     {}",
+                s.last_run_at
+                    .map(|t| t.with_timezone(&chrono::Local).to_rfc3339())
+                    .unwrap_or_else(|| "never".into())
+            );
+            println!(
+                "  last outcome {}",
+                s.last_outcome.map(|o| o.as_str()).unwrap_or("—")
+            );
+            println!(
+                "  kind         {}",
+                if s.is_sync() { "sync" } else { "backup" }
+            );
+            println!("  output       {}", s.action.output_dir.display());
+            println!("  verify       {}", s.action.verify);
+            println!("  notify       {}", s.notify.as_str());
+            println!("  webhook      {}", s.webhook_url.as_deref().unwrap_or("—"));
+            if let Some(r) = &s.action.restore {
+                println!("  restore as   {:?}", r.naming);
+            }
+            if let Some(r) = &s.action.retention {
+                println!(
+                    "  retention    keep_last={:?} max_age_days={:?}",
+                    r.keep_last, r.max_age_days
+                );
+            }
+        }
+
+        ScheduleCommand::Run { schedule } => {
+            let s = resolve_schedule(store, &schedule).await?;
+            eprintln!("running {:?}", s.name);
+
+            let outcome = run_and_wait(store, s.id, json, None).await?;
+            report_outcome(outcome)?;
+        }
+
+        ScheduleCommand::Tick => {
+            let (event_tx, rx) = create_event_channel(EVENT_CHANNEL_CAPACITY);
+            let scheduler = Scheduler::new(store.clone(), JobRegistry::new(), event_tx);
+
+            if json {
+                tokio::spawn(stream_channel_as_json(rx));
+            }
+
+            scheduler.tick_once(chrono::Utc::now()).await;
+
+            let started = scheduler.in_flight_ids().await.len();
+            if started == 0 {
+                eprintln!("nothing is due");
+                return Ok(());
+            }
+            eprintln!("{started} schedule(s) started");
+
+            wait_for_idle(&scheduler).await;
+        }
+
+        ScheduleCommand::Crontab { schedule } => {
+            let s = resolve_schedule(store, &schedule).await?;
+            print_crontab_line(&s)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Start one schedule and block until it finishes, returning its outcome.
+async fn run_and_wait(
+    store: &Store,
+    schedule_id: Uuid,
+    json: bool,
+    tick: Option<Duration>,
+) -> Result<Option<JobOutcome>> {
+    let (event_tx, rx) = create_event_channel(EVENT_CHANNEL_CAPACITY);
+    let mut scheduler = Scheduler::new(store.clone(), JobRegistry::new(), event_tx);
+    if let Some(t) = tick {
+        scheduler = scheduler.with_tick(t);
+    }
+
+    if json {
+        tokio::spawn(stream_channel_as_json(rx));
+    } else {
+        tokio::spawn(stream_channel_as_text(rx));
+    }
+
+    let Some(_job_id) = scheduler.run_now(schedule_id).await? else {
+        bail!("that schedule is already running");
+    };
+
+    wait_for_idle(&scheduler).await;
+
+    Ok(store
+        .get_schedule(schedule_id)
+        .await?
+        .and_then(|s| s.last_outcome))
+}
+
+async fn wait_for_idle(scheduler: &Scheduler) {
+    // Polling rather than a completion channel: a run can take hours, and a
+    // half-second poll costs nothing against that.
+    while !scheduler.in_flight_ids().await.is_empty() {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Turn a run outcome into a process exit status.
+///
+/// Cron mails the output of a failing job and CI turns a red build red; both
+/// depend on the exit code, so a failed backup must never exit zero.
+fn report_outcome(outcome: Option<JobOutcome>) -> Result<()> {
+    match outcome {
+        Some(JobOutcome::Success) => {
+            eprintln!("done");
+            Ok(())
+        }
+        Some(JobOutcome::Cancelled) => bail!("the run was cancelled"),
+        Some(JobOutcome::Failed) => {
+            bail!("the run failed; `dbsync jobs` and the job log have the detail")
+        }
+        None => bail!("the run finished without recording an outcome"),
+    }
+}
+
+/// Print a crontab line, plus the things that actually go wrong when people
+/// move a schedule into system cron.
+fn print_crontab_line(schedule: &Schedule) -> Result<()> {
+    let exe = std::env::current_exe()
+        .context("could not determine this executable's path")?
+        .display()
+        .to_string();
+
+    // `@daily` and friends are valid in a crontab, so the expression can be
+    // emitted exactly as the user wrote it.
+    println!("# {} — {}", schedule.name, schedule.cron.describe());
+    println!(
+        "{} {} schedule run {} >> {} 2>&1",
+        schedule.cron.as_str(),
+        shell_quote(&exe),
+        schedule.id,
+        shell_quote(&log_path_hint(schedule))
+    );
+    println!();
+
+    eprintln!("Before using this line:");
+    eprintln!();
+    eprintln!(
+        "  * cron runs with a bare PATH. mysqldump/pg_dump are found via PATH, so either set"
+    );
+    eprintln!("    PATH= at the top of your crontab or set a tool override on the profile.");
+    eprintln!("  * passwords live in the OS keychain, which a cron job can only read while the");
+    eprintln!("    keychain is unlocked. On macOS that means an active login session; a headless");
+    eprintln!("    server should use the daemon under your own user instead.");
+    if schedule.timezone == db_sync_engine::cron::ScheduleTimezone::Utc {
+        eprintln!(
+            "  * this schedule is set to UTC, but cron reads its expression in local time. The"
+        );
+        eprintln!("    line above will fire at a different moment than the app would.");
+    }
+    eprintln!(
+        "  * the app's own scheduler will also run this schedule if the app is open. Disable"
+    );
+    eprintln!("    it in the app to avoid two copies running at once.");
+
+    Ok(())
+}
+
+fn log_path_hint(schedule: &Schedule) -> String {
+    schedule
+        .action
+        .output_dir
+        .join("dbsync-cron.log")
+        .display()
+        .to_string()
+}
+
+/// Quote a path for a crontab line, which is interpreted by `/bin/sh`.
+fn shell_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-:".contains(c))
+    {
+        return s.to_string();
+    }
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    s.chars().take(max.saturating_sub(1)).chain(['…']).collect()
+}
+
+async fn stream_channel_as_json(mut rx: db_sync_engine::events::EventReceiver) {
     loop {
         match rx.recv().await {
             Ok(event) => emit_json(&event),
@@ -168,5 +528,58 @@ async fn stream_events_as_json(ctx: &JobContext) {
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
+    }
+}
+
+async fn stream_channel_as_text(mut rx: db_sync_engine::events::EventReceiver) {
+    loop {
+        match rx.recv().await {
+            Ok(event) => eprintln!("{}", event.to_log_line()),
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                eprintln!("warning: dropped {skipped} progress events (consumer too slow)");
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_plain_path_is_left_unquoted() {
+        assert_eq!(
+            shell_quote("/usr/local/bin/dbsync"),
+            "/usr/local/bin/dbsync"
+        );
+    }
+
+    #[test]
+    fn a_path_with_spaces_is_quoted() {
+        // "/Applications/DBSync Studio.app/..." is the normal macOS case, and
+        // an unquoted crontab line there silently runs the wrong command.
+        assert_eq!(
+            shell_quote("/Applications/DBSync Studio.app/dbsync"),
+            "'/Applications/DBSync Studio.app/dbsync'"
+        );
+    }
+
+    #[test]
+    fn an_embedded_quote_cannot_break_out() {
+        assert_eq!(shell_quote("/tmp/it's here"), r"'/tmp/it'\''s here'");
+    }
+
+    #[test]
+    fn an_empty_string_is_still_quoted() {
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn long_names_are_shortened_for_the_table() {
+        assert_eq!(truncate("short", 24), "short");
+        let long = truncate("a name far longer than the column allows", 10);
+        assert_eq!(long.chars().count(), 10);
+        assert!(long.ends_with('…'));
     }
 }

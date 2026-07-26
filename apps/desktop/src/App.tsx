@@ -1,4 +1,5 @@
-import { Navigate, Route, Routes } from "react-router-dom";
+import { useEffect } from "react";
+import { Navigate, Route, Routes, useNavigate } from "react-router-dom";
 
 import Sidebar from "@/components/Sidebar";
 import ProfilesPage from "@/pages/ProfilesPage";
@@ -6,10 +7,14 @@ import JobsPage from "@/pages/JobsPage";
 import BackupPage from "@/pages/BackupPage";
 import RestorePage from "@/pages/RestorePage";
 import SyncPage from "@/pages/SyncPage";
+import SchedulesPage from "@/pages/SchedulesPage";
 import LibraryPage from "@/pages/LibraryPage";
 import SettingsPage from "@/pages/SettingsPage";
+import { events } from "@/bindings";
 
 export default function App() {
+  useTrayNavigation();
+
   return (
     <div className="flex h-full">
       <Sidebar />
@@ -20,6 +25,7 @@ export default function App() {
           <Route path="/backup" element={<BackupPage />} />
           <Route path="/restore" element={<RestorePage />} />
           <Route path="/sync" element={<SyncPage />} />
+          <Route path="/schedules" element={<SchedulesPage />} />
           <Route path="/library" element={<LibraryPage />} />
           <Route path="/jobs" element={<JobsPage />} />
           <Route path="/settings" element={<SettingsPage />} />
@@ -28,4 +34,23 @@ export default function App() {
       </main>
     </div>
   );
+}
+
+/**
+ * Let the tray menu open a specific page.
+ *
+ * Routed here rather than by changing the window URL: a reload would tear down
+ * any live job progress the user is watching.
+ */
+function useTrayNavigation() {
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    const unlisten = events.navigateTo.listen((event) => {
+      navigate(event.payload);
+    });
+    return () => {
+      void unlisten.then((f) => f());
+    };
+  }, [navigate]);
 }

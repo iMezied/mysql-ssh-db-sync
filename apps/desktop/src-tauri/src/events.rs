@@ -21,3 +21,18 @@ pub struct JobFinished {
     pub job_id: String,
     pub outcome: String,
 }
+
+/// A scheduled run finished, carrying everything the UI needs to show it.
+///
+/// Separate from [`JobFinished`] because a scheduled run has a schedule behind
+/// it: the schedules list has to update its "last outcome" column, which a bare
+/// job id would not tell it.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+pub struct ScheduledRunFinished(pub db_sync_engine::notify::RunReport);
+
+/// The tray asking the open window to show a particular page.
+///
+/// An event rather than a navigation, so a window that is already showing live
+/// job progress does not get reloaded out from under the user.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+pub struct NavigateTo(pub String);

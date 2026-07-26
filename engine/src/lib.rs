@@ -14,6 +14,7 @@
 
 pub mod backup;
 pub mod connect;
+pub mod cron;
 pub mod db;
 pub mod definer;
 pub mod events;
@@ -21,13 +22,17 @@ pub mod exec;
 pub mod job;
 pub mod library;
 pub mod manifest;
+pub mod notify;
 pub mod ops;
 pub mod paths;
 pub mod plan;
 pub mod profile;
 pub mod restore;
 pub mod retention;
+pub mod schedule;
+pub mod scheduler;
 pub mod secrets;
+pub mod settings;
 pub mod ssh;
 pub mod store;
 pub mod tools;

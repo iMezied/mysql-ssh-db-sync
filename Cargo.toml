@@ -41,6 +41,16 @@ async-trait = "0.1"
 sha2 = "0.10"
 flate2 = "1"
 
+# Webhook delivery only. `default-features = false` keeps OpenSSL out of the
+# build: the `rustls` feature verifies certificates against the OS trust store
+# via rustls-platform-verifier, so a corporate webhook endpoint behind an
+# internal CA still works without shipping our own root bundle.
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "json",
+    "charset",
+] }
+
 # Pinned exactly: these are release candidates and rc-to-rc churn breaks builds.
 # specta-typescript is a DIRECT dependency because tauri-specta's `export`
 # takes an `impl LanguageExt`, and the only impls live on specta_typescript types.
