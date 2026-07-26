@@ -1,551 +1,232 @@
-# db-migrate
+# DBSync Studio
 
-> MySQL cross-server backup and restore via SSH tunnels and a local Docker container.
-> Designed for production databases: selective schema-only or schema+data backup per table, with full progress tracking.
+Cross-server database backup, restore and sync for MySQL and PostgreSQL — a
+desktop app for DBAs, plus a headless CLI that does exactly the same things.
 
-```
-┌─────────────────────┐        SSH Tunnel         ┌──────────────────────┐
-│   Source Server A   │ ────────────────────────► │   Your Mac (Docker)  │
-│   (Germany)         │                           │   MySQL 8 Container  │
-└─────────────────────┘                           └──────────┬───────────┘
-                                                             │
-                                                     SSH Tunnel
-                                                             │
-                                                  ┌──────────▼───────────┐
-                                                  │  Destination Server B │
-                                                  │  (Malaysia)           │
-                                                  └──────────────────────┘
-```
+> **Status: M0 (foundation).** The engine, persistence, security model and test
+> harness are in place and tested. Connectivity and the dump/restore pipelines
+> land in the next milestones — see [Roadmap](#roadmap). The original Bash tool
+> in this repo still works and is unchanged; see [Legacy tool](#legacy-tool).
 
 ---
 
-## Table of Contents
+## Contents
 
-- [Overview](#overview)
-- [How It Works](#how-it-works)
-- [Requirements](#requirements)
-- [Project Structure](#project-structure)
-- [Installation](#installation)
-- [Configuration](#configuration)
-  - [Environment Variables (.env)](#environment-variables-env)
-  - [Tables Configuration (tables.conf)](#tables-configuration-tablesconf)
-- [Usage](#usage)
-  - [Full Pipeline](#full-pipeline)
-  - [Backup Only](#backup-only)
-  - [Restore Only](#restore-only)
-  - [Dry Run](#dry-run)
-- [What Gets Backed Up](#what-gets-backed-up)
-- [Output & Progress](#output--progress)
-- [Backup File Naming](#backup-file-naming)
-- [Destination Database Naming](#destination-database-naming)
-- [Security](#security)
-- [Troubleshooting](#troubleshooting)
-- [Git Setup](#git-setup)
+- [Why](#why)
+- [Architecture](#architecture)
+- [How a backup job flows through the system](#how-a-backup-job-flows-through-the-system)
+- [Development setup](#development-setup)
+- [Testing](#testing)
+- [Security model](#security-model)
+- [Roadmap](#roadmap)
+- [Legacy tool](#legacy-tool)
 
 ---
 
-## Overview
+## Why
 
-`db-migrate` is a Bash automation script that connects to two remote MySQL servers via SSH tunnels, backs up a production database with granular table-level control, and restores it to a destination server — all from your local Mac without installing MySQL directly on your machine.
+This project began as `db_migrate.sh`: a Bash script that tunnelled into a
+production MySQL server, dumped all table schemas plus data for a selected
+subset, and restored the result into a freshly named database on a second
+server. It worked, and it had a set of failure modes worth naming, because the
+design here is a direct response to them:
 
-**Key capabilities:**
-
-- Schema-only backup for all tables in the database
-- Schema + data backup for a selected list of tables (defined in a config file)
-- Everything packed into a single compressed `.sql.gz` file
-- Live progress bars, spinners, and size monitors throughout every step
-- Per-step timing with a full summary table at the end
-- Safe for production: uses `--single-transaction`, no table locks on InnoDB
-- Strips `DEFINER` clauses automatically — no `SUPER` privilege required on destination
-- Each restore creates a uniquely named database — source is never touched
-
----
-
-## How It Works
-
-The script runs through up to 8 sequential steps depending on the mode:
-
-| Step | Name | Description |
-|------|------|-------------|
-| **0** | Pre-flight Checks | Validates Docker, SSH keys, disk space, tables config |
-| **1** | SSH Tunnel → Source | Opens an SSH tunnel to Server A on a local port |
-| **2** | Schema Dump | Dumps all table schemas (no data) via `mysqldump --no-data` |
-| **3** | Data Dump | Dumps data for selected tables via `mysqldump --no-create-info` |
-| **4** | Compress | Gzips the combined `.sql` into a single `.sql.gz` file, closes Source tunnel |
-| **5** | SSH Tunnel → Destination | Opens an SSH tunnel to Server B on a separate local port |
-| **6** | Create Database | Creates a new database on Server B with a timestamped name |
-| **7** | Restore | Streams the backup file into the new database via `pv` or plain pipe |
-| **8** | Verification | Queries the restored DB for table count, row stats, and top 5 largest tables |
-
-The two-pass dump strategy (schema first, data second into the same file) allows you to control exactly which tables carry data, while ensuring all 250+ table structures are always present on the destination.
-
----
-
-## Requirements
-
-| Requirement | Notes |
+| Problem in the Bash tool | How this is addressed |
 |---|---|
-| **macOS** | Tested on macOS Ventura / Sonoma |
-| **Docker Desktop** | Must be running with a MySQL 8 container active |
-| **SSH access** | Key-based SSH access to both servers |
-| **bash 3.2+** | Ships with macOS — no upgrade needed |
-| **`pv`** *(optional)* | Enables byte-level progress bar during restore — `brew install pv` |
-| **`bc`** *(optional)* | Used for size formatting — usually pre-installed on macOS |
+| `2>/dev/null` on the dump and restore hid every error; partial dumps looked successful | All child-process stderr is captured into the job log and surfaced |
+| Passwords passed as `-p<pass>` argv, visible in `ps` | Secrets live in the OS keychain and reach children via env or 0600 files |
+| Restore "verified" with `information_schema.TABLE_ROWS`, an estimate that reads 0 for freshly imported InnoDB tables | Exact `COUNT(*)` comparison, with a per-table verdict |
+| `sed 's/DEFINER=[^ ]* //g'` corrupted row data containing that text | Quote-aware streaming filter, proven against a real dump |
+| Tunnels tracked by `pgrep -f`, leaking orphans | Tunnels owned by a handle whose `Drop` closes them |
+| Hardcoded local ports 13306/13307, colliding between runs | Ephemeral port allocation |
+| `StrictHostKeyChecking=no` | Host keys pinned, changes surfaced |
+| Backups never deleted | Retention policy that never deletes the only remaining backup |
+| Required a local Docker MySQL container | Native client binaries discovered on the host |
 
-### Setting Up the Local MySQL 8 Docker Container
+Reasoning for the non-obvious choices is in [DECISIONS.md](DECISIONS.md).
 
-If you don't already have a MySQL 8 container running:
-
-```bash
-docker run \
-  --name mysql8 \
-  -e MYSQL_ROOT_PASSWORD=your_password \
-  -p 3306:3306 \
-  -d mysql:8
-```
-
-Verify it is running:
-
-```bash
-docker ps --filter name=mysql8
-```
-
----
-
-## Project Structure
+## Architecture
 
 ```
-db-migrate/
-├── db_migrate.sh               # Main entry point — run this
-├── .env                        # Your configuration (git-ignored)
-├── .env.example                # Configuration template (safe to commit)
-├── .gitignore                  # Excludes .env, tables.conf, backups, logs
-├── README.md                   # This file
-├── config/
-│   ├── tables.conf             # Your table list (git-ignored)
-│   └── tables.conf.example     # Table list template (safe to commit)
-└── scripts/
-    ├── ui.sh                   # Terminal UI: colors, progress bars, spinners, timers
-    └── validate.sh             # Config and environment validation logic
+┌──────────────────────────┐     ┌──────────────────────┐
+│  apps/desktop            │     │  engine-cli          │
+│  Tauri 2 + React + TS    │     │  `dbsync` binary     │
+│  (presentation only)     │     │  (cron / CI)         │
+└────────────┬─────────────┘     └──────────┬───────────┘
+             │                              │
+             │   both depend on the engine; │
+             │   neither owns domain logic  │
+             └───────────────┬──────────────┘
+                             ▼
+                 ┌───────────────────────┐
+                 │  engine (Rust)        │
+                 │  no tauri dependency  │
+                 ├───────────────────────┤
+                 │ store    profile      │
+                 │ secrets  job/events   │
+                 │ ssh      db  tools    │
+                 │ backup   restore      │
+                 │ verify   retention    │
+                 │ manifest definer      │
+                 └───────────────────────┘
 ```
 
----
+The split is enforced, not aspirational: `engine/Cargo.toml` has no `tauri`
+dependency, and persistence lives in `engine::store` so the CLI and GUI read the
+same profiles and write the same job history. Anything the GUI can do, `dbsync`
+must be able to do.
 
-## Installation
-
-### 1. Clone the repository
-
-```bash
-git clone https://github.com/yourname/db-migrate.git
-cd db-migrate
-```
-
-### 2. Make the script executable
-
-```bash
-chmod +x db_migrate.sh
-```
-
-### 3. Create your environment file
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env` and fill in your server details — see [Configuration](#configuration) below.
-
-### 4. Create your tables configuration
-
-```bash
-cp config/tables.conf.example config/tables.conf
-```
-
-Edit `config/tables.conf` and add the table names that should be backed up with data — one table per line.
-
-### 5. Install optional dependencies
-
-```bash
-# Strongly recommended — enables byte-level progress bar during restore
-brew install pv
-```
-
-### 6. Validate your setup
-
-```bash
-./db_migrate.sh --dry-run
-```
-
-This checks your entire configuration without making any changes to either server.
-
----
-
-## Configuration
-
-### Environment Variables (`.env`)
-
-```dotenv
-# ── Local Docker ─────────────────────────────────────────────────
-# Name of your running MySQL 8 Docker container
-DOCKER_CONTAINER=mysql8
-
-# ── Backup Storage ───────────────────────────────────────────────
-# Where .sql.gz backup files are saved on your Mac
-# The ~ shorthand is supported
-BACKUP_DIR=~/mysql_backups
-
-# ── Source Server A ──────────────────────────────────────────────
-SRC_SSH_USER=ubuntu
-SRC_SSH_HOST=1.2.3.4
-SRC_SSH_PORT=22
-SRC_SSH_KEY=~/.ssh/id_rsa
-
-SRC_DB_HOST=127.0.0.1          # MySQL host as seen from Server A (usually 127.0.0.1)
-SRC_DB_PORT=3306
-SRC_DB_USER=root
-SRC_DB_PASS=your_source_password
-SRC_DB_NAME=your_database_name
-
-SRC_LOCAL_PORT=13306            # Free local port to bind the SSH tunnel
-
-# ── Destination Server B ─────────────────────────────────────────
-DST_SSH_USER=ubuntu
-DST_SSH_HOST=5.6.7.8
-DST_SSH_PORT=22
-DST_SSH_KEY=~/.ssh/id_rsa
-
-DST_DB_HOST=127.0.0.1
-DST_DB_PORT=3306
-DST_DB_USER=root
-DST_DB_PASS=your_destination_password
-
-DST_LOCAL_PORT=13307            # Must be different from SRC_LOCAL_PORT
-
-# ── Destination Database Naming ───────────────────────────────────
-# Final DB name will be: DB_PREFIX + _ + YYYYMMDD_HHmmss
-# Example: restore_20250315_143022
-DB_PREFIX=restore
-
-# ── Tables Configuration ──────────────────────────────────────────
-# Path to the file listing tables that need schema + data backup
-# Relative paths are resolved from the project root
-TABLES_FILE=./config/tables.conf
-
-# ── Dump Options ──────────────────────────────────────────────────
-DUMP_ROUTINES=true              # Include stored procedures and functions
-DUMP_TRIGGERS=true              # Include triggers
-DUMP_EVENTS=true                # Include scheduled events
-COMPRESS_BACKUP=true            # Gzip the output file
-```
-
-### Tables Configuration (`config/tables.conf`)
-
-One table name per line. Lines starting with `#` are treated as comments and ignored. Blank lines are ignored.
-
-```
-# Orders
-orders
-order_items
-order_status_history
-
-# Users
-users
-user_profiles
-roles
-permissions
-```
-
-**Every table listed here** → backed up with **schema + data**
-
-**Every other table in the database** → backed up with **schema only** (structure preserved, no rows)
-
-There is no limit on the number of tables. The file supports hundreds of entries organized into any comment-based groupings you prefer.
-
----
-
-## Usage
-
-### Short Commands
-
-Use these as the primary command forms:
-
-| Action | Command |
+| Path | Contents |
 |---|---|
-| Full sync (backup + restore) | `./db_migrate.sh sync` |
-| Backup only (source → local) | `./db_migrate.sh sync --backup-only` |
-| Restore only (local → destination) | `./db_migrate.sh restore` |
-| Validate configuration only | `./db_migrate.sh dry-run` |
+| `engine/` | All domain logic. Options, validation, persistence, secrets, filters |
+| `engine/migrations/` | Versioned SQLite schema (`sqlx::migrate!`) |
+| `engine-cli/` | `dbsync` — headless entry point, JSON-lines progress |
+| `apps/desktop/src-tauri/` | Tauri commands, typed event bridge, app state |
+| `apps/desktop/src/` | React UI. `bindings.ts` is generated — never edit it |
+| `tests/fixtures/` | MySQL and PostgreSQL fixture schemas |
+| `tests/*.sh` | Fixture and DEFINER round-trip verification |
 
-Legacy flags are still supported for compatibility: `--backup`, `--restore`, `--dry-run`.
+## How a backup job flows through the system
 
-### Full Pipeline
+1. **The UI submits a `BackupRequest`** — a `CommonBackupOptions` (database,
+   per-table selections, output directory) plus a per-engine variant,
+   `Mysql(..)` or `Postgres(..)`. Options that mean nothing to the other engine
+   are unrepresentable rather than silently ignored.
 
-Runs all 8 steps: connects to Source, dumps schema and data, compresses, connects to Destination, creates DB, restores, verifies.
+2. **`validate()` runs before anything opens.** Engine mismatch, an empty
+   selection, a row filter on a schema-only table, or parallel `pg_dump`
+   without the directory format all fail here — before a tunnel or a
+   destination database exists.
 
-```bash
-./db_migrate.sh sync
-```
+3. **A `JobContext` is created and registered.** It carries a
+   `CancellationToken` and a durable log buffer. `JobRegistry` maps job id to
+   that token, so cancelling actually propagates into child processes.
 
-`sync` is the default command, so `./db_migrate.sh` behaves the same.
+4. **A tunnel is opened if the profile needs one.** `TunnelHandle` owns the
+   tunnel; the last clone dropping closes it, so an early return or panic
+   cannot leak one. The local port comes from the ephemeral range.
 
-### Backup Only
+5. **The dump streams.** For MySQL the output passes through
+   `definer::strip_definers` inline — quote-aware, so `DEFINER=` inside row data
+   survives — and then through streaming gzip. No uncompressed intermediate
+   file is written.
 
-Connects to Source, runs the full dump and compression, saves the `.sql.gz` file locally. Stops before touching the Destination server. Useful for scheduled backups or when you want to review the file before restoring.
+6. **Progress is emitted twice.** `JobContext::emit_event` appends to the
+   durable log *first*, then publishes to a lossy broadcast channel. The desktop
+   app forwards those as typed `JobProgress` events; the CLI writes JSON-lines.
+   A lagging consumer drops live messages and never loses log lines.
 
-```bash
-./db_migrate.sh sync --backup-only
-```
+7. **A manifest is written** next to the artifact: engine, server and tool
+   versions, options, table lists, size, SHA-256 and format. Restores read it to
+   pick the right tool and to detect corruption before touching a destination.
 
-Legacy shortcut still works:
+8. **Retention runs**, and reports what it deleted. It never deletes the newest
+   artifact, whatever the policy says.
 
-```bash
-./db_migrate.sh --backup
-```
+## Development setup
 
-### Restore Only
-
-Skips the dump entirely. Presents a numbered list of `.sql.gz` files available in your `BACKUP_DIR`, lets you choose one, then connects to Destination and restores it into a new database.
-
-```bash
-./db_migrate.sh restore
-```
-
-Example prompt:
-
-```
-  Available backups:
-  ───────────────────────────────────────────────────────
-  [ 1]  mydb_20250315_143022.sql.gz          142 MB   2025-03-15 14:30
-  [ 2]  mydb_20250314_090011.sql.gz          139 MB   2025-03-14 09:00
-  [ 3]  mydb_20250313_021500.sql.gz          138 MB   2025-03-13 02:15
-  ───────────────────────────────────────────────────────
-
-  Select backup [1-3]:
-```
-
-### Dry Run
-
-Validates your entire configuration without opening any tunnels or touching any database. Checks Docker, SSH keys, disk space, tables config, and all required `.env` values.
+Requires Rust (stable, edition 2024 — 1.85+), Node 20+, and Docker for the
+integration fixtures.
 
 ```bash
-./db_migrate.sh dry-run
+cargo build --workspace
+cd apps/desktop && npm install
 ```
 
-Legacy shortcut still works:
+Run the desktop app with hot reload:
 
 ```bash
-./db_migrate.sh --dry-run
+cd apps/desktop && npm run tauri dev
 ```
 
----
-
-## What Gets Backed Up
-
-| Tables | Schema | Data |
-|--------|--------|------|
-| All tables in the source database | ✅ Always | ❌ |
-| Tables listed in `tables.conf` | ✅ Always | ✅ |
-
-The result is a single `.sql` file (then compressed to `.sql.gz`) that contains:
-
-1. `CREATE TABLE` statements for every table in the database
-2. `INSERT` statements only for tables listed in `tables.conf`
-3. Stored routines, triggers, and events (if enabled in `.env`)
-
-All `DEFINER=` clauses are automatically stripped from the dump, making it safe to restore on any server without requiring `SUPER` privileges.
-
----
-
-## Output & Progress
-
-The script provides live feedback at every stage:
-
-**Schema dump** — live file size monitor showing bytes written and elapsed time as the dump runs in the background
-
-**Data dump** — animated progress bar per table showing:
-  - Visual fill bar (25 segments)
-  - Percentage complete
-  - Current / total table count
-  - Current table name
-  - Elapsed time and ETA
-
-**Compression** — spinner with size while gzip runs, then shows original size → compressed size → reduction percentage
-
-**Restore with `pv` installed** — byte-level progress bar showing:
-  - Bytes transferred
-  - Transfer throughput
-  - Elapsed time
-  - ETA to completion
-
-**Restore without `pv`** — animated spinner showing file size and elapsed time
-
-**Verification** — after restore, queries the destination database and reports:
-  - Total table count
-  - Tables with data vs schema-only
-  - DB size on disk
-  - Top 5 largest tables (by size) with row counts
-
-**Summary** — step-by-step timing table showing duration per step and total elapsed time
-
----
-
-## Backup File Naming
-
-Backup files are saved to `BACKUP_DIR` with the following naming convention:
-
-```
-{SOURCE_DB_NAME}_{YYYYMMDD}_{HHmmss}.sql.gz
-```
-
-Example:
-```
-~/mysql_backups/baredex_app_20250315_143022.sql.gz
-```
-
-Backup files are never deleted automatically. Manage retention manually or add a cron-based cleanup as needed.
-
----
-
-## Destination Database Naming
-
-Each restore creates a brand-new database on the Destination server. The name is auto-generated using your configured prefix and a timestamp:
-
-```
-{DB_PREFIX}_{YYYYMMDD}_{HHmmss}
-```
-
-Example with `DB_PREFIX=restore`:
-```
-restore_20250315_143022
-```
-
-This means every run is non-destructive — no existing database on the destination is ever modified or dropped.
-
----
-
-## Security
-
-| Concern | How it is handled |
-|---|---|
-| **Passwords in `.env`** | `.env` is git-ignored and never committed |
-| **Table names in `tables.conf`** | `tables.conf` is git-ignored and never committed |
-| **SSH connections** | Key-based only — no password authentication |
-| **Data in transit** | All MySQL traffic travels inside the SSH tunnel (encrypted) |
-| **Source database safety** | `--single-transaction` — no locks, no writes to source |
-| **Destination safety** | Always creates a new uniquely named DB — never overwrites |
-| **SUPER privilege error** | `DEFINER=` clauses stripped automatically from dump |
-| **Backup files** | Stored locally on your Mac only — not uploaded anywhere |
-
----
-
-## Troubleshooting
-
-### `zsh: permission denied: ./db_migrate.sh`
+Run the CLI:
 
 ```bash
-chmod +x db_migrate.sh
+cargo run -p db-sync-cli -- doctor
 ```
 
-To persist the permission in Git so it survives clones:
+`bindings.ts` is generated from the Rust command signatures. Regenerate after
+changing any `#[tauri::command]`:
 
 ```bash
-git update-index --chmod=+x db_migrate.sh
-git commit -m "fix: set executable bit on db_migrate.sh"
+cargo test -p db-sync-desktop --lib export_typescript_bindings
 ```
 
----
-
-### `mapfile: command not found`
-
-Your system is using macOS's default bash 3.2. The script uses `while read` loops for compatibility, but if you see this in another context:
+## Testing
 
 ```bash
-# Check your bash version
-bash --version
-
-# Install bash 5 via Homebrew (does not replace system bash)
-brew install bash
+cargo test --workspace
 ```
 
----
-
-### `Cannot reach Server A on port 13306 after 15 attempts`
-
-- Confirm the SSH host and user are correct in `.env`
-- Test your SSH key manually: `ssh -i ~/.ssh/id_rsa ubuntu@your-server`
-- Check that MySQL is actually running on the source server
-- Confirm `SRC_LOCAL_PORT` is not already in use: `lsof -i :13306`
-- Try increasing the sleep before `wait_for_tunnel` in `step_open_source_tunnel` if the server is slow
-
----
-
-### `ERROR 1227 (42000): Access denied; you need SUPER privilege`
-
-This is caused by `DEFINER=` clauses in the dump. The script strips these automatically in Step 2. If you are using an older backup file that was generated without the strip:
+Integration fixtures — two databases seeded with the things that break naive
+tooling (DEFINER clauses, binary payloads, FK cycles, reserved-word and unicode
+identifiers, a MyISAM table, and row data containing the literal text
+`DEFINER=`):
 
 ```bash
-# Strip DEFINER from an existing backup file
-gunzip -c old_backup.sql.gz \
-  | sed 's/DEFINER=[^ ]* / /g' \
-  | gzip > fixed_backup.sql.gz
+docker compose -f docker-compose.test.yml up -d --wait mysql postgres
+tests/verify-fixtures.sh
+tests/verify-definer-roundtrip.sh
+docker compose -f docker-compose.test.yml down -v
 ```
 
----
+`verify-definer-roundtrip.sh` is the one worth understanding: it takes a real
+`mysqldump`, confirms the raw dump is *rejected* when restoring as a user
+without SUPER, confirms the filtered dump restores cleanly, and confirms rows
+whose data merely mentions `DEFINER=` come back byte-identical.
 
-### `No .sql.gz files found` during `--restore`
-
-Check that `BACKUP_DIR` in your `.env` points to the correct directory and that backup files exist there:
+Keychain tests touch the real OS credential store, so they are `#[ignore]`d —
+CI runners have no unlocked keychain. Run them locally after changing anything
+credential related:
 
 ```bash
-ls -lh ~/mysql_backups/
+cargo test -p db-sync-engine --test keychain -- --ignored
 ```
 
----
+## Security model
 
-### Docker container not found
+- **Secrets never cross the IPC boundary.** The webview can store a secret and
+  ask whether one exists. There is deliberately no command that returns one.
+- **Never in argv.** Credentials reach child processes through environment
+  variables or 0600 credential files, never `-p<password>`.
+- **Host keys are pinned**, and a changed key is surfaced rather than silently
+  accepted. There is no `StrictHostKeyChecking=no` equivalent.
+- **Minimal Tauri capabilities**: `core:default` only. Dump and restore
+  processes are spawned by the Rust engine, so the webview needs no shell
+  permission.
+- **Destructive restores require typed confirmation**, and production-tagged
+  targets require it even for non-obviously-destructive strategies.
+
+## Roadmap
+
+| Milestone | Scope | State |
+|---|---|---|
+| **M0** | Engine/CLI/GUI split, persistence, secrets, options model, DEFINER filter, verification, retention, test harness, CI | **Done** |
+| **M1′** | SSH tunnels (russh) with jump hosts and host-key prompts, table introspection, test-connection | Next |
+| **M2′** | MySQL backup and restore end to end, real cancellation, backup library | |
+| **M3′** | PostgreSQL backup and restore, formats, parallel and selective restore | |
+| **M4′** | Sync wizard, scheduler, notifications, retention enforcement, packaging | |
+
+Not in scope for v1: data masking, incremental/binlog/WAL sync, cloud upload,
+multi-user access control. Trait seams are left where they would attach.
+
+## Legacy tool
+
+The original Bash tool (`db_migrate.sh`, `ui.sh`, `validate.sh`) is unchanged
+and still works. It remains the supported path until M2′ reaches feature parity
+for MySQL.
 
 ```bash
-# List running containers
-docker ps
-
-# Start your MySQL 8 container if it is stopped
-docker start mysql8
+./db_migrate.sh dry-run      # validate configuration, touch nothing
+./db_migrate.sh sync         # backup + restore
+./db_migrate.sh backup       # backup only
+./db_migrate.sh restore      # restore from a saved backup
 ```
 
----
+It reads `.env` and `table.conf` from the repository root; both are git-ignored.
+Its table list is a good starting point for a sync plan once the GUI can import
+one.
 
-## Git Setup
+## Licence
 
-Sensitive files are excluded from version control via `.gitignore`. Only templates and scripts are committed.
-
-```
-✅ Committed (safe)          ❌ Git-ignored (stays local)
-─────────────────────────    ──────────────────────────────
-db_migrate.sh                .env
-scripts/ui.sh                config/tables.conf
-scripts/validate.sh          *.sql
-.env.example                 *.sql.gz
-config/tables.conf.example   logs/
-README.md
-.gitignore
-```
-
-Initial repository setup:
-
-```bash
-git init
-git add .
-git update-index --chmod=+x db_migrate.sh
-git commit -m "initial commit"
-git remote add origin https://github.com/yourname/db-migrate.git
-git push -u origin main
-```
-
-When setting up on a new machine:
-
-```bash
-git clone https://github.com/yourname/db-migrate.git
-cd db-migrate
-cp .env.example .env          # then edit with your values
-cp config/tables.conf.example config/tables.conf   # then add your tables
-./db_migrate.sh --dry-run
-```
+MIT — see [LICENSE](LICENSE).

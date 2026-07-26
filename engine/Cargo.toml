@@ -1,0 +1,45 @@
+[package]
+name = "db-sync-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The engine deliberately does NOT depend on tauri or tauri-specta.
+# All domain logic must be usable headlessly from engine-cli.
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+secrecy.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+sqlx.workspace = true
+async-trait.workspace = true
+directories = "5"
+sha2.workspace = true
+flate2.workspace = true
+specta.workspace = true
+
+# keyring's credential store is chosen by feature flag. With default features it
+# compiles to an in-memory mock that loses everything between Entry instances,
+# so a user's saved password would silently disappear. Each platform must opt
+# into its native backend explicitly.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+# crypto-rust avoids requiring OpenSSL headers on the build machine.
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tempfile = "3"
+secrecy.workspace = true

@@ -7,10 +7,28 @@ tables.conf
 table.conf
 
 # ── Backup Files ─────────────────────────────────────────────────
+# Dumps produced by the tool. The negations keep source-controlled SQL
+# (migrations, test fixtures) tracked — without them `*.sql` silently swallows
+# the schema this project is built on.
 *.sql
 *.sql.gz
+!engine/migrations/*.sql
+!tests/fixtures/**/*.sql
 backups/
 logs/
+
+# ── Test SSH keys ────────────────────────────────────────────────
+# Generated on demand for the sshd test container. Never commit a private key,
+# even a throwaway one — it trips secret scanners and teaches a bad habit.
+tests/fixtures/ssh/
+
+# ── Rust ─────────────────────────────────────────────────────────
+target/
+
+# ── Node / frontend build output ─────────────────────────────────
+node_modules/
+apps/desktop/dist/
+apps/desktop/src-tauri/gen/
 
 # ── macOS ────────────────────────────────────────────────────────
 .DS_Store

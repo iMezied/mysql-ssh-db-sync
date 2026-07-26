@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "engine",
+    "engine-cli",
+    "apps/desktop/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+anyhow = "1"
+thiserror = "2"
+secrecy = { version = "0.10", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate"] }
+# NOTE: keyring is NOT declared here. Its backend is selected by feature flags,
+# and with default features it silently falls back to an in-memory *mock* store
+# — secrets appear to save and then vanish. It is declared per-target in
+# engine/Cargo.toml so the native backend is always enabled. See DECISIONS.md.
+async-trait = "0.1"
+sha2 = "0.10"
+flate2 = "1"
+
+# Pinned exactly: these are release candidates and rc-to-rc churn breaks builds.
+# specta-typescript is a DIRECT dependency because tauri-specta's `export`
+# takes an `impl LanguageExt`, and the only impls live on specta_typescript types.
+specta = { version = "=2.0.0-rc.25", features = ["derive", "chrono", "uuid", "serde_json"] }
+specta-typescript = { version = "=0.0.12" }
+tauri-specta = { version = "=2.0.0-rc.25", features = ["derive", "typescript"] }
+
+# SSH tunnels land in M1'. Pinned here so the version is a deliberate choice
+# rather than whatever resolves on the day.
+# russh = "0.62"

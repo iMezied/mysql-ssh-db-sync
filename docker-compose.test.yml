@@ -1,0 +1,64 @@
+# Integration test fixtures.
+#
+#   docker compose -f docker-compose.test.yml up -d --wait
+#   cargo test --workspace -- --include-ignored
+#   docker compose -f docker-compose.test.yml down -v
+#
+# Ports are deliberately non-default so a developer's local MySQL/Postgres is
+# never touched by a test run.
+
+services:
+  mysql:
+    image: mysql:8.0
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --log-bin-trust-function-creators=1
+    environment:
+      MYSQL_ROOT_PASSWORD: testroot
+      MYSQL_DATABASE: fixture
+      MYSQL_USER: dbsync
+      MYSQL_PASSWORD: testpass
+    ports:
+      - "13306:3306"
+    volumes:
+      - ./tests/fixtures/mysql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-ptestroot"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: testpass
+      POSTGRES_USER: dbsync
+      POSTGRES_DB: fixture
+    ports:
+      - "15432:5432"
+    volumes:
+      - ./tests/fixtures/postgres:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dbsync -d fixture"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  # Exercises the tunnel path end to end. The database containers are reachable
+  # from here by service name, so a test can forward to mysql:3306 through SSH
+  # exactly as a real deployment would.
+  sshd:
+    image: linuxserver/openssh-server:latest
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      USER_NAME: tunnel
+      PASSWORD_ACCESS: "false"
+      PUBLIC_KEY_FILE: /keys/id_ed25519.pub
+      DOCKER_MODS: linuxserver/mods:openssh-server-ssh-tunnel
+    ports:
+      - "12222:2222"
+    volumes:
+      - ./tests/fixtures/ssh:/keys:ro
