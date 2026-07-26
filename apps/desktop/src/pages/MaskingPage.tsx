@@ -140,6 +140,17 @@ export default function MaskingPage() {
       <div className="space-y-6 p-6">
         <Warning />
 
+        {(profiles.isError || plans.isError) && (
+          // Without this the pickers just read "None", which is
+          // indistinguishable from having no connections — and on this page
+          // "nothing is listed" would quietly imply "nothing needs masking".
+          <p className="text-xs text-red-400">
+            Could not load{" "}
+            {profiles.isError ? "connections" : "this connection's plans"}:{" "}
+            {((profiles.error ?? plans.error) as Error).message}
+          </p>
+        )}
+
         <section className="flex flex-wrap gap-3">
           <Select
             label="Connection"

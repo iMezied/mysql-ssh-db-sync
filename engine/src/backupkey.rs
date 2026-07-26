@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 
 use crate::crypto::{self, CryptoError};
-use crate::secrets::{self, APP_SCOPE, SecretKind};
+use crate::secrets::{self, SecretKind, app_scope};
 use crate::settings;
 use crate::store::Store;
 
@@ -75,7 +75,7 @@ pub async fn status(store: &Store) -> Result<KeyStatus, KeyError> {
     let exported = settings::parse_flag(store.get_setting(KEY_EXPORTED).await?.as_deref(), false);
 
     Ok(KeyStatus {
-        exists: public.is_some() && secrets::has_secret(APP_SCOPE, SecretKind::BackupKey)?,
+        exists: public.is_some() && secrets::has_secret(app_scope(), SecretKind::BackupKey)?,
         public,
         exported,
         extra_recipients: extra_recipients(store).await?,
@@ -107,7 +107,7 @@ pub async fn ensure_exists(store: &Store) -> Result<KeyStatus, KeyError> {
     }
 
     let (secret, public) = crypto::generate_identity();
-    secrets::set_secret(APP_SCOPE, SecretKind::BackupKey, secret.expose_secret())?;
+    secrets::set_secret(app_scope(), SecretKind::BackupKey, secret.expose_secret())?;
     store.set_setting(PUBLIC_KEY, &public).await?;
     store.set_flag(KEY_EXPORTED, false).await?;
 
@@ -119,7 +119,8 @@ pub async fn ensure_exists(store: &Store) -> Result<KeyStatus, KeyError> {
 ///
 /// Marks the key as exported, which is what unblocks encrypted backups.
 pub async fn export(store: &Store) -> Result<SecretString, KeyError> {
-    let secret = secrets::get_secret(APP_SCOPE, SecretKind::BackupKey)?.ok_or(KeyError::Missing)?;
+    let secret =
+        secrets::get_secret(app_scope(), SecretKind::BackupKey)?.ok_or(KeyError::Missing)?;
 
     // Checked on the way out rather than trusted: if the two halves ever drift
     // apart, the manifest would record a recipient nothing can decrypt.
@@ -144,7 +145,7 @@ pub async fn import(store: &Store, secret: &str) -> Result<KeyStatus, KeyError> 
     // and the store disagreeing.
     let public = crypto::public_from_identity(&secret)?;
 
-    secrets::set_secret(APP_SCOPE, SecretKind::BackupKey, secret.expose_secret())?;
+    secrets::set_secret(app_scope(), SecretKind::BackupKey, secret.expose_secret())?;
     store.set_setting(PUBLIC_KEY, &public).await?;
     // An imported key is by definition already held somewhere else.
     store.set_flag(KEY_EXPORTED, true).await?;
@@ -190,7 +191,7 @@ pub async fn ensure_ready_for_encryption(store: &Store) -> Result<Vec<String>, K
 
 /// The identity needed to read an encrypted artifact.
 pub fn identity() -> Result<SecretString, KeyError> {
-    secrets::get_secret(APP_SCOPE, SecretKind::BackupKey)?.ok_or(KeyError::Missing)
+    secrets::get_secret(app_scope(), SecretKind::BackupKey)?.ok_or(KeyError::Missing)
 }
 
 #[cfg(test)]

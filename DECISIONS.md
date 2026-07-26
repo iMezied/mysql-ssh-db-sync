@@ -1092,3 +1092,64 @@ to hurt someone is a user who configures masking, sees "3 columns masked", and
 concludes the artifacts in their backup folder are now safe to share. Every
 other surface — module docs, README, `dbsync mask list` — says the same thing,
 because the one place a person forms that belief is the place they set it up.
+
+## M9 — App-scoped secrets need a test escape hatch
+
+Every secret in this app is keyed by a profile id, so a test that writes one is
+isolated by construction: the id is random, the entry is unique, and cleanup is
+a delete on the way out.
+
+The backup key is the exception. It is stored under a **fixed** account — the
+nil UUID — because there is one per machine by design: a restore has to find it
+without knowing which profile made the backup. That fixedness is correct for
+the product and wrong for tests, because the keychain belongs to the machine
+and not to the temporary store a test opens.
+
+The consequence was live in this repo and went unnoticed for three milestones:
+`cargo test -- --include-ignored` created a real backup key in the developer's
+own login keychain and left it there. Worse, on a machine that already had one,
+`ensure_exists` is idempotent — so the encryption round-trip tests would have
+quietly encrypted their fixtures to the developer's actual key.
+
+`secrets::app_scope()` reads `DBSYNC_APP_SCOPE`, so tests can point app-scoped
+secrets at a disposable UUID and delete it afterwards.
+
+### Why the override is compiled out of release builds
+
+It decides which key encrypted backups are written to. Honouring it in a
+shipped binary would let anything able to set an environment variable point the
+app at an empty scope, where it would generate a fresh key and encrypt to that
+instead — producing artifacts the user cannot decrypt and has no reason to
+suspect are different. `cfg!(debug_assertions)` keeps it where tests are and
+nowhere else.
+
+### Two things the first attempt got wrong
+
+**The variable is per-process, not per-thread.** Cargo runs a binary's tests on
+threads, so two guards alive at once shared one variable, and whichever
+finished first pulled the scope out from under the other. It surfaced as an
+artifact that would not decrypt — a failure that looks exactly like the
+encryption being broken. The guard now holds a mutex for its lifetime.
+
+**`delete_all_for_profile` deliberately skips `BackupKey`**, which is right for
+its real caller — deleting a profile must never destroy the key that decrypts
+every artifact ever taken — and exactly wrong for cleanup, where it silently
+left behind the one entry the guard existed to remove. Writing an empty value
+is how the secrets layer deletes.
+
+## M9 — Commands are tested through the IPC path, not called directly
+
+`tauri::test::mock_builder` runs commands through real registration, argument
+deserialisation, `State` extraction and response serialisation, without a
+window or a built frontend. Calling the functions directly would skip every one
+of those.
+
+The layer is generated from the same signatures `bindings.ts` is, so it is
+structurally hard to get wrong — but that was said about several things in this
+project that turned out to be wrong. A command renamed without its call site,
+or one left out of `generate_handler!`, now fails in CI rather than in front of
+a user.
+
+`generate_backup_key` is deliberately *not* among them: it writes to the
+machine's keychain, and a test that creates a real key is the problem described
+above rather than a test of it.

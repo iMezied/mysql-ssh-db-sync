@@ -41,6 +41,11 @@ tauri-specta.workspace = true
 # you. This bit the engine crate once already; see DECISIONS.md.
 [dev-dependencies]
 tempfile = "3"
+# The mock runtime, so commands can be driven through the real IPC path
+# without a window. See tests/ipc.rs.
+tauri = { version = "2", features = ["test"] }
+serde_json.workspace = true
+uuid.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # `access(2)` is the honest way to ask whether a directory is writable; working

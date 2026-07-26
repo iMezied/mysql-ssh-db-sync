@@ -149,7 +149,24 @@ function BackupKeySection() {
       <h2 className="text-sm font-medium text-slate-200">Backup encryption</h2>
 
       <div className="panel space-y-4 p-4">
-        {!key?.exists ? (
+        {status.isPending ? (
+          <p className="text-xs text-slate-500">Reading the key…</p>
+        ) : status.isError ? (
+          // Deliberately not folded into the "no key yet" branch. Reading the
+          // key touches the OS keychain, and a locked keychain fails here — a
+          // UI that answered "you have no key" would be telling the user
+          // something false about a secret they may well have.
+          <div className="space-y-1.5">
+            <p className="text-xs text-red-400">
+              Could not read the encryption key: {(status.error as Error).message}
+            </p>
+            <p className="max-w-2xl text-xs leading-relaxed text-slate-500">
+              This does not mean there is no key — it means the app could not
+              check. Unlocking the OS keychain and reopening this page is the
+              usual fix.
+            </p>
+          </div>
+        ) : !key?.exists ? (
           <>
             <p className="max-w-2xl text-xs leading-relaxed text-slate-500">
               No key yet. Encrypted backups are blocked until one exists and has

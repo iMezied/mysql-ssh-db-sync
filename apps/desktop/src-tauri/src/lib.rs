@@ -18,7 +18,9 @@ use tauri_specta::{Event as _, collect_commands, collect_events};
 use tokio_util::sync::CancellationToken;
 
 mod cli_tool;
-mod commands;
+// Public so the IPC tests can register the handlers through
+// `generate_handler!`. Nothing outside this crate calls them directly.
+pub mod commands;
 mod events;
 mod hooks;
 mod tray;

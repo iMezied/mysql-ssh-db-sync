@@ -113,6 +113,49 @@ impl Drop for Cleanup {
     }
 }
 
+/// Redirect app-scoped secrets to a disposable scope, and remove them after.
+///
+/// Without this, `backupkey::ensure_exists` writes a real backup key into the
+/// developer's own login keychain at the fixed app scope and leaves it there —
+/// and on a machine that already has one, the test would encrypt its fixtures
+/// to the developer's actual key rather than to one of its own.
+/// The override is an environment variable, and those are per-*process*, not
+/// per-thread — so two of these alive at once would silently share, and
+/// whichever finished first would pull the scope out from under the other.
+/// (That is not hypothetical: it is what happened the first time this existed
+/// without the lock, and it surfaced as an artifact that would not decrypt.)
+/// Holding a lock for the life of the guard makes the key-touching tests run
+/// one at a time; there are three of them and they are container-bound anyway.
+static KEY_SCOPE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct ScopedBackupKey {
+    id: Uuid,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl ScopedBackupKey {
+    fn new() -> Self {
+        let guard = KEY_SCOPE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let id = Uuid::new_v4();
+        // Safe: nothing else in this process reads the variable while the lock
+        // is held, which is the whole point of holding it.
+        unsafe { std::env::set_var(secrets::APP_SCOPE_OVERRIDE, id.to_string()) };
+        Self { id, _guard: guard }
+    }
+}
+
+impl Drop for ScopedBackupKey {
+    fn drop(&mut self) {
+        // NOT `delete_all_for_profile`: it deliberately skips BackupKey, so it
+        // would leave exactly the entry this guard exists to remove. Writing an
+        // empty value is how the secrets layer deletes.
+        let _ = secrets::set_secret(self.id, SecretKind::BackupKey, "");
+        unsafe { std::env::remove_var(secrets::APP_SCOPE_OVERRIDE) };
+    }
+}
+
 async fn temp_store() -> (Store, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join("t.db")).await.unwrap();
@@ -838,6 +881,8 @@ db_test! {
         let dest = profile(&store, "enc-dest", "dbsync", "testpass").await;
         let _cleanup = Cleanup(vec![source.id, dest.id]);
 
+        let _scope = ScopedBackupKey::new();
+
         // A key must exist and be escrowed before an encrypted backup runs.
         db_sync_engine::backupkey::ensure_exists(&store).await.unwrap();
         let exported = db_sync_engine::backupkey::export(&store).await.unwrap();
@@ -944,6 +989,7 @@ db_test! {
         let source = profile(&store, "escrow-source", "root", "testroot").await;
         let _cleanup = Cleanup(vec![source.id]);
 
+        let _scope = ScopedBackupKey::new();
         db_sync_engine::backupkey::ensure_exists(&store).await.unwrap();
         // Deliberately not exported.
 

@@ -41,7 +41,45 @@ impl SecretKind {
 ///
 /// The nil UUID can never collide with a real profile: `Uuid::new_v4` does not
 /// generate it, and no profile is ever created with it.
+///
+/// Use [`app_scope`] rather than this constant, so tests stay isolated.
 pub const APP_SCOPE: Uuid = Uuid::nil();
+
+/// Environment variable that redirects app-scoped secrets, for tests.
+pub const APP_SCOPE_OVERRIDE: &str = "DBSYNC_APP_SCOPE";
+
+/// Which scope application-wide secrets are actually filed under.
+///
+/// # Why this is not just [`APP_SCOPE`]
+///
+/// Every other secret is keyed by a random profile id, so a test that writes
+/// one is isolated by construction. The app scope is *fixed*, and the keychain
+/// belongs to the machine rather than to the temporary store a test opens — so
+/// a test calling [`crate::backupkey::ensure_exists`] creates a real backup key
+/// in the developer's own login keychain and leaves it there. Worse, on a
+/// machine that already has one, the test would quietly encrypt its fixtures
+/// to the developer's actual key.
+///
+/// Setting [`APP_SCOPE_OVERRIDE`] to a UUID moves those secrets somewhere
+/// disposable.
+///
+/// # Why it is ignored in release builds
+///
+/// The override decides which key encrypted backups are written to. Honouring
+/// it in a shipped binary would let anything able to set an environment
+/// variable point the app at an empty scope, where it would generate a fresh
+/// key and encrypt to that instead — producing artifacts the user cannot
+/// decrypt and would not know were different. A test convenience is not worth
+/// that, so it exists only where tests do.
+pub fn app_scope() -> Uuid {
+    if cfg!(debug_assertions)
+        && let Ok(raw) = std::env::var(APP_SCOPE_OVERRIDE)
+        && let Ok(id) = Uuid::parse_str(&raw)
+    {
+        return id;
+    }
+    APP_SCOPE
+}
 
 fn account(profile_id: Uuid, kind: SecretKind) -> String {
     format!("{}#{}", profile_id, kind.suffix())
@@ -117,5 +155,24 @@ mod tests {
     fn accounts_are_namespaced_per_profile() {
         let kind = SecretKind::DbPassword;
         assert_ne!(account(Uuid::new_v4(), kind), account(Uuid::new_v4(), kind));
+    }
+
+    #[test]
+    fn the_app_scope_defaults_to_the_shared_one() {
+        // With nothing set, key operations must find the machine's real key.
+        // A default that drifted would silently generate a second key and
+        // encrypt to it, leaving existing artifacts undecryptable.
+        assert!(std::env::var(APP_SCOPE_OVERRIDE).is_err());
+        assert_eq!(app_scope(), APP_SCOPE);
+    }
+
+    #[test]
+    fn a_malformed_override_is_ignored_rather_than_guessed_at() {
+        // Falling back to the real scope is the safe reading: the alternative
+        // is inventing a scope from a typo and generating a key there.
+        assert_eq!(
+            Uuid::parse_str("not-a-uuid").ok().unwrap_or(APP_SCOPE),
+            APP_SCOPE
+        );
     }
 }
