@@ -13,6 +13,7 @@ use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 use crate::backup::TableSelection;
+use crate::destination::{Destination, DestinationCreate, DestinationUpdate};
 use crate::events::JobKind;
 use crate::job::{JobOutcome, JobRecord};
 use crate::plan::{SyncPlan, SyncPlanCreate};
@@ -43,8 +44,14 @@ pub enum StoreError {
     SyncPlanNotFound(Uuid),
     #[error("no schedule with id {0}")]
     ScheduleNotFound(Uuid),
+    #[error("no destination with id {0}")]
+    DestinationNotFound(Uuid),
     #[error(transparent)]
     InvalidSchedule(crate::schedule::ScheduleError),
+    #[error(transparent)]
+    InvalidDestination(crate::destination::DestinationError),
+    #[error(transparent)]
+    Secrets(crate::secrets::SecretError),
 }
 
 type Result<T> = std::result::Result<T, StoreError>;
@@ -604,6 +611,156 @@ impl Store {
             .await?;
         Ok(res.rows_affected() > 0)
     }
+}
+
+// ── Off-site destinations ───────────────────────────────────────────────
+
+const DESTINATION_COLUMNS: &str =
+    "id, name, kind, enabled, retention, created_at, updated_at FROM destinations";
+
+impl Store {
+    pub async fn list_destinations(&self) -> Result<Vec<Destination>> {
+        let rows = sqlx::query(&format!("SELECT {DESTINATION_COLUMNS} ORDER BY name"))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(row_to_destination).collect()
+    }
+
+    /// The destinations a backup actually ships to.
+    pub async fn list_enabled_destinations(&self) -> Result<Vec<Destination>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {DESTINATION_COLUMNS} WHERE enabled = 1 ORDER BY name"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(row_to_destination).collect()
+    }
+
+    pub async fn get_destination(&self, id: Uuid) -> Result<Option<Destination>> {
+        let row = sqlx::query(&format!("SELECT {DESTINATION_COLUMNS} WHERE id = ?1"))
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(row_to_destination).transpose()
+    }
+
+    pub async fn require_destination(&self, id: Uuid) -> Result<Destination> {
+        self.get_destination(id)
+            .await?
+            .ok_or(StoreError::DestinationNotFound(id))
+    }
+
+    pub async fn create_destination(&self, input: DestinationCreate) -> Result<Destination> {
+        let now = Utc::now();
+        let destination = Destination {
+            id: Uuid::new_v4(),
+            name: input.name.trim().to_string(),
+            kind: input.kind,
+            enabled: input.enabled,
+            retention: input.retention,
+            created_at: now,
+            updated_at: now,
+        };
+        // Refused here rather than at the point of use: a destination that
+        // cannot work is worse stored than rejected, because it looks
+        // configured and only fails at 3am.
+        destination
+            .validate()
+            .map_err(StoreError::InvalidDestination)?;
+
+        let result = sqlx::query(
+            "INSERT INTO destinations (id, name, kind, enabled, retention, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind(destination.id.to_string())
+        .bind(&destination.name)
+        .bind(serde_json::to_string(&destination.kind).map_err(|e| corrupt("kind", e))?)
+        .bind(destination.enabled)
+        .bind(serde_json::to_string(&destination.retention).map_err(|e| corrupt("retention", e))?)
+        .bind(destination.created_at.to_rfc3339())
+        .bind(destination.updated_at.to_rfc3339())
+        .execute(&self.pool)
+        .await;
+
+        match result {
+            Ok(_) => Ok(destination),
+            Err(e) if is_unique_violation(&e) => Err(StoreError::DuplicateName(destination.name)),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub async fn update_destination(
+        &self,
+        id: Uuid,
+        patch: DestinationUpdate,
+    ) -> Result<Destination> {
+        let mut d = self.require_destination(id).await?;
+
+        if let Some(v) = patch.name {
+            d.name = v.trim().to_string();
+        }
+        if let Some(v) = patch.kind {
+            d.kind = v;
+        }
+        if let Some(v) = patch.enabled {
+            d.enabled = v;
+        }
+        if let Some(v) = patch.retention {
+            d.retention = v;
+        }
+        d.updated_at = Utc::now();
+        d.validate().map_err(StoreError::InvalidDestination)?;
+
+        let result = sqlx::query(
+            "UPDATE destinations SET name = ?2, kind = ?3, enabled = ?4, retention = ?5, \
+             updated_at = ?6 WHERE id = ?1",
+        )
+        .bind(d.id.to_string())
+        .bind(&d.name)
+        .bind(serde_json::to_string(&d.kind).map_err(|e| corrupt("kind", e))?)
+        .bind(d.enabled)
+        .bind(serde_json::to_string(&d.retention).map_err(|e| corrupt("retention", e))?)
+        .bind(d.updated_at.to_rfc3339())
+        .execute(&self.pool)
+        .await;
+
+        match result {
+            Ok(_) => Ok(d),
+            Err(e) if is_unique_violation(&e) => Err(StoreError::DuplicateName(d.name)),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Remove the row only.
+    ///
+    /// The stored credential is **not** touched here — this module is SQLite
+    /// persistence, and reaching into the OS keychain from it would make every
+    /// test of this table need an unlocked one. Callers use
+    /// [`crate::ops::forget_destination`], which does both in the right order.
+    pub async fn delete_destination(&self, id: Uuid) -> Result<bool> {
+        let res = sqlx::query("DELETE FROM destinations WHERE id = ?1")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+}
+
+fn row_to_destination(row: sqlx::sqlite::SqliteRow) -> Result<Destination> {
+    Ok(Destination {
+        id: parse_uuid(&row.get::<String, _>("id"), "id")?,
+        name: row.get("name"),
+        kind: serde_json::from_str(&row.get::<String, _>("kind"))
+            .map_err(|e| corrupt("kind", e))?,
+        enabled: row.get("enabled"),
+        // A destination whose retention cannot be read must not fall back to
+        // "no policy": that reads as "keep everything", which is safe, but it
+        // is a different policy than the one the user set and would be silent.
+        retention: serde_json::from_str(&row.get::<String, _>("retention"))
+            .map_err(|e| corrupt("retention", e))?,
+        created_at: parse_ts(&row.get::<String, _>("created_at"), "created_at")?,
+        updated_at: parse_ts(&row.get::<String, _>("updated_at"), "updated_at")?,
+    })
 }
 
 // ── Application settings ────────────────────────────────────────────────

@@ -63,6 +63,8 @@ pub enum OpError {
     },
     #[error("job was cancelled")]
     Cancelled,
+    #[error("{0}")]
+    Destination(String),
 }
 
 /// A tunnel plus the local endpoint the tools should talk to.
@@ -526,6 +528,24 @@ pub struct SyncOutcome {
     pub masking: Option<MaskingReport>,
     /// Artifacts retention removed, if it ran.
     pub removed_artifacts: Vec<String>,
+    /// One entry per enabled off-site destination. Empty when none is set up.
+    ///
+    /// A entry carrying an error means that copy does not exist; see
+    /// [`push_offsite`].
+    #[serde(default)]
+    pub offsite: Vec<PushResult>,
+}
+
+impl SyncOutcome {
+    /// Whether every part of this run did what it claimed.
+    ///
+    /// A restore that landed and verified but never reached the off-site
+    /// destination it was configured to reach has not fully succeeded, and the
+    /// job history has to say so.
+    pub fn fully_succeeded(&self) -> bool {
+        self.verification.as_ref().is_none_or(|r| r.passed())
+            && self.offsite.iter().all(PushResult::succeeded)
+    }
 }
 
 /// Run a full source-to-destination sync.
@@ -560,6 +580,14 @@ pub async fn sync(
     // ── Backup ──────────────────────────────────────────────────────────
     let artifact = backup(source, &request.backup, store, ctx).await?;
     ctx.bail_if_cancelled().map_err(|_| OpError::Cancelled)?;
+
+    // ── Off-site copy ───────────────────────────────────────────────────
+    //
+    // Immediately after the artifact exists, and before the restore: the copy
+    // that survives losing this machine should not be waiting behind a restore
+    // that might fail. A failure here does not stop the sync — it is recorded
+    // and surfaces in the outcome.
+    let offsite = push_offsite(&artifact, store, ctx).await?;
 
     // ── Restore ─────────────────────────────────────────────────────────
     let restore_request = RestoreRequest {
@@ -628,15 +656,24 @@ pub async fn sync(
     // ── Retention ───────────────────────────────────────────────────────
     //
     // Deliberately after verification: a failed verification is exactly when
-    // the older backups matter most.
+    // the older backups matter most. A failed off-site push counts the same
+    // way — this run did not produce the second copy it was meant to, so it
+    // has not earned the right to delete the older local ones.
+    let verified = verification.as_ref().is_none_or(|r| r.passed());
+    let copied = offsite.iter().all(PushResult::succeeded);
     let removed = match &request.retention {
-        Some(policy) if verification.as_ref().is_none_or(|r| r.passed()) => {
+        Some(policy) if verified && copied => {
             apply_retention(&request.backup.common.output_dir, *policy, ctx).await
         }
         Some(_) => {
+            let reason = if verified {
+                "the off-site copy failed"
+            } else {
+                "verification failed"
+            };
             ctx.emit_warn(
                 JobPhase::Cleanup,
-                "verification failed; keeping every existing backup",
+                format!("{reason}; keeping every existing backup"),
             )
             .await;
             Vec::new()
@@ -650,6 +687,7 @@ pub async fn sync(
         verification,
         masking,
         removed_artifacts: removed,
+        offsite,
     })
 }
 
@@ -967,6 +1005,364 @@ pub async fn apply_retention(
     .await;
 
     removed
+}
+
+// ── Off-site destinations ───────────────────────────────────────────────
+
+/// What one destination did with one artifact.
+///
+/// Every field is present whether or not the push worked, because "which
+/// bucket did this fail to reach" is the first question asked about a failure.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct PushResult {
+    pub destination_id: uuid::Uuid,
+    pub destination_name: String,
+    /// Human-readable location of the destination, e.g. `s3://backups/prod`.
+    pub location: String,
+    /// The object key the artifact was sent to, prefix included.
+    pub key: String,
+    /// Where the object itself is, ready to paste into a console or a ticket.
+    ///
+    /// Stored rather than composed by each caller, because composing it from
+    /// `location` and `key` repeats the prefix.
+    pub url: String,
+    #[specta(type = f64)]
+    pub bytes: u64,
+    /// `None` on success. Anything else means **there is no off-site copy**.
+    pub error: Option<String>,
+    /// Objects off-site retention removed after a successful push.
+    pub removed: Vec<String>,
+}
+
+impl PushResult {
+    pub const fn succeeded(&self) -> bool {
+        self.error.is_none()
+    }
+}
+
+/// Send an artifact to every enabled destination.
+///
+/// # Why this never returns `Err` for a transport failure
+///
+/// One unreachable bucket must not stop the others from being tried, and it
+/// must not hide the ones that worked. Each destination gets its own
+/// [`PushResult`], and the caller decides what a failure means for the job as a
+/// whole — the same shape verification already has.
+///
+/// # Why a failure here is not cosmetic
+///
+/// A destination exists because a local-only backup is one failure from gone.
+/// If the copy silently does not happen, the operator believes they are covered
+/// and they are not, which is worse than not having configured one. Callers are
+/// expected to fail the job: see [`push_failures`].
+pub async fn push_offsite(
+    artifact: &std::path::Path,
+    store: &Store,
+    ctx: &JobContext,
+) -> Result<Vec<PushResult>, OpError> {
+    let destinations = store.list_enabled_destinations().await?;
+    if destinations.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    ctx.emit(
+        JobPhase::Transfer,
+        format!(
+            "sending {} to {} off-site destination(s)",
+            artifact
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            destinations.len()
+        ),
+    )
+    .await;
+
+    let mut results = Vec::new();
+    for destination in destinations {
+        results.push(push_one(artifact, &destination, ctx).await);
+    }
+    Ok(results)
+}
+
+/// The destinations a push failed to reach, named for a log line.
+pub fn push_failures(results: &[PushResult]) -> Vec<String> {
+    results
+        .iter()
+        .filter(|r| !r.succeeded())
+        .map(|r| {
+            format!(
+                "{}: {}",
+                r.destination_name,
+                r.error.as_deref().unwrap_or("unknown error")
+            )
+        })
+        .collect()
+}
+
+async fn push_one(
+    artifact: &std::path::Path,
+    destination: &crate::destination::Destination,
+    ctx: &JobContext,
+) -> PushResult {
+    let filename = artifact
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let key = destination.key_for(&filename);
+    let mut result = PushResult {
+        destination_id: destination.id,
+        destination_name: destination.name.clone(),
+        location: destination.kind.describe(),
+        url: destination.object_url(&key),
+        key,
+        bytes: 0,
+        error: None,
+        removed: Vec::new(),
+    };
+
+    match upload_to(artifact, destination, &result.key, ctx).await {
+        Ok((bytes, removed)) => {
+            result.bytes = bytes;
+            result.removed = removed;
+            ctx.emit(
+                JobPhase::Transfer,
+                format!("{filename} is now at {} ({bytes} bytes)", result.url),
+            )
+            .await;
+        }
+        Err(e) => {
+            ctx.emit_error(
+                JobPhase::Transfer,
+                format!(
+                    "off-site copy to {} FAILED: {e}. The local artifact at {} is unaffected",
+                    result.location,
+                    artifact.display()
+                ),
+            )
+            .await;
+            result.error = Some(e);
+        }
+    }
+
+    result
+}
+
+/// The upload itself, with every failure flattened into a message.
+async fn upload_to(
+    artifact: &std::path::Path,
+    destination: &crate::destination::Destination,
+    key: &str,
+    ctx: &JobContext,
+) -> Result<(u64, Vec<String>), String> {
+    let crate::destination::DestinationKind::S3(config) = &destination.kind;
+
+    let secret = secrets::get_secret(destination.id, SecretKind::ObjectStoreSecret)
+        .map_err(|e| format!("could not read the credential from the keychain: {e}"))?
+        .ok_or_else(|| {
+            format!(
+                "no secret access key is stored for {:?}; set one before it is relied on",
+                destination.name
+            )
+        })?;
+
+    let client = crate::s3::S3Client::new(config.to_config(secret)).map_err(|e| e.to_string())?;
+
+    // Before the bytes rather than after: a wrong bucket or an expired key is
+    // a two-second answer here and a full re-upload otherwise.
+    client
+        .check_access()
+        .await
+        .map_err(|e| format!("the destination is not usable: {e}"))?;
+
+    // `upload_file` reports progress from a synchronous callback, and emitting
+    // an event is async. The channel is the join between them; a bounded
+    // buffer would make a fast upload block on the log.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
+    let pump = tokio::spawn({
+        let ctx = ctx.clone();
+        let key = key.to_string();
+        async move {
+            while let Some((sent, total)) = rx.recv().await {
+                ctx.emit_event(
+                    crate::events::ProgressEvent::new(
+                        ctx.job_id,
+                        JobPhase::Transfer,
+                        format!("uploading {key}"),
+                    )
+                    .with_progress(sent, total),
+                )
+                .await;
+            }
+        }
+    });
+
+    let uploaded = {
+        let mut progress = |sent, total| {
+            let _ = tx.send((sent, total));
+        };
+        let cancelled = || ctx.is_cancelled();
+        let out = client
+            .upload_file(artifact, key, &mut progress, &cancelled)
+            .await;
+        // Dropping the sender is what ends the pump; without it the await below
+        // never returns.
+        drop(tx);
+        out.map_err(|e| e.to_string())?
+    };
+    let _ = pump.await;
+
+    // The manifest is what makes the copy restorable and checkable. An
+    // artifact off-site without one can still be restored, but nothing can say
+    // whether it arrived intact — so a manifest that fails to upload fails the
+    // push rather than leaving a copy that cannot be verified.
+    let manifest = crate::manifest::BackupManifest::path_for(artifact);
+    if manifest.exists() {
+        let manifest_key = format!("{key}{}", crate::destination::MANIFEST_SUFFIX);
+        let mut silent = |_, _| {};
+        client
+            .upload_file(&manifest, &manifest_key, &mut silent, &|| {
+                ctx.is_cancelled()
+            })
+            .await
+            .map_err(|e| format!("the artifact uploaded but its manifest did not: {e}"))?;
+    }
+
+    let removed = apply_offsite_retention(&client, destination, ctx).await;
+    Ok((uploaded, removed))
+}
+
+/// Apply a destination's retention policy to what it already holds.
+///
+/// Never fails the push: the copy that was just made is the point, and losing
+/// the ability to tidy up older ones does not undo it. Problems are logged.
+async fn apply_offsite_retention(
+    client: &crate::s3::S3Client,
+    destination: &crate::destination::Destination,
+    ctx: &JobContext,
+) -> Vec<String> {
+    if !destination.retention.is_enabled() {
+        return Vec::new();
+    }
+
+    let objects = match client.list(&destination.list_prefix()).await {
+        Ok(objects) => objects,
+        Err(e) => {
+            ctx.emit_warn(
+                JobPhase::Cleanup,
+                format!(
+                    "could not list {} to apply its retention policy, so nothing was removed: {e}",
+                    destination.name
+                ),
+            )
+            .await;
+            return Vec::new();
+        }
+    };
+
+    let candidates: Vec<crate::retention::RetentionCandidate> = objects
+        .into_iter()
+        // A manifest is not one of the copies being kept, and an object with
+        // no readable timestamp cannot be aged — treating either as a
+        // candidate would delete by a number that means nothing.
+        .filter(|o| crate::destination::is_artifact_key(&o.key))
+        .filter_map(|o| {
+            Some(crate::retention::RetentionCandidate {
+                path: o.key,
+                created_at: o.last_modified?,
+                size_bytes: o.size,
+            })
+        })
+        .collect();
+
+    let plan =
+        crate::retention::plan_retention(candidates, destination.retention, chrono::Utc::now());
+    if plan.delete.is_empty() {
+        return Vec::new();
+    }
+
+    let mut removed = Vec::new();
+    for candidate in &plan.delete {
+        ctx.emit(
+            JobPhase::Cleanup,
+            format!("off-site retention will remove {}", candidate.path),
+        )
+        .await;
+
+        if let Err(e) = client.delete(&candidate.path).await {
+            ctx.emit_warn(
+                JobPhase::Cleanup,
+                format!("could not remove {}: {e}", candidate.path),
+            )
+            .await;
+            continue;
+        }
+        // An orphaned manifest would make a later listing describe an object
+        // that is no longer there.
+        let _ = client
+            .delete(&format!(
+                "{}{}",
+                candidate.path,
+                crate::destination::MANIFEST_SUFFIX
+            ))
+            .await;
+        removed.push(candidate.path.clone());
+    }
+
+    ctx.emit(
+        JobPhase::Cleanup,
+        format!(
+            "off-site retention removed {} artifact(s) from {}",
+            removed.len(),
+            destination.name
+        ),
+    )
+    .await;
+
+    removed
+}
+
+/// Delete a destination and the credential belonging to it.
+///
+/// The keychain entry goes first. The other order can leave a credential that
+/// nothing points at: invisible in the app, still in the keychain, and with no
+/// remaining way to remove it from inside the product.
+///
+/// This is the function to call rather than [`Store::delete_destination`],
+/// which deliberately only removes the row.
+pub async fn forget_destination(store: &Store, id: uuid::Uuid) -> Result<bool, OpError> {
+    secrets::delete_for_destination(id).map_err(ConnectError::Secrets)?;
+    Ok(store.delete_destination(id).await?)
+}
+
+/// Check that a destination is usable, without sending anything.
+///
+/// What "usable" means here is deliberately narrow and stated in full: the
+/// endpoint resolves, the credential is accepted, and the bucket exists and can
+/// be listed. It does not prove the credential can *write*, which only a write
+/// proves — see [`push_offsite`].
+pub async fn test_destination(
+    destination: &crate::destination::Destination,
+) -> Result<(), OpError> {
+    let crate::destination::DestinationKind::S3(config) = &destination.kind;
+
+    let secret = secrets::get_secret(destination.id, SecretKind::ObjectStoreSecret)
+        .map_err(ConnectError::Secrets)?
+        .ok_or_else(|| {
+            OpError::Destination(format!(
+                "no secret access key is stored for {:?}",
+                destination.name
+            ))
+        })?;
+
+    let client = crate::s3::S3Client::new(config.to_config(secret))
+        .map_err(|e| OpError::Destination(e.to_string()))?;
+    client
+        .check_access()
+        .await
+        .map_err(|e| OpError::Destination(e.to_string()))?;
+    Ok(())
 }
 
 // ── Restore drills ──────────────────────────────────────────────────────

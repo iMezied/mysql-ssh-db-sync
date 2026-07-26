@@ -84,6 +84,13 @@ enum Command {
     /// Manage the backup encryption key.
     #[command(subcommand)]
     Key(KeyCommand),
+    /// Manage off-site destinations.
+    ///
+    /// A backup that only exists on the machine that made it is one failure
+    /// away from not existing. A destination is the second copy: every backup
+    /// is uploaded to each enabled destination as soon as it is written.
+    #[command(subcommand)]
+    Destination(DestinationCommand),
     /// Run the scheduler in the foreground until interrupted.
     ///
     /// The desktop app runs this same loop internally; use this to run
@@ -93,6 +100,89 @@ enum Command {
         /// there is nothing to gain below about 30.
         #[arg(long, default_value_t = 30)]
         interval: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum DestinationCommand {
+    /// List destinations and where they point.
+    List,
+    /// Add an S3-compatible destination.
+    ///
+    /// The secret access key is read from stdin, never from an argument: a
+    /// credential on the command line lands in shell history and is visible in
+    /// `ps` to every user on the machine.
+    Add {
+        /// Name used in logs and in every other command here.
+        #[arg(long)]
+        name: String,
+        /// Base URL with scheme, e.g. https://s3.eu-west-1.amazonaws.com
+        #[arg(long)]
+        endpoint: String,
+        #[arg(long)]
+        bucket: String,
+        /// Use us-east-1 if the provider does not have regions.
+        #[arg(long, default_value = "us-east-1")]
+        region: String,
+        /// Key prefix, so one bucket can hold several sources.
+        #[arg(long, default_value = "")]
+        prefix: String,
+        /// Address the bucket by path. Required by MinIO and most
+        /// self-hosted gateways.
+        #[arg(long)]
+        path_style: bool,
+        #[arg(long)]
+        access_key_id: String,
+        /// Keep at most this many artifacts at the destination.
+        #[arg(long)]
+        keep_last: Option<u32>,
+        /// Remove artifacts at the destination older than this many days.
+        #[arg(long)]
+        max_age_days: Option<u32>,
+    },
+    /// Replace a destination's secret access key, read from stdin.
+    SetKey {
+        /// Id, or a unique prefix of the name.
+        destination: String,
+    },
+    /// Check that a destination is reachable and the credential is accepted.
+    ///
+    /// Proves the endpoint resolves, the credential is valid and the bucket
+    /// can be listed. It does not prove the credential can write — only a
+    /// write proves that, so `push` is the stronger check.
+    Test {
+        /// Id, or a unique prefix of the name. Omit to test every destination.
+        destination: Option<String>,
+    },
+    /// Start or stop using a destination, keeping its configuration.
+    Enable {
+        destination: String,
+    },
+    Disable {
+        destination: String,
+    },
+    /// Set what a destination keeps. Passing neither limit clears the policy.
+    Retention {
+        destination: String,
+        #[arg(long)]
+        keep_last: Option<u32>,
+        #[arg(long)]
+        max_age_days: Option<u32>,
+    },
+    /// Upload an existing artifact to every enabled destination.
+    ///
+    /// For backfilling artifacts taken before a destination was configured,
+    /// and for retrying one whose upload failed. Exits non-zero if any
+    /// destination could not be reached.
+    Push {
+        /// Path to the artifact. Its manifest is sent alongside it.
+        artifact: PathBuf,
+    },
+    /// Delete a destination and its stored credential.
+    ///
+    /// Objects already at the destination are left where they are.
+    Remove {
+        destination: String,
     },
 }
 
@@ -333,6 +423,12 @@ async fn main() -> Result<()> {
             store.close().await;
             result?;
         }
+        Command::Destination(cmd) => {
+            let store = Store::open(&store_path).await?;
+            let result = run_destination_command(cmd, &store, cli.json).await;
+            store.close().await;
+            result?;
+        }
         Command::Daemon { interval } => {
             let store = Store::open(&store_path).await?;
             let (event_tx, _rx) = create_event_channel(EVENT_CHANNEL_CAPACITY);
@@ -476,6 +572,286 @@ fn default_restore_options(
             )
         }
     }
+}
+
+// ── Off-site destinations ───────────────────────────────────────────────
+
+async fn resolve_destination(
+    store: &Store,
+    needle: &str,
+) -> Result<db_sync_engine::destination::Destination> {
+    if let Ok(id) = Uuid::parse_str(needle) {
+        return Ok(store.require_destination(id).await?);
+    }
+
+    let all = store.list_destinations().await?;
+    let lowered = needle.to_lowercase();
+    let matches: Vec<_> = all
+        .iter()
+        .filter(|d| d.name.to_lowercase().starts_with(&lowered))
+        .collect();
+
+    match matches.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => bail!("no destination matches {needle:?}; `dbsync destination list` shows them"),
+        many => {
+            let names: Vec<&str> = many.iter().map(|d| d.name.as_str()).collect();
+            bail!(
+                "{needle:?} matches several destinations: {}",
+                names.join(", ")
+            )
+        }
+    }
+}
+
+/// Read a credential from stdin.
+///
+/// Never an argument. A secret on the command line is written to shell history
+/// and is readable in `ps` by every other user on the machine.
+fn read_credential(prompt: &str) -> Result<String> {
+    eprintln!("{prompt}");
+    let mut secret = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut secret)
+        .context("could not read the key from stdin")?;
+
+    let secret = secret.trim().to_string();
+    if secret.is_empty() {
+        bail!("no key was supplied, so nothing was changed");
+    }
+    Ok(secret)
+}
+
+fn describe_retention(policy: db_sync_engine::retention::RetentionPolicy) -> String {
+    match (policy.keep_last, policy.max_age_days) {
+        (None, None) => "keeps everything".to_string(),
+        (Some(n), None) => format!("keeps the newest {n}"),
+        (None, Some(d)) => format!("keeps {d} days"),
+        (Some(n), Some(d)) => format!("keeps the newest {n}, and at most {d} days"),
+    }
+}
+
+async fn run_destination_command(cmd: DestinationCommand, store: &Store, json: bool) -> Result<()> {
+    use db_sync_engine::destination::{
+        DestinationCreate, DestinationKind, DestinationUpdate, S3Destination,
+    };
+    use db_sync_engine::retention::RetentionPolicy;
+    use db_sync_engine::secrets::{self, SecretKind};
+
+    match cmd {
+        DestinationCommand::List => {
+            let all = store.list_destinations().await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&all)?);
+                return Ok(());
+            }
+            if all.is_empty() {
+                eprintln!("no off-site destinations configured");
+                eprintln!("backups are being kept only on this machine");
+                return Ok(());
+            }
+            for d in &all {
+                // Whether a credential exists is shown; the credential is not.
+                // A destination with no key is configured and unusable, which
+                // is the state most worth surfacing in a list.
+                let keyed =
+                    secrets::has_secret(d.id, SecretKind::ObjectStoreSecret).unwrap_or(false);
+                println!(
+                    "{:<20} {:<40} {:<9} {:<12} {}",
+                    d.name,
+                    d.kind.describe(),
+                    if d.enabled { "enabled" } else { "disabled" },
+                    if keyed { "has key" } else { "NO KEY" },
+                    describe_retention(d.retention),
+                );
+            }
+        }
+
+        DestinationCommand::Add {
+            name,
+            endpoint,
+            bucket,
+            region,
+            prefix,
+            path_style,
+            access_key_id,
+            keep_last,
+            max_age_days,
+        } => {
+            let secret = read_credential("paste the secret access key, then press Ctrl-D:")?;
+
+            let created = store
+                .create_destination(DestinationCreate {
+                    name,
+                    kind: DestinationKind::S3(S3Destination {
+                        endpoint,
+                        region,
+                        bucket,
+                        prefix,
+                        path_style,
+                        access_key_id,
+                    }),
+                    enabled: true,
+                    retention: RetentionPolicy {
+                        keep_last,
+                        max_age_days,
+                    },
+                })
+                .await?;
+
+            secrets::set_secret(created.id, SecretKind::ObjectStoreSecret, &secret)?;
+
+            // Checked immediately rather than at the next backup: a typo in a
+            // bucket name is cheap to fix now and expensive to discover at 3am.
+            match db_sync_engine::ops::test_destination(&created).await {
+                Ok(()) => eprintln!("added {:?} — {}", created.name, created.kind.describe()),
+                Err(e) => {
+                    eprintln!("added {:?}, but it is not usable yet: {e}", created.name);
+                    eprintln!(
+                        "fix it and re-check with `dbsync destination test {}`",
+                        created.name
+                    );
+                }
+            }
+            println!("{}", created.id);
+        }
+
+        DestinationCommand::SetKey { destination } => {
+            let d = resolve_destination(store, &destination).await?;
+            let secret = read_credential("paste the new secret access key, then press Ctrl-D:")?;
+            secrets::set_secret(d.id, SecretKind::ObjectStoreSecret, &secret)?;
+
+            match db_sync_engine::ops::test_destination(&d).await {
+                Ok(()) => eprintln!("the new key for {:?} works", d.name),
+                Err(e) => bail!("the new key was stored but is not accepted: {e}"),
+            }
+        }
+
+        DestinationCommand::Test { destination } => {
+            let targets = match destination {
+                Some(needle) => vec![resolve_destination(store, &needle).await?],
+                None => store.list_destinations().await?,
+            };
+            if targets.is_empty() {
+                eprintln!("no off-site destinations configured");
+                return Ok(());
+            }
+
+            let mut failed = 0;
+            for d in &targets {
+                match db_sync_engine::ops::test_destination(d).await {
+                    Ok(()) => println!("{:<20} ok    {}", d.name, d.kind.describe()),
+                    Err(e) => {
+                        failed += 1;
+                        println!("{:<20} FAIL  {e}", d.name);
+                    }
+                }
+            }
+            // Non-zero so this is usable as a health check in cron or CI.
+            if failed > 0 {
+                bail!(
+                    "{failed} of {} destination(s) are not usable",
+                    targets.len()
+                );
+            }
+        }
+
+        DestinationCommand::Enable { destination } => {
+            let d = resolve_destination(store, &destination).await?;
+            store
+                .update_destination(
+                    d.id,
+                    DestinationUpdate {
+                        enabled: Some(true),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            eprintln!("{:?} will receive future backups", d.name);
+        }
+
+        DestinationCommand::Disable { destination } => {
+            let d = resolve_destination(store, &destination).await?;
+            store
+                .update_destination(
+                    d.id,
+                    DestinationUpdate {
+                        enabled: Some(false),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            eprintln!(
+                "{:?} will be skipped; its configuration and key are kept",
+                d.name
+            );
+        }
+
+        DestinationCommand::Retention {
+            destination,
+            keep_last,
+            max_age_days,
+        } => {
+            let d = resolve_destination(store, &destination).await?;
+            let policy = RetentionPolicy {
+                keep_last,
+                max_age_days,
+            };
+            store
+                .update_destination(
+                    d.id,
+                    DestinationUpdate {
+                        retention: Some(policy),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            eprintln!("{:?} now {}", d.name, describe_retention(policy));
+        }
+
+        DestinationCommand::Push { artifact } => {
+            if !artifact.is_file() {
+                bail!("{} is not a file", artifact.display());
+            }
+
+            let ctx = JobContext::new(Uuid::new_v4());
+            if json {
+                tokio::spawn(stream_channel_as_json(ctx.subscribe()));
+            } else {
+                tokio::spawn(stream_channel_as_text(ctx.subscribe()));
+            }
+
+            let results = db_sync_engine::ops::push_offsite(&artifact, store, &ctx).await?;
+            if results.is_empty() {
+                eprintln!("no enabled destinations; nothing was uploaded");
+                return Ok(());
+            }
+
+            for r in &results {
+                match &r.error {
+                    None => println!("{:<20} ok    {}", r.destination_name, r.url),
+                    Some(e) => println!("{:<20} FAIL  {e}", r.destination_name),
+                }
+            }
+
+            let failures = db_sync_engine::ops::push_failures(&results);
+            if !failures.is_empty() {
+                bail!(
+                    "{} destination(s) failed: {}",
+                    failures.len(),
+                    failures.join("; ")
+                );
+            }
+        }
+
+        DestinationCommand::Remove { destination } => {
+            let d = resolve_destination(store, &destination).await?;
+            db_sync_engine::ops::forget_destination(store, d.id).await?;
+            eprintln!("removed {:?} and its stored key", d.name);
+            eprintln!("objects already at {} were left alone", d.kind.describe());
+        }
+    }
+
+    Ok(())
 }
 
 // ── Backup key ──────────────────────────────────────────────────────────

@@ -23,6 +23,14 @@ pub const MULTIPART_THRESHOLD: u64 = 64 * 1024 * 1024;
 /// Size of each part. S3 requires at least 5 MiB for every part but the last.
 pub const PART_SIZE: u64 = 16 * 1024 * 1024;
 
+/// Keys requested per listing round trip. 1000 is the S3 maximum and default.
+///
+/// The number matters less than the fact that [`S3Client::list`] follows the
+/// continuation token past it. A listing that stops at the first page is how
+/// off-site retention would decide what to keep while seeing only part of what
+/// is there.
+pub const LIST_PAGE_SIZE: u32 = 1000;
+
 /// The service name in the credential scope. Fixed for object storage.
 const SERVICE: &str = "s3";
 
@@ -81,6 +89,13 @@ pub enum S3Error {
 pub struct ObjectInfo {
     pub key: String,
     pub size: u64,
+    /// When the object was last written, as the server reports it.
+    ///
+    /// `None` when the timestamp was missing or unparseable. Off-site retention
+    /// treats that as "do not touch this" rather than substituting the current
+    /// time, which would make an unreadable date look like a brand-new object —
+    /// or, with the opposite default, delete one that might be the only copy.
+    pub last_modified: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// One request, before it is signed.
@@ -303,11 +318,9 @@ impl S3Client {
         // empty result *without checking the bucket exists*, so a typo'd
         // bucket name passed this check and failed at upload time instead.
         // Asking for one key takes the path the server actually validates.
-        self.send(
-            Request::new("checking bucket access", reqwest::Method::GET, "")
-                .query("list-type=2&max-keys=1"),
-        )
-        .await?;
+        let query = sign::canonical_query(&[("list-type", "2"), ("max-keys", "1")]);
+        self.send(Request::new("checking bucket access", reqwest::Method::GET, "").query(&query))
+            .await?;
         Ok(())
     }
 
@@ -369,22 +382,64 @@ impl S3Client {
         }
     }
 
+    /// Every object under a prefix, following continuation tokens to the end.
     pub async fn list(&self, prefix: &str) -> Result<Vec<ObjectInfo>, S3Error> {
-        let query = format!("list-type=2&prefix={}", sign::uri_encode(prefix, true));
-        let (_, _, body) = self
-            .send(Request::new("listing objects", reqwest::Method::GET, "").query(&query))
-            .await?;
+        self.list_paged(prefix, LIST_PAGE_SIZE).await
+    }
 
-        let keys = xml::all(&body, "Key");
-        let sizes = xml::all(&body, "Size");
-        Ok(keys
-            .into_iter()
-            .zip(sizes)
-            .map(|(key, size)| ObjectInfo {
-                key,
-                size: size.parse().unwrap_or(0),
-            })
-            .collect())
+    /// [`S3Client::list`] with an explicit page size.
+    ///
+    /// Exists so the pagination can be exercised against a real server without
+    /// uploading a thousand objects: ask for one key at a time and the
+    /// continuation path is the only path.
+    pub async fn list_paged(
+        &self,
+        prefix: &str,
+        page_size: u32,
+    ) -> Result<Vec<ObjectInfo>, S3Error> {
+        let page_size = page_size.clamp(1, LIST_PAGE_SIZE).to_string();
+        let mut out = Vec::new();
+        let mut token: Option<String> = None;
+
+        loop {
+            let mut params = vec![
+                ("list-type", "2"),
+                ("max-keys", page_size.as_str()),
+                ("prefix", prefix),
+            ];
+            if let Some(t) = &token {
+                params.push(("continuation-token", t.as_str()));
+            }
+
+            let (_, _, body) = self
+                .send(
+                    Request::new("listing objects", reqwest::Method::GET, "")
+                        .query(&sign::canonical_query(&params)),
+                )
+                .await?;
+
+            out.extend(parse_listing(&body));
+
+            // `IsTruncated` is the server's own statement that there is more.
+            // Stopping on an empty page instead would end the listing early
+            // whenever a page is filtered down to nothing.
+            let truncated = xml::first(&body, "IsTruncated").as_deref() == Some("true");
+            token = xml::first(&body, "NextContinuationToken");
+
+            match (truncated, &token) {
+                (true, Some(_)) => continue,
+                (true, None) => {
+                    // The server says there is more and did not say where to
+                    // resume. Returning a short list as if it were complete is
+                    // what retention would then act on.
+                    return Err(S3Error::Invalid(format!(
+                        "the listing of {prefix:?} is incomplete: the server reported more \
+                         results but sent no continuation token"
+                    )));
+                }
+                (false, _) => return Ok(out),
+            }
+        }
     }
 
     pub async fn delete(&self, key: &str) -> Result<(), S3Error> {
@@ -406,8 +461,8 @@ impl S3Client {
         &self,
         path: &Path,
         key: &str,
-        progress: &mut dyn FnMut(u64, u64),
-        cancelled: &dyn Fn() -> bool,
+        progress: &mut (dyn FnMut(u64, u64) + Send),
+        cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<u64, S3Error> {
         let metadata = tokio::fs::metadata(path)
             .await
@@ -445,7 +500,7 @@ impl S3Client {
         path: &Path,
         key: &str,
         total: u64,
-        progress: &mut dyn FnMut(u64, u64),
+        progress: &mut (dyn FnMut(u64, u64) + Send),
     ) -> Result<(), S3Error> {
         let body = tokio::fs::read(path).await.map_err(|source| S3Error::Io {
             path: path.display().to_string(),
@@ -464,13 +519,14 @@ impl S3Client {
         path: &Path,
         key: &str,
         total: u64,
-        progress: &mut dyn FnMut(u64, u64),
-        cancelled: &dyn Fn() -> bool,
+        progress: &mut (dyn FnMut(u64, u64) + Send),
+        cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<(), S3Error> {
+        let query = sign::canonical_query(&[("uploads", "")]);
         let (_, _, body) = self
             .send(
                 Request::new("starting a multipart upload", reqwest::Method::POST, key)
-                    .query("uploads="),
+                    .query(&query),
             )
             .await?;
 
@@ -501,8 +557,8 @@ impl S3Client {
         key: &str,
         upload_id: &str,
         total: u64,
-        progress: &mut dyn FnMut(u64, u64),
-        cancelled: &dyn Fn() -> bool,
+        progress: &mut (dyn FnMut(u64, u64) + Send),
+        cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<Vec<String>, S3Error> {
         let mut file = tokio::fs::File::open(path)
             .await
@@ -541,10 +597,9 @@ impl S3Client {
             buffer.truncate(filled);
 
             let hash = format!("{:x}", Sha256::digest(&buffer));
-            let query = format!(
-                "partNumber={part_number}&uploadId={}",
-                sign::uri_encode(upload_id, true)
-            );
+            let part = part_number.to_string();
+            let query =
+                sign::canonical_query(&[("partNumber", part.as_str()), ("uploadId", upload_id)]);
 
             let (_, headers, _) = self
                 .send(
@@ -588,7 +643,7 @@ impl S3Client {
         }
         body.push_str("</CompleteMultipartUpload>");
 
-        let query = format!("uploadId={}", sign::uri_encode(upload_id, true));
+        let query = sign::canonical_query(&[("uploadId", upload_id)]);
         let bytes = body.into_bytes();
 
         let (_, _, response) = self
@@ -614,13 +669,39 @@ impl S3Client {
     }
 
     async fn abort_multipart(&self, key: &str, upload_id: &str) -> Result<(), S3Error> {
-        let query = format!("uploadId={}", sign::uri_encode(upload_id, true));
+        let query = sign::canonical_query(&[("uploadId", upload_id)]);
         self.send(
             Request::new("aborting a multipart upload", reqwest::Method::DELETE, key).query(&query),
         )
         .await?;
         Ok(())
     }
+}
+
+/// Pull the objects out of one `ListObjectsV2` page.
+///
+/// Parsed one `<Contents>` block at a time rather than by collecting every
+/// `<Key>` and every `<Size>` into parallel lists and zipping them. The zip
+/// reads fine and is wrong the moment a single element is absent from one
+/// entry: every later object silently acquires the previous one's size and
+/// timestamp, and retention would then delete by the wrong dates.
+fn parse_listing(body: &str) -> Vec<ObjectInfo> {
+    body.split("<Contents>")
+        // The first chunk is everything before the first entry.
+        .skip(1)
+        .filter_map(|chunk| {
+            let entry = chunk.split("</Contents>").next().unwrap_or(chunk);
+            Some(ObjectInfo {
+                key: xml::first(entry, "Key")?,
+                size: xml::first(entry, "Size")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0),
+                last_modified: xml::first(entry, "LastModified")
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                    .map(|t| t.with_timezone(&chrono::Utc)),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -741,6 +822,71 @@ mod tests {
             rendered.contains("AKIDEXAMPLE"),
             "the key id is not secret and is useful in a log: {rendered}"
         );
+    }
+
+    // ── Listing ─────────────────────────────────────────────────────────
+
+    const PAGE: &str = "<ListBucketResult>\
+        <Name>backups</Name><Prefix>prod/</Prefix><KeyCount>2</KeyCount>\
+        <Contents><Key>prod/a.sql.gz</Key>\
+          <LastModified>2026-07-20T03:00:00.000Z</LastModified>\
+          <Size>1024</Size></Contents>\
+        <Contents><Key>prod/b.sql.gz</Key>\
+          <LastModified>2026-07-26T03:00:00.000Z</LastModified>\
+          <Size>2048</Size></Contents>\
+        </ListBucketResult>";
+
+    #[test]
+    fn a_listing_page_is_parsed_entry_by_entry() {
+        let objects = parse_listing(PAGE);
+        assert_eq!(objects.len(), 2);
+        assert_eq!(objects[0].key, "prod/a.sql.gz");
+        assert_eq!(objects[0].size, 1024);
+        assert_eq!(objects[1].size, 2048);
+        assert!(objects[0].last_modified.unwrap() < objects[1].last_modified.unwrap());
+    }
+
+    #[test]
+    fn the_bucket_name_is_not_mistaken_for_an_object() {
+        // `<Name>` and `<Prefix>` sit outside `<Contents>`; parsing the whole
+        // document flat would pick them up.
+        assert!(
+            parse_listing(PAGE)
+                .iter()
+                .all(|o| o.key.starts_with("prod/"))
+        );
+    }
+
+    #[test]
+    fn an_entry_missing_a_size_does_not_shift_the_others() {
+        // The exact failure that zipping parallel `<Key>`/`<Size>` lists
+        // produces: every object after the gap inherits its neighbour's size,
+        // and a retention decision is then made on numbers belonging to a
+        // different file.
+        let xml = "<ListBucketResult>\
+            <Contents><Key>a</Key></Contents>\
+            <Contents><Key>b</Key><Size>77</Size></Contents>\
+            </ListBucketResult>";
+
+        let objects = parse_listing(xml);
+        assert_eq!(objects.len(), 2);
+        assert_eq!(objects[0].key, "a");
+        assert_eq!(objects[0].size, 0, "unknown, not b's size");
+        assert_eq!(objects[1].key, "b");
+        assert_eq!(objects[1].size, 77);
+    }
+
+    #[test]
+    fn an_unparseable_timestamp_reads_as_unknown_rather_than_now() {
+        let xml = "<ListBucketResult><Contents><Key>a</Key>\
+            <LastModified>whenever</LastModified><Size>1</Size></Contents></ListBucketResult>";
+        assert_eq!(parse_listing(xml)[0].last_modified, None);
+    }
+
+    #[test]
+    fn an_empty_listing_parses_to_nothing() {
+        let xml = "<ListBucketResult><Name>backups</Name><KeyCount>0</KeyCount></ListBucketResult>";
+        assert!(parse_listing(xml).is_empty());
     }
 
     #[test]

@@ -55,6 +55,30 @@ pub fn uri_encode(input: &str, encode_slash: bool) -> String {
     out
 }
 
+/// Build a canonical query string: every pair percent-encoded, sorted by name.
+///
+/// The sort is not cosmetic. SigV4 signs the *sorted* form, so a request whose
+/// parameters go out in one order and were signed in another is a
+/// `403 SignatureDoesNotMatch` — an error that reads like a credentials problem
+/// and is not one. Assembling the string here rather than by `format!` at each
+/// call site means adding a parameter cannot silently break the signature,
+/// which is exactly the mistake that is invisible until it happens.
+pub fn canonical_query(params: &[(&str, &str)]) -> String {
+    // Sorted after encoding, by name and then by value, which is what the
+    // specification says and is not always the same as sorting the raw text.
+    let mut encoded: Vec<(String, String)> = params
+        .iter()
+        .map(|(name, value)| (uri_encode(name, true), uri_encode(value, true)))
+        .collect();
+    encoded.sort();
+
+    encoded
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
 /// One header, already lowercased and trimmed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Header {
@@ -226,6 +250,54 @@ mod tests {
             "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, \
              SignedHeaders=host;x-amz-date, \
              Signature=5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31"
+        );
+    }
+
+    #[test]
+    fn query_parameters_are_sorted_regardless_of_the_order_given() {
+        // The failure this prevents: a caller adds a parameter in a readable
+        // order, the signature covers the sorted order, and every request to
+        // that endpoint starts returning 403 SignatureDoesNotMatch.
+        assert_eq!(
+            canonical_query(&[
+                ("prefix", "prod/"),
+                ("list-type", "2"),
+                ("max-keys", "1000")
+            ]),
+            "list-type=2&max-keys=1000&prefix=prod%2F"
+        );
+    }
+
+    #[test]
+    fn query_values_are_encoded_including_slashes() {
+        // A prefix is a path and full of slashes; leaving them raw in the query
+        // signs one string and sends another.
+        assert_eq!(canonical_query(&[("prefix", "a/b c")]), "prefix=a%2Fb%20c");
+    }
+
+    #[test]
+    fn a_valueless_parameter_keeps_its_equals_sign() {
+        // `?uploads` is how a multipart upload is initiated, and S3 expects
+        // `uploads=` in the canonical form.
+        assert_eq!(canonical_query(&[("uploads", "")]), "uploads=");
+    }
+
+    #[test]
+    fn an_empty_parameter_list_is_an_empty_string() {
+        // Not "=", and not "?": a request with no query signs an empty line.
+        assert_eq!(canonical_query(&[]), "");
+    }
+
+    #[test]
+    fn a_continuation_token_survives_encoding() {
+        // These are opaque, server-generated, and routinely contain characters
+        // that must be escaped. Sending one back wrong ends the listing early
+        // and silently — the pagination equivalent of a truncated result.
+        let token = "1ueGcxLPRx1Tr/XYExHnhbYLgveDs2J/wm36Hy4vbOwM=";
+        let query = canonical_query(&[("continuation-token", token)]);
+        assert_eq!(
+            query,
+            "continuation-token=1ueGcxLPRx1Tr%2FXYExHnhbYLgveDs2J%2Fwm36Hy4vbOwM%3D"
         );
     }
 

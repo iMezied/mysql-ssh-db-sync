@@ -20,6 +20,7 @@ desktop app for DBAs, plus a headless CLI that does exactly the same things.
 - [Development setup](#development-setup)
 - [Scheduling](#scheduling)
 - [Masking](#masking)
+- [Off-site destinations](#off-site-destinations)
 - [Packaging](#packaging)
 - [Testing](#testing)
 - [Security model](#security-model)
@@ -345,6 +346,82 @@ the source by design, so they are recorded as *not compared* — the same as any
 other undigestable table, so masking cannot become a way for a genuinely broken
 table to report success.
 
+## Off-site destinations
+
+A backup that only exists on the machine that made it is one failure away from
+not existing — the same disk, the same laptop, the same office fire. A
+destination is the second copy: every backup is uploaded to each enabled
+destination as soon as it is written, before the restore half of a sync runs.
+
+Anything speaking the S3 API works: AWS, Cloudflare R2, Backblaze B2, Wasabi,
+MinIO.
+
+```bash
+# The secret access key is read from stdin, never from an argument.
+dbsync destination add \
+  --name off-site \
+  --endpoint https://s3.eu-west-1.amazonaws.com \
+  --bucket acme-backups \
+  --region eu-west-1 \
+  --prefix prod \
+  --access-key-id AKIA... \
+  --keep-last 30
+
+dbsync destination list
+dbsync destination test              # exits non-zero if any is unusable
+dbsync destination push backup.sql.gz   # backfill or retry one artifact
+```
+
+### What is guaranteed
+
+- **A failed upload fails the job.** A backup that was written locally but never
+  reached the destination it was configured to reach has not done what it said,
+  and job history records it as failed. Silently succeeding is the exact belief
+  a destination exists to prevent.
+- **The manifest travels with the artifact.** An artifact in a bucket with no
+  manifest can still be restored, but nothing can say whether it arrived intact.
+- **The upload is read back.** A `200` means the request was accepted, not that
+  the object is readable at the size that was sent. Every upload is followed by
+  a `HEAD` comparing the stored size.
+- **One broken destination does not stop another.** Each gets its own result;
+  two off-site copies exist precisely so that losing one is survivable.
+- **Retention will not run on a failed push.** If this run did not produce the
+  second copy it was meant to, it has not earned the right to delete the older
+  local ones.
+
+### Credentials and transport
+
+The secret access key lives in the OS keychain, keyed by the destination's id.
+Nothing in the `destinations` table is sensitive — endpoint, bucket, region and
+access key id only — so the row is safe to log, list and export, and there is no
+code path that has to remember to redact it.
+
+Plaintext `http://` endpoints are **refused** for anything but a loopback
+address. SigV4 authenticates a request; it does not encrypt one, so an `http://`
+destination would send both the backup and the credentials signing it across the
+network in the clear. `http://localhost.evil.example` is a remote host with a
+reassuring name and is refused too — the check is on the resolved host, not on
+the string.
+
+### Off-site retention
+
+Each destination has its own policy, separate from the local one: off-site
+storage is usually cheaper and is the copy that survives losing the machine, so
+keeping more there than locally is the normal case. The same guarantee applies
+as locally — **the newest artifact is never deleted**, whatever the policy says.
+Manifests are not counted as artifacts, so `--keep-last 10` keeps ten backups
+rather than five.
+
+### What is verified, and what is not
+
+The signing is pinned against the published AWS SigV4 `get-vanilla` vector, and
+the client and the whole push path are exercised against MinIO: upload,
+read-back, list with pagination, delete, multipart, cancellation, a missing
+credential, a wrong credential, a missing bucket, and retention. **AWS itself,
+R2, B2 and Wasabi are not exercised by any test here.** They speak the same
+protocol and are expected to work, but that is an expectation rather than a
+result, so it is written down instead of implied.
+
 ## Packaging
 
 ```bash
@@ -522,6 +599,10 @@ a schedule that comes due, moves data, verifies it, and enforces retention.
   can ask for the key to be escrowed and is told where it landed; the secret
   itself never becomes a JS string. The file is created `0600` as part of
   opening it, so it is never briefly world-readable.
+- **Off-site destinations store no credential.** The secret access key is in the
+  keychain; the `destinations` table holds only an endpoint, bucket, region and
+  access key id. Plaintext `http://` endpoints are refused for anything but
+  loopback. See [Off-site destinations](#off-site-destinations).
 
 ## Roadmap
 
@@ -538,10 +619,11 @@ a schedule that comes due, moves data, verifies it, and enforces retention.
 | **M7** | Verification beyond row counts: content digests and column comparison | **Done** |
 | **M8** | Restore drills — proving an artifact restores, on a schedule | **Done** |
 | **M9** | Column-level masking on the destination, with a verified read-back | **Done** |
+| **M10** | Off-site destinations: S3-compatible upload, credentials, off-site retention, CLI | **Partly** — no GUI page yet |
 | **M12** | Slack and Teams webhook rendering | **Partly** — library analytics outstanding |
 
-Outstanding: off-site destinations (M10), team features (M13), MongoDB and SQL
-Server (M14), and library size/growth analytics. Restore drills have no
+Outstanding: a destinations page in the GUI, team features (M13), MongoDB and
+SQL Server (M14), and library size/growth analytics. Restore drills have no
 scheduled kind — they run from cron or the CLI.
 
 Not in scope for v1: incremental/binlog/WAL sync, multi-user access control.

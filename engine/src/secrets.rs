@@ -25,6 +25,12 @@ pub enum SecretKind {
     /// artifact, so a restore does not depend on which profile made the backup.
     /// Stored under [`APP_SCOPE`] for that reason.
     BackupKey,
+    /// The secret access key of an off-site destination.
+    ///
+    /// Keyed by the *destination's* id rather than a profile's: a destination
+    /// belongs to the installation, not to one database, and several profiles
+    /// back up to the same bucket.
+    ObjectStoreSecret,
 }
 
 impl SecretKind {
@@ -33,6 +39,7 @@ impl SecretKind {
             SecretKind::DbPassword => "db",
             SecretKind::SshKeyPassphrase => "ssh",
             SecretKind::BackupKey => "backup-key",
+            SecretKind::ObjectStoreSecret => "object-store",
         }
     }
 }
@@ -126,7 +133,10 @@ pub fn has_secret(profile_id: Uuid, kind: SecretKind) -> Result<bool, SecretErro
 ///
 /// Deliberately does NOT touch [`SecretKind::BackupKey`]: that is
 /// application-scoped, and deleting a profile must never destroy the key that
-/// decrypts every artifact ever taken.
+/// decrypts every artifact ever taken. It also does not touch
+/// [`SecretKind::ObjectStoreSecret`], which belongs to a destination — several
+/// profiles ship to the same bucket, so deleting one must not lock the others
+/// out of it.
 pub fn delete_all_for_profile(profile_id: Uuid) -> Result<(), SecretError> {
     for kind in [SecretKind::DbPassword, SecretKind::SshKeyPassphrase] {
         let entry = keyring::Entry::new(KEYRING_SERVICE, &account(profile_id, kind))?;
@@ -136,6 +146,11 @@ pub fn delete_all_for_profile(profile_id: Uuid) -> Result<(), SecretError> {
         }
     }
     Ok(())
+}
+
+/// Remove the credential belonging to a destination, on its deletion.
+pub fn delete_for_destination(destination_id: Uuid) -> Result<(), SecretError> {
+    set_secret(destination_id, SecretKind::ObjectStoreSecret, "")
 }
 
 #[cfg(test)]

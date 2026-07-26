@@ -19,6 +19,7 @@ pub mod cron;
 pub mod crypto;
 pub mod db;
 pub mod definer;
+pub mod destination;
 pub mod events;
 pub mod exec;
 pub mod job;

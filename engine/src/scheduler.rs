@@ -401,20 +401,54 @@ impl Scheduler {
                     .await
                     .map_err(|e| e.to_string())?;
 
+                let offsite = ops::push_offsite(&artifact, &self.store, ctx)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let failures = ops::push_failures(&offsite);
+
+                // A local backup that never reached the destination it was
+                // configured to reach has not done what it said. Deleting the
+                // older local copies on top of that would remove the ones that
+                // are currently the only ones.
                 let removed = match schedule.action.retention {
-                    Some(policy) => {
+                    Some(policy) if failures.is_empty() => {
                         ops::apply_retention(&schedule.action.output_dir, policy, ctx).await
+                    }
+                    Some(_) => {
+                        ctx.emit_warn(
+                            JobPhase::Cleanup,
+                            "the off-site copy failed; keeping every existing backup",
+                        )
+                        .await;
+                        Vec::new()
                     }
                     None => Vec::new(),
                 };
 
+                if !failures.is_empty() {
+                    ctx.emit_error(
+                        JobPhase::Done,
+                        format!(
+                            "the backup was written locally but did not reach {} destination(s): {}",
+                            failures.len(),
+                            failures.join("; ")
+                        ),
+                    )
+                    .await;
+                }
+
                 Ok(RunResult {
-                    outcome: JobOutcome::Success,
+                    outcome: if failures.is_empty() {
+                        JobOutcome::Success
+                    } else {
+                        JobOutcome::Failed
+                    },
                     artifact: Some(artifact),
                     target_database: None,
                     verification: None,
                     removed_artifacts: removed.len(),
-                    error: None,
+                    error: (!failures.is_empty())
+                        .then(|| format!("off-site copy failed: {}", failures.join("; "))),
                 })
             }
 
@@ -464,8 +498,28 @@ impl Scheduler {
                     .await;
                 }
 
+                let failures = ops::push_failures(&out.offsite);
+                if !failures.is_empty() {
+                    ctx.emit_error(
+                        JobPhase::Done,
+                        format!("the off-site copy did not happen: {}", failures.join("; ")),
+                    )
+                    .await;
+                }
+
+                // Both halves have to hold. Reporting success because the data
+                // arrived, while the off-site copy silently did not, is exactly
+                // the belief a destination exists to prevent.
+                let mut problems = Vec::new();
+                if !verified {
+                    problems.push("verification found discrepancies".to_string());
+                }
+                if !failures.is_empty() {
+                    problems.push(format!("off-site copy failed: {}", failures.join("; ")));
+                }
+
                 Ok(RunResult {
-                    outcome: if verified {
+                    outcome: if problems.is_empty() {
                         JobOutcome::Success
                     } else {
                         JobOutcome::Failed
@@ -474,7 +528,7 @@ impl Scheduler {
                     target_database: Some(out.target_database.clone()),
                     verification: out.verification.clone(),
                     removed_artifacts: out.removed_artifacts.len(),
-                    error: (!verified).then(|| "verification found discrepancies".to_string()),
+                    error: (!problems.is_empty()).then(|| problems.join("; ")),
                 })
             }
         }

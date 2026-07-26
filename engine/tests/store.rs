@@ -6,6 +6,9 @@
 
 use chrono::Utc;
 use db_sync_engine::backup::TableSelection;
+use db_sync_engine::destination::{
+    DestinationCreate, DestinationKind, DestinationUpdate, S3Destination,
+};
 use db_sync_engine::events::JobKind;
 use db_sync_engine::job::{JobOutcome, JobRecord};
 use db_sync_engine::mask::{MaskRule, MaskTransform};
@@ -13,6 +16,7 @@ use db_sync_engine::plan::SyncPlanCreate;
 use db_sync_engine::profile::{
     DbConfig, ProfileCreate, ProfileUpdate, SshAuth, SshConfig, SshEndpoint, ToolOverrides,
 };
+use db_sync_engine::retention::RetentionPolicy;
 use db_sync_engine::store::{Store, StoreError};
 use db_sync_engine::types::{Engine, EnvironmentTag};
 use uuid::Uuid;
@@ -631,4 +635,235 @@ async fn a_rule_on_a_schema_only_table_is_not_active() {
     let active = plan.active_masking();
     assert_eq!(active.len(), 1);
     assert_eq!(active[0].table, "users");
+}
+
+// ── Off-site destinations ───────────────────────────────────────────────
+
+fn s3_destination(name: &str) -> DestinationCreate {
+    DestinationCreate {
+        name: name.to_string(),
+        kind: DestinationKind::S3(S3Destination {
+            endpoint: "https://s3.eu-west-1.amazonaws.com".into(),
+            region: "eu-west-1".into(),
+            bucket: "backups".into(),
+            prefix: "prod".into(),
+            path_style: false,
+            access_key_id: "AKIDEXAMPLE".into(),
+        }),
+        enabled: true,
+        retention: RetentionPolicy::default(),
+    }
+}
+
+#[tokio::test]
+async fn a_destination_round_trips_through_the_store() {
+    let (store, _dir) = store().await;
+    let created = store
+        .create_destination(s3_destination("off-site"))
+        .await
+        .expect("create");
+
+    let fetched = store
+        .get_destination(created.id)
+        .await
+        .unwrap()
+        .expect("stored");
+    assert_eq!(fetched, created);
+
+    let DestinationKind::S3(s3) = &fetched.kind;
+    assert_eq!(s3.bucket, "backups");
+    assert_eq!(s3.access_key_id, "AKIDEXAMPLE");
+}
+
+#[tokio::test]
+async fn a_stored_destination_holds_no_credential() {
+    // The invariant the schema is built around: nothing in this table is
+    // sensitive, so no query against it can leak a credential.
+    let (store, _dir) = store().await;
+    let created = store
+        .create_destination(s3_destination("off-site"))
+        .await
+        .unwrap();
+
+    let row: (String,) = sqlx::query_as("SELECT kind FROM destinations WHERE id = ?1")
+        .bind(created.id.to_string())
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+
+    assert!(row.0.contains("AKIDEXAMPLE"), "the key id is not a secret");
+    assert!(
+        !row.0.to_lowercase().contains("secret"),
+        "no secret material may be persisted: {}",
+        row.0
+    );
+}
+
+#[tokio::test]
+async fn destination_names_are_unique() {
+    // A job log naming a destination has to be unambiguous.
+    let (store, _dir) = store().await;
+    store
+        .create_destination(s3_destination("off-site"))
+        .await
+        .unwrap();
+
+    let err = store
+        .create_destination(s3_destination("off-site"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::DuplicateName(_)), "{err}");
+}
+
+#[tokio::test]
+async fn an_unusable_destination_is_refused_rather_than_stored() {
+    // Storing it would make it look configured, and it would only fail at the
+    // moment it was being relied on.
+    let (store, _dir) = store().await;
+    let mut input = s3_destination("insecure");
+    let DestinationKind::S3(s3) = &mut input.kind;
+    s3.endpoint = "http://s3.example.com".into();
+
+    let err = store.create_destination(input).await.unwrap_err();
+    assert!(matches!(err, StoreError::InvalidDestination(_)), "{err}");
+    assert!(store.list_destinations().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn only_enabled_destinations_are_offered_to_a_backup() {
+    let (store, _dir) = store().await;
+    store
+        .create_destination(s3_destination("live"))
+        .await
+        .unwrap();
+
+    let mut paused = s3_destination("paused");
+    paused.enabled = false;
+    let paused = store.create_destination(paused).await.unwrap();
+
+    let enabled = store.list_enabled_destinations().await.unwrap();
+    assert_eq!(enabled.len(), 1);
+    assert_eq!(enabled[0].name, "live");
+
+    // Disabled, not forgotten: the configuration and its credential survive.
+    assert_eq!(store.list_destinations().await.unwrap().len(), 2);
+    assert!(store.get_destination(paused.id).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn updating_a_destination_leaves_untouched_fields_alone() {
+    let (store, _dir) = store().await;
+    let created = store
+        .create_destination(s3_destination("off-site"))
+        .await
+        .unwrap();
+
+    let updated = store
+        .update_destination(
+            created.id,
+            DestinationUpdate {
+                enabled: Some(false),
+                retention: Some(RetentionPolicy {
+                    keep_last: Some(30),
+                    max_age_days: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(!updated.enabled);
+    assert_eq!(updated.retention.keep_last, Some(30));
+    assert_eq!(
+        updated.name, "off-site",
+        "the name was not part of the patch"
+    );
+    assert_eq!(updated.kind, created.kind);
+}
+
+#[tokio::test]
+async fn an_update_cannot_make_a_destination_unusable() {
+    // The same guard as creation. Editing an endpoint to a plaintext one is
+    // exactly as bad as configuring it that way to begin with.
+    let (store, _dir) = store().await;
+    let created = store
+        .create_destination(s3_destination("off-site"))
+        .await
+        .unwrap();
+
+    let err = store
+        .update_destination(
+            created.id,
+            DestinationUpdate {
+                kind: Some(DestinationKind::S3(S3Destination {
+                    endpoint: "http://s3.example.com".into(),
+                    region: "eu-west-1".into(),
+                    bucket: "backups".into(),
+                    prefix: String::new(),
+                    path_style: false,
+                    access_key_id: "AKIDEXAMPLE".into(),
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, StoreError::InvalidDestination(_)), "{err}");
+
+    let unchanged = store.get_destination(created.id).await.unwrap().unwrap();
+    assert_eq!(unchanged.kind, created.kind, "the stored row must not move");
+}
+
+#[tokio::test]
+async fn off_site_retention_defaults_to_keeping_everything() {
+    // A destination created without a policy must not start deleting things.
+    let (store, _dir) = store().await;
+    let created = store
+        .create_destination(s3_destination("off-site"))
+        .await
+        .unwrap();
+    assert!(!created.retention.is_enabled());
+
+    let fetched = store.get_destination(created.id).await.unwrap().unwrap();
+    assert!(
+        !fetched.retention.is_enabled(),
+        "and it reads back that way"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_destination_removes_it() {
+    let (store, _dir) = store().await;
+    let created = store
+        .create_destination(s3_destination("off-site"))
+        .await
+        .unwrap();
+
+    assert!(store.delete_destination(created.id).await.unwrap());
+    assert!(store.get_destination(created.id).await.unwrap().is_none());
+    assert!(
+        !store.delete_destination(created.id).await.unwrap(),
+        "deleting twice reports that there was nothing to delete"
+    );
+}
+
+#[tokio::test]
+async fn a_corrupt_destination_row_is_an_error_not_a_guess() {
+    let (store, _dir) = store().await;
+    let created = store
+        .create_destination(s3_destination("off-site"))
+        .await
+        .unwrap();
+
+    sqlx::query("UPDATE destinations SET kind = ?2 WHERE id = ?1")
+        .bind(created.id.to_string())
+        .bind("{not json")
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let err = store.get_destination(created.id).await.unwrap_err();
+    assert!(matches!(err, StoreError::Corrupt { .. }), "{err}");
 }

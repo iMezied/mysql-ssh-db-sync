@@ -65,9 +65,11 @@ impl From<StoreError> for CommandError {
             StoreError::DuplicateName(_) => "duplicate_name",
             StoreError::ProfileNotFound(_)
             | StoreError::SyncPlanNotFound(_)
-            | StoreError::ScheduleNotFound(_) => "not_found",
+            | StoreError::ScheduleNotFound(_)
+            | StoreError::DestinationNotFound(_) => "not_found",
             StoreError::Corrupt { .. } => "corrupt",
-            StoreError::InvalidSchedule(_) => "invalid",
+            StoreError::InvalidSchedule(_) | StoreError::InvalidDestination(_) => "invalid",
+            StoreError::Secrets(_) => "keychain",
             StoreError::Sqlx(_) | StoreError::Migrate(_) => "storage",
         };
         Self::new(kind, e.to_string())

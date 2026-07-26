@@ -258,6 +258,85 @@ s3_test! {
 }
 
 s3_test! {
+    async fn listing_follows_continuation_tokens_past_a_page_boundary() {
+        // A listing that stops at the first page is silent: it returns a
+        // shorter list that looks complete, and off-site retention then makes
+        // its keep/delete decision while seeing only part of what is there.
+        //
+        // A page size of one forces the continuation path without needing the
+        // thousand objects a default page would take.
+        require_minio!();
+        let c = client("dbsync-paging").await;
+
+        let expected: Vec<String> = (0..5)
+            .map(|i| format!("prod/page-{i}.sql.gz"))
+            .collect();
+        for key in &expected {
+            let (_dir, path) = temp_file(key.as_bytes());
+            let mut progress = no_progress();
+            c.upload_file(&path, key, &mut progress, &|| false)
+                .await
+                .expect("upload");
+        }
+
+        let mut one_at_a_time: Vec<String> = c
+            .list_paged("prod/", 1)
+            .await
+            .expect("paged listing")
+            .into_iter()
+            .map(|o| o.key)
+            .collect();
+        one_at_a_time.sort();
+        assert_eq!(
+            one_at_a_time, expected,
+            "every page after the first must be fetched"
+        );
+
+        // And the default path agrees, so pagination is not a special mode.
+        let mut default: Vec<String> = c
+            .list("prod/")
+            .await
+            .expect("listing")
+            .into_iter()
+            .map(|o| o.key)
+            .collect();
+        default.sort();
+        assert_eq!(default, expected);
+    }
+}
+
+s3_test! {
+    async fn a_listing_reports_the_size_and_age_of_each_object() {
+        // Off-site retention decides what to delete from these two numbers. A
+        // listing that returns keys alone would force it to guess.
+        require_minio!();
+        let c = client("dbsync-listing-detail").await;
+
+        let payload = b"-- twenty-three bytes.\n";
+        let (_dir, path) = temp_file(payload);
+        let key = c.key_for("aged.sql.gz");
+        let before = chrono::Utc::now() - Duration::from_secs(60);
+
+        let mut progress = no_progress();
+        c.upload_file(&path, &key, &mut progress, &|| false)
+            .await
+            .expect("upload");
+
+        let listed = c.list("prod/").await.expect("list");
+        let object = listed.iter().find(|o| o.key == key).expect("the object");
+
+        assert_eq!(object.size, payload.len() as u64);
+        let modified = object
+            .last_modified
+            .expect("the server reports a timestamp, and it must be parsed");
+        assert!(
+            modified > before,
+            "an object just written cannot be older than a minute ago: {modified}"
+        );
+    }
+}
+
+s3_test! {
     async fn a_key_with_awkward_characters_survives_the_round_trip() {
         // Object keys carry database and profile names. Spaces and non-ASCII
         // are where percent-encoding bugs show up, and an encoding that differs

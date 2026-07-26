@@ -1153,3 +1153,115 @@ a user.
 `generate_backup_key` is deliberately *not* among them: it writes to the
 machine's keychain, and a test that creates a real key is the problem described
 above rather than a test of it.
+
+## M10 — A failed off-site copy fails the job
+
+A backup that was written to disk but never reached its configured destination
+is a partial success, and the tempting reading is that the important half
+worked: the artifact exists, it is valid, it verifies. Reporting success would
+be defensible.
+
+It is also the exact failure the feature exists to prevent. A destination is
+configured because a local-only backup is one failure away from not existing.
+If the copy silently does not happen, the operator believes they are covered
+and they are not — which is strictly worse than never having configured one,
+because the belief is now wrong rather than merely absent.
+
+So a push failure makes the job `Failed`, and the log says explicitly that the
+local artifact is fine and where it is. This is the same rule already applied to
+verification: the data arrived, and the job still failed, because the question
+job history has to answer is "did it work", not "did most of it work".
+
+Two consequences follow:
+
+- **Retention does not run.** If this run did not produce the second copy it was
+  meant to, it has not earned the right to delete the older local ones — those
+  are now the only copies.
+- **`push_offsite` never returns `Err` for a transport failure.** Each
+  destination gets its own result. One unreachable bucket must not stop the
+  others from being tried, and must not hide the ones that worked; two off-site
+  copies exist precisely so that losing one is survivable. The caller decides
+  what the collection means for the job.
+
+## M10 — Plaintext http:// destinations are refused, not warned about
+
+SigV4 authenticates a request. It does not encrypt one. An `http://` endpoint
+sends the backup — and the credentials signing for it — across the network
+readable by anything in the path.
+
+A warning would have been the polite option, and it would have been ignored,
+because a warning at configuration time is read once and the destination then
+works. Refusing is a one-line fix at the moment the mistake is made, and the
+error names the fix.
+
+Loopback is exempt, because a local MinIO is how anyone sensible tries this out
+and nothing leaves the machine. The exemption is decided by parsing the host and
+asking `IpAddr::is_loopback`, not by looking for "localhost" in the string:
+`http://localhost.evil.example` resolves wherever its owner points it, and a
+substring check would have waved it through. There is a test for exactly that
+hostname.
+
+## M10 — The destinations table holds nothing sensitive
+
+The obvious schema has a `secret_access_key` column. The one here does not, and
+will not: the secret lives in the OS keychain under the destination's id, and
+the row holds an endpoint, a bucket, a region and an access key id.
+
+The point is not that a column would be insecure in itself — it is that a
+`Destination` with no secret in it is safe to log, list, serialise into a job's
+options and hand to a UI, *without any code path having to remember to redact
+it*. Redaction that has to be remembered is redaction that eventually is not.
+A test asserts that a serialised destination contains no secret material and
+does contain the access key id, which is not secret and identifies which
+credential is in use.
+
+The credential is keyed by the destination rather than by a profile because a
+destination belongs to the installation: several profiles ship to the same
+bucket, so deleting one profile must not lock the others out of it.
+`delete_all_for_profile` skips this kind for that reason, as it already skips
+the backup key.
+
+## M10 — `Store::delete_destination` removes the row and nothing else
+
+Deleting a destination should also delete its credential, and the first version
+did both inside the store. That made every test of the `destinations` table
+need an unlocked OS keychain, which is a strange thing for a persistence test to
+require and a reason for a whole suite to fail on a CI runner.
+
+The store is SQLite persistence; `secrets` is a separate layer. So the row
+deletion stays in the store and `ops::forget_destination` does both, keychain
+first — the other order can leave a credential that nothing points at, invisible
+in the app and impossible to remove from inside it. `delete_profile` already
+worked this way, with the cleanup at the caller.
+
+## M10 — Listing follows continuation tokens
+
+The first version of `list` sent one request and returned what came back. S3
+caps a page at 1000 keys and signals more with `IsTruncated`, so a bucket with
+more than that returned a shorter list that looked complete — and off-site
+retention would then decide what to keep while seeing part of what is there.
+
+It now follows `NextContinuationToken` to the end, and a response that claims to
+be truncated without supplying a token is an error rather than a short list. The
+integration test asks for one key per page against MinIO, so the continuation
+path is the only path, rather than uploading a thousand objects to reach the
+default boundary.
+
+Two related fixes came out of the same reading:
+
+- **Query strings are built by `sign::canonical_query`**, which encodes and
+  sorts. SigV4 signs the sorted form, so a parameter added in a readable order
+  at a call site is a `403 SignatureDoesNotMatch` — an error that reads like a
+  credentials problem and is not one. Adding pagination meant adding a
+  parameter, which is exactly when that bug appears.
+- **A listing page is parsed one `<Contents>` block at a time**, not by
+  collecting every `<Key>` and every `<Size>` into parallel lists and zipping
+  them. The zip reads fine and is wrong the moment one element is missing from
+  one entry: every later object silently inherits its neighbour's size and
+  timestamp, and retention then deletes by numbers belonging to a different
+  file.
+
+`ObjectInfo` carries `last_modified` because retention needs an age. An object
+whose timestamp cannot be parsed is left out of the candidate list entirely
+rather than being given `Utc::now()` — a substituted date is a decision made on
+a number that means nothing.
