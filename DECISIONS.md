@@ -924,3 +924,23 @@ revisited rather than silently outliving its cause.
 
 PostgreSQL's `parallel_jobs` is genuinely implemented (`pg_dump -j`, directory
 format only) and is unaffected.
+
+## M12 — Webhook shape is inferred, not configured
+
+A Slack incoming webhook accepts a POST it cannot render and returns 200. So a
+raw `RunReport` sent to one produces no message *and* no error — the worst
+combination available, and one the user only discovers by noticing the channel
+has been silent for a month.
+
+The endpoint's host is already unambiguous, so it decides: `hooks.slack.com`
+gets a Slack attachment, `webhook.office.com` and `logic.azure.com` get a Teams
+MessageCard, everything else keeps the full report. That means no setting to
+get wrong and no migration, and existing schedules start rendering properly the
+moment they are upgraded.
+
+Host matching is exact or suffix-on-a-dot-boundary. `hooks.slack.com.evil.test`
+is not Slack, and a test says so.
+
+The chat payloads carry the same guarantee as the raw one — profile names, no
+hosts, ports, credentials or paths — restated as its own test, because these
+are the shapes that actually get pasted into a shared channel.

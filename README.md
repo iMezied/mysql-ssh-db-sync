@@ -273,6 +273,12 @@ options. A webhook URL receives a JSON POST per run:
 }
 ```
 
+**Slack and Microsoft Teams are detected from the URL** and receive a rendered
+message instead of the raw report — a Slack incoming webhook returns 200 for a
+body it cannot render, so a raw report sent there produces no message *and* no
+error. Anything else keeps the full JSON above, so a consumer that parses it is
+never silently switched to a chat payload.
+
 Profiles appear **by name only**. No host, port, username, password, key path
 or directory ever leaves the machine — the artifact is named, not located.
 Redirects are not followed, delivery is a single 10-second attempt, and a

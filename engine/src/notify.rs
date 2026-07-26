@@ -224,6 +224,122 @@ pub struct Notification {
     pub is_failure: bool,
 }
 
+/// The shape a webhook endpoint expects.
+///
+/// Inferred from the URL rather than configured. A Slack incoming webhook
+/// silently accepts a POST it cannot render and returns 200, so a raw report
+/// sent there produces no message and no error — the worst combination. The
+/// host name is the one piece of information that is already unambiguous, so
+/// it is what decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookFormat {
+    /// The full [`RunReport`] as JSON. For anything that parses it itself.
+    Json,
+    Slack,
+    Teams,
+}
+
+impl WebhookFormat {
+    /// Work out what an endpoint expects from its host.
+    pub fn infer(url: &str) -> Self {
+        let host = url::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+            .unwrap_or_default();
+
+        if host == "hooks.slack.com" || host.ends_with(".slack.com") {
+            WebhookFormat::Slack
+        } else if host.ends_with("webhook.office.com")
+            || host.ends_with("office.com")
+            || host.ends_with("logic.azure.com")
+        {
+            WebhookFormat::Teams
+        } else {
+            WebhookFormat::Json
+        }
+    }
+}
+
+/// Build the body for a given endpoint shape.
+///
+/// The generic form is the report itself, so nothing is lost for a consumer
+/// that knows how to read it. The chat forms are deliberately terse: a
+/// notification that has to be expanded to learn whether it failed is a
+/// notification people stop reading.
+pub fn payload_for(format: WebhookFormat, report: &RunReport) -> serde_json::Value {
+    let notification = report.to_notification();
+
+    match format {
+        WebhookFormat::Json => serde_json::to_value(report).unwrap_or(serde_json::Value::Null),
+
+        WebhookFormat::Slack => serde_json::json!({
+            // `text` is the fallback shown in notifications and on clients
+            // that do not render attachments.
+            "text": notification.title,
+            "attachments": [{
+                "color": if report.succeeded() { "good" } else { "danger" },
+                "fallback": notification.title,
+                "text": notification.body,
+                "fields": slack_fields(report),
+            }],
+        }),
+
+        WebhookFormat::Teams => serde_json::json!({
+            "@type": "MessageCard",
+            "@context": "https://schema.org/extensions",
+            "themeColor": if report.succeeded() { "2EB67D" } else { "E01E5A" },
+            "summary": notification.title,
+            "title": notification.title,
+            "text": notification.body,
+            "sections": [{
+                "facts": teams_facts(report),
+            }],
+        }),
+    }
+}
+
+/// The handful of fields worth showing without expanding the message.
+fn facts(report: &RunReport) -> Vec<(&'static str, String)> {
+    let mut out = vec![
+        ("Database", report.database.clone()),
+        ("Source", report.source_profile.clone()),
+    ];
+    if let Some(dest) = &report.dest_profile {
+        out.push(("Destination", dest.clone()));
+    }
+    out.push(("Duration", format!("{:.0}s", report.duration_seconds)));
+    if let Some(v) = &report.verification {
+        out.push((
+            "Verified",
+            format!(
+                "{} table(s){}",
+                v.tables_checked,
+                if v.passed {
+                    String::new()
+                } else {
+                    format!(", {} FAILED", v.failures)
+                }
+            ),
+        ));
+    }
+    out
+}
+
+fn slack_fields(report: &RunReport) -> Vec<serde_json::Value> {
+    facts(report)
+        .into_iter()
+        .map(|(title, value)| serde_json::json!({ "title": title, "value": value, "short": true }))
+        .collect()
+}
+
+fn teams_facts(report: &RunReport) -> Vec<serde_json::Value> {
+    facts(report)
+        .into_iter()
+        .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
+        .collect()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WebhookError {
     #[error("could not build the HTTP client: {0}")]
@@ -271,9 +387,12 @@ fn client() -> Result<&'static reqwest::Client, WebhookError> {
 /// durably recorded — a failed webhook is a lost notification, not lost data.
 /// Failure is returned so the caller can log it against the job.
 pub async fn post_webhook(url: &str, report: &RunReport) -> Result<u16, WebhookError> {
+    let format = WebhookFormat::infer(url);
+    let body = payload_for(format, report);
+
     let response = client()?
         .post(url)
-        .json(report)
+        .json(&body)
         .send()
         .await
         .map_err(|e| WebhookError::Transport(e.to_string()))?;
@@ -536,5 +655,149 @@ mod tests {
         let json = serde_json::to_string(&summary).unwrap();
         assert!(!json.contains("orders"), "per-table detail leaked into it");
         assert!(json.len() < 120);
+    }
+}
+
+#[cfg(test)]
+mod webhook_format_tests {
+    use super::*;
+
+    fn report(outcome: JobOutcome) -> RunReport {
+        let started = Utc::now();
+        let mut r = RunReport::new(RunOutcome {
+            schedule_id: Uuid::nil(),
+            schedule_name: "nightly staging refresh",
+            job_id: Uuid::nil(),
+            kind: JobKind::Sync,
+            outcome,
+            scheduled_for: started,
+            started_at: started,
+            finished_at: started + chrono::Duration::seconds(42),
+            source_profile: "prod-mysql",
+            dest_profile: Some("staging-mysql"),
+            database: "app",
+            target_database: Some("app_20260726"),
+            artifact_path: None,
+            verification: None,
+            removed_artifacts: 0,
+            error: None,
+        });
+        r.verification = Some(VerificationSummary {
+            passed: matches!(outcome, JobOutcome::Success),
+            tables_checked: 12,
+            failures: if matches!(outcome, JobOutcome::Success) {
+                0
+            } else {
+                3
+            },
+            skipped: 0,
+        });
+        r
+    }
+
+    #[test]
+    fn slack_urls_are_recognised() {
+        assert_eq!(
+            WebhookFormat::infer("https://hooks.slack.com/services/T00/B00/xxx"),
+            WebhookFormat::Slack
+        );
+    }
+
+    #[test]
+    fn teams_urls_are_recognised() {
+        for url in [
+            "https://outlook.webhook.office.com/webhookb2/abc",
+            "https://prod-12.westus.logic.azure.com/workflows/abc",
+        ] {
+            assert_eq!(WebhookFormat::infer(url), WebhookFormat::Teams, "{url}");
+        }
+    }
+
+    #[test]
+    fn anything_else_gets_the_raw_report() {
+        // The default has to stay the full report: a consumer that parses it
+        // must not silently start receiving a chat message instead.
+        for url in [
+            "https://hooks.example.com/abc",
+            "http://localhost:9000/hook",
+            "not a url",
+        ] {
+            assert_eq!(WebhookFormat::infer(url), WebhookFormat::Json, "{url}");
+        }
+    }
+
+    #[test]
+    fn a_lookalike_host_is_not_treated_as_slack() {
+        // `hooks.slack.com.evil.test` must not be mistaken for Slack, or a
+        // report gets shaped for an endpoint that is not the one it claims.
+        assert_eq!(
+            WebhookFormat::infer("https://hooks.slack.com.evil.test/x"),
+            WebhookFormat::Json
+        );
+    }
+
+    #[test]
+    fn the_generic_payload_is_still_the_whole_report() {
+        let r = report(JobOutcome::Success);
+        let body = payload_for(WebhookFormat::Json, &r);
+        assert_eq!(body["event"], "dbsync.run.finished");
+        assert_eq!(body["schedule_name"], "nightly staging refresh");
+    }
+
+    #[test]
+    fn slack_gets_a_renderable_message_with_a_colour() {
+        let body = payload_for(WebhookFormat::Slack, &report(JobOutcome::Success));
+        assert!(
+            body["text"]
+                .as_str()
+                .unwrap()
+                .contains("nightly staging refresh")
+        );
+        assert_eq!(body["attachments"][0]["color"], "good");
+        // A fallback is what shows in the notification list and on clients
+        // that do not render attachments.
+        assert!(body["attachments"][0]["fallback"].is_string());
+
+        let failed = payload_for(WebhookFormat::Slack, &report(JobOutcome::Failed));
+        assert_eq!(failed["attachments"][0]["color"], "danger");
+        assert!(failed["text"].as_str().unwrap().contains("FAILED"));
+    }
+
+    #[test]
+    fn teams_gets_a_message_card() {
+        let body = payload_for(WebhookFormat::Teams, &report(JobOutcome::Success));
+        assert_eq!(body["@type"], "MessageCard");
+        // Teams refuses a card with no summary.
+        assert!(body["summary"].is_string());
+        assert_eq!(body["themeColor"], "2EB67D");
+
+        let failed = payload_for(WebhookFormat::Teams, &report(JobOutcome::Failed));
+        assert_eq!(failed["themeColor"], "E01E5A");
+    }
+
+    #[test]
+    fn no_chat_payload_leaks_connection_details() {
+        // The same guarantee the raw report makes, restated for the shapes
+        // that actually get pasted into a shared channel.
+        for format in [WebhookFormat::Slack, WebhookFormat::Teams] {
+            let body = payload_for(format, &report(JobOutcome::Failed)).to_string();
+            for forbidden in ["password", "3306", "5432", "ssh", "/Users/"] {
+                assert!(
+                    !body.to_lowercase().contains(forbidden),
+                    "{format:?} payload mentions {forbidden:?}: {body}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_facts_shown_are_the_ones_worth_reading_at_a_glance() {
+        let body = payload_for(WebhookFormat::Slack, &report(JobOutcome::Failed)).to_string();
+        assert!(body.contains("prod-mysql"));
+        assert!(body.contains("staging-mysql"));
+        assert!(
+            body.contains("3 FAILED"),
+            "a failed verification must be visible: {body}"
+        );
     }
 }
