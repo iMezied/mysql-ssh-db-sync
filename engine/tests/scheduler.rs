@@ -141,6 +141,7 @@ fn action(restore: Option<ScheduleRestore>, output_dir: PathBuf) -> ScheduleActi
         backup: EngineBackupOptions::Mysql(MysqlBackupOptions::default()),
         restore,
         verify: true,
+        deep_verify: false,
         retention: None,
     }
 }

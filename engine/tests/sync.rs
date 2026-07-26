@@ -361,6 +361,7 @@ db_test! {
             },
             restore: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
             verify: true,
+            deep_verify: false,
             retention: None,
             typed_confirmation: None,
         };
@@ -422,6 +423,7 @@ db_test! {
             },
             restore: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
             verify: true,
+            deep_verify: false,
             retention: Some(RetentionPolicy {
                 keep_last: Some(1),
                 max_age_days: None,
@@ -476,6 +478,7 @@ db_test! {
             },
             restore: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
             verify: false,
+            deep_verify: false,
             retention: None,
             typed_confirmation: None,
         };
@@ -521,6 +524,7 @@ db_test! {
             },
             restore: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
             verify: false,
+            deep_verify: false,
             retention: None,
             typed_confirmation: None,
         };

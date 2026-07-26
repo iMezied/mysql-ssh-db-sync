@@ -125,6 +125,23 @@ pub trait Introspector: Send + Sync {
     /// Exact `COUNT(*)`. Slow on large tables by design — estimates are not
     /// acceptable for verification.
     async fn exact_row_count(&self, database: &str, table: &str) -> Result<u64, DbError>;
+    /// An order-independent digest of a table's contents.
+    ///
+    /// `COUNT(*)` proves a table has the right number of rows; it says nothing
+    /// about whether they hold the right bytes. Truncated text, a mangled
+    /// character set, a column restored as NULL — all pass a row count and all
+    /// are exactly what a restore gets wrong.
+    ///
+    /// The digest only ever has to be comparable between a source and a
+    /// destination of the *same* engine, because cross-engine sync is refused
+    /// upstream. That frees each implementation to use whatever its own server
+    /// computes fastest, rather than a lowest-common-denominator scheme.
+    ///
+    /// `None` means the table could not be digested (no columns, an exotic
+    /// type). That is reported as "not compared", never as a match.
+    async fn table_digest(&self, database: &str, table: &str) -> Result<Option<String>, DbError>;
+    /// Column names, in ordinal order, for schema comparison.
+    async fn column_names(&self, database: &str, table: &str) -> Result<Vec<String>, DbError>;
     async fn close(&self);
 }
 
@@ -291,6 +308,54 @@ impl Introspector for MysqlIntrospector {
         Ok(count.max(0) as u64)
     }
 
+    async fn table_digest(&self, database: &str, table: &str) -> Result<Option<String>, DbError> {
+        let columns = self.column_names(database, table).await?;
+        if columns.is_empty() {
+            return Ok(None);
+        }
+
+        // Per-row MD5 folded together with BIT_XOR. XOR is commutative, so the
+        // result does not depend on the order rows come back in — which matters
+        // because a restored table has no reason to share the source's physical
+        // ordering.
+        //
+        // CONCAT_WS skips NULLs, which would make ('a', NULL) and (NULL, 'a')
+        // collide, so each value is wrapped in COALESCE with a sentinel that
+        // cannot appear in real data.
+        let projection = columns
+            .iter()
+            .map(|c| {
+                quote_mysql_ident(c).map(|q| format!("COALESCE(CAST({q} AS CHAR), '\\0NULL')"))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .join(", ");
+
+        let sql = format!(
+            "SELECT COALESCE(CAST(BIT_XOR(CAST(CONV(SUBSTRING(MD5(CONCAT_WS('\\0', {projection})), 1, 16), 16, 10) AS UNSIGNED)) AS CHAR), '0')              FROM {}.{}",
+            quote_mysql_ident(database)?,
+            quote_mysql_ident(table)?
+        );
+
+        let digest: String = sqlx::query_scalar(&sql)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| DbError::Query(format!("digesting {database}.{table}: {e}")))?;
+        Ok(Some(digest))
+    }
+
+    async fn column_names(&self, database: &str, table: &str) -> Result<Vec<String>, DbError> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT CONVERT(COLUMN_NAME USING utf8mb4) FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+        )
+        .bind(database)
+        .bind(table)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbError::Query(format!("reading columns of {database}.{table}: {e}")))?;
+        Ok(rows)
+    }
+
     async fn close(&self) {
         self.pool.close().await;
     }
@@ -441,6 +506,44 @@ impl Introspector for PostgresIntrospector {
             .await
             .map_err(|e| DbError::Query(format!("counting {table}: {e}")))?;
         Ok(count.max(0) as u64)
+    }
+
+    async fn table_digest(&self, _database: &str, table: &str) -> Result<Option<String>, DbError> {
+        let (schema, name) = split_qualified(table, "public");
+
+        // `t::text` is PostgreSQL's own canonical rendering of a whole row, so
+        // this needs no column list and handles every type the server can
+        // print. Summing per-row hashes keeps it order-independent, the same
+        // property the MySQL side relies on.
+        //
+        // The cast chain takes 16 hex digits of the MD5 into a signed 64-bit
+        // integer; the sum is taken as numeric so it cannot overflow.
+        let sql = format!(
+            "SELECT COALESCE(SUM(('x' || substr(md5(t::text), 1, 16))::bit(64)::bigint::numeric), 0)::text \
+             FROM {}.{} AS t",
+            quote_pg_ident(&schema)?,
+            quote_pg_ident(&name)?
+        );
+
+        let digest: String = sqlx::query_scalar(&sql)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| DbError::Query(format!("digesting {table}: {e}")))?;
+        Ok(Some(digest))
+    }
+
+    async fn column_names(&self, _database: &str, table: &str) -> Result<Vec<String>, DbError> {
+        let (schema, name) = split_qualified(table, "public");
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position",
+        )
+        .bind(&schema)
+        .bind(&name)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbError::Query(format!("reading columns of {table}: {e}")))?;
+        Ok(rows)
     }
 
     async fn close(&self) {

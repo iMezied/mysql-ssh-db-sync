@@ -639,6 +639,14 @@ export type ScheduleAction = {
 	/**  Present exactly when the schedule has a destination profile. */
 	restore: ScheduleRestore | null,
 	verify: boolean,
+	/**
+	 *  Compare table contents, not only row counts.
+	 * 
+	 *  Off by default and defaulted on deserialise: it costs a full scan of
+	 *  every table on both sides, and an existing schedule must not silently
+	 *  acquire that cost on upgrade.
+	 */
+	deep_verify?: boolean,
 	retention: RetentionPolicy | null,
 };
 
@@ -794,6 +802,14 @@ export type SyncRequest = {
 	restore: EngineRestoreOptions,
 	/**  Compare exact row counts once the restore finishes. */
 	verify: boolean,
+	/**
+	 *  Also compare table contents and columns.
+	 * 
+	 *  Defaulted so a stored request written before this existed still
+	 *  deserialises — an old schedule keeps its old, shallower behaviour
+	 *  rather than silently acquiring a full table scan.
+	 */
+	deep_verify?: boolean,
 	/**  Applied to the source's backup directory after a successful run. */
 	retention: RetentionPolicy | null,
 	/**  Required when the destination naming strategy is destructive. */

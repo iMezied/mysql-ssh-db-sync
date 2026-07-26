@@ -29,13 +29,32 @@ pub enum TableVerdict {
     UnexpectedAtDestination,
     /// Counting was skipped, e.g. the table exceeded the time budget.
     Skipped { reason: String },
+    /// Counts agree but the contents do not.
+    ///
+    /// The dangerous case, and the reason digests exist: the right number of
+    /// rows holding the wrong bytes. Truncated text, a mangled character set,
+    /// a column that came back NULL — every one of those passes a row count.
+    ContentMismatch {
+        #[specta(type = f64)]
+        rows: u64,
+    },
+    /// Counts and contents agree but the columns differ.
+    SchemaMismatch {
+        /// Columns on the source that the destination does not have.
+        missing: Vec<String>,
+        /// Columns at the destination that the source does not have.
+        extra: Vec<String>,
+    },
 }
 
 impl TableVerdict {
     pub const fn is_failure(&self) -> bool {
         matches!(
             self,
-            TableVerdict::RowCountMismatch { .. } | TableVerdict::MissingAtDestination
+            TableVerdict::RowCountMismatch { .. }
+                | TableVerdict::MissingAtDestination
+                | TableVerdict::ContentMismatch { .. }
+                | TableVerdict::SchemaMismatch { .. }
         )
     }
 }
@@ -72,6 +91,19 @@ impl VerificationReport {
                 TableVerdict::MissingAtDestination => "MISSING at destination".to_string(),
                 TableVerdict::UnexpectedAtDestination => "unexpected at destination".to_string(),
                 TableVerdict::Skipped { reason } => format!("skipped ({reason})"),
+                TableVerdict::ContentMismatch { rows } => {
+                    format!("CONTENT MISMATCH: {rows} rows on both sides, but the data differs")
+                }
+                TableVerdict::SchemaMismatch { missing, extra } => {
+                    let mut parts = Vec::new();
+                    if !missing.is_empty() {
+                        parts.push(format!("missing columns: {}", missing.join(", ")));
+                    }
+                    if !extra.is_empty() {
+                        parts.push(format!("extra columns: {}", extra.join(", ")));
+                    }
+                    format!("SCHEMA MISMATCH: {}", parts.join("; "))
+                }
             };
             out.push_str(&format!("| {} | {} |\n", t.table, cell));
         }
@@ -168,6 +200,79 @@ pub fn build_report(
         skipped: skipped_count,
         tables,
     }
+}
+
+// ── Content and schema comparison ───────────────────────────────────────
+
+/// The deeper evidence, gathered from both sides.
+///
+/// Separate from [`build_report`] on purpose: row counts are cheap and always
+/// available, digests need a full table scan and can legitimately be
+/// unavailable. Layering the expensive check on top of the cheap one keeps
+/// "we could not digest this" distinguishable from "this matched".
+#[derive(Debug, Clone, Default)]
+pub struct DeepComparison {
+    pub source_digests: BTreeMap<String, Option<String>>,
+    pub dest_digests: BTreeMap<String, Option<String>>,
+    pub source_columns: BTreeMap<String, Vec<String>>,
+    pub dest_columns: BTreeMap<String, Vec<String>>,
+    pub row_counts: BTreeMap<String, u64>,
+}
+
+/// Upgrade `Match` verdicts that the deeper evidence contradicts.
+///
+/// Only tables currently reported as matching are examined. A row-count
+/// mismatch is already a failure, and telling the user their contents also
+/// differ adds noise to a problem they can already see.
+///
+/// A missing digest never turns a match into a failure. Being unable to
+/// compare is not evidence of a difference, and treating it as one would make
+/// verification cry wolf on exactly the exotic tables people care about most.
+pub fn refine_with_contents(report: &mut VerificationReport, deep: &DeepComparison) {
+    for entry in &mut report.tables {
+        if !matches!(entry.verdict, TableVerdict::Match) {
+            continue;
+        }
+
+        // Schema first: differing columns explain a differing digest, and
+        // "you are missing a column" is far more actionable than "the bytes
+        // do not match".
+        let src_cols = deep.source_columns.get(&entry.table);
+        let dst_cols = deep.dest_columns.get(&entry.table);
+        if let (Some(src), Some(dst)) = (src_cols, dst_cols) {
+            let missing: Vec<String> = src.iter().filter(|c| !dst.contains(c)).cloned().collect();
+            let extra: Vec<String> = dst.iter().filter(|c| !src.contains(c)).cloned().collect();
+
+            if !missing.is_empty() || !extra.is_empty() {
+                entry.verdict = TableVerdict::SchemaMismatch { missing, extra };
+                continue;
+            }
+        }
+
+        if let (Some(Some(src)), Some(Some(dst))) = (
+            deep.source_digests.get(&entry.table),
+            deep.dest_digests.get(&entry.table),
+        ) && src != dst
+        {
+            entry.verdict = TableVerdict::ContentMismatch {
+                rows: deep.row_counts.get(&entry.table).copied().unwrap_or(0),
+            };
+        }
+    }
+
+    // The tallies are derived, so they have to be recomputed rather than
+    // adjusted — an off-by-one here would make `passed()` disagree with the
+    // table list it is summarising.
+    report.failures = report
+        .tables
+        .iter()
+        .filter(|t| t.verdict.is_failure())
+        .count();
+    report.skipped = report
+        .tables
+        .iter()
+        .filter(|t| matches!(t.verdict, TableVerdict::Skipped { .. }))
+        .count();
 }
 
 #[cfg(test)]
@@ -319,5 +424,140 @@ mod tests {
         let md = r.to_markdown();
         assert!(md.contains("| orders |"));
         assert!(md.contains("MISMATCH"));
+    }
+
+    // ── Deep comparison ─────────────────────────────────────────────────
+
+    fn matching_report(table: &str, rows: u64) -> VerificationReport {
+        let mut expected = BTreeMap::new();
+        expected.insert(table.to_string(), rows);
+        build_report(&expected, &expected.clone(), &[], &BTreeMap::new())
+    }
+
+    fn deep(table: &str, src: &str, dst: &str) -> DeepComparison {
+        let mut d = DeepComparison::default();
+        d.source_digests.insert(table.into(), Some(src.into()));
+        d.dest_digests.insert(table.into(), Some(dst.into()));
+        d.row_counts.insert(table.into(), 42);
+        d
+    }
+
+    #[test]
+    fn equal_counts_with_different_contents_is_a_failure() {
+        // The whole point: this is what a row count cannot see.
+        let mut report = matching_report("orders", 42);
+        assert!(report.passed());
+
+        refine_with_contents(&mut report, &deep("orders", "aaa", "bbb"));
+
+        assert!(!report.passed());
+        assert_eq!(report.failures, 1);
+        assert_eq!(
+            report.tables[0].verdict,
+            TableVerdict::ContentMismatch { rows: 42 }
+        );
+    }
+
+    #[test]
+    fn equal_counts_with_equal_contents_still_passes() {
+        let mut report = matching_report("orders", 42);
+        refine_with_contents(&mut report, &deep("orders", "same", "same"));
+        assert!(report.passed());
+        assert_eq!(report.tables[0].verdict, TableVerdict::Match);
+    }
+
+    #[test]
+    fn a_missing_digest_never_manufactures_a_failure() {
+        // Being unable to compare is not evidence of a difference.
+        let mut report = matching_report("blobs", 5);
+        let mut d = DeepComparison::default();
+        d.source_digests.insert("blobs".into(), None);
+        d.dest_digests.insert("blobs".into(), Some("x".into()));
+
+        refine_with_contents(&mut report, &d);
+        assert!(report.passed());
+        assert_eq!(report.tables[0].verdict, TableVerdict::Match);
+    }
+
+    #[test]
+    fn a_column_difference_is_reported_instead_of_a_content_difference() {
+        // "you are missing a column" is far more actionable than "the bytes
+        // do not match", and it explains the digest difference anyway.
+        let mut report = matching_report("users", 10);
+        let mut d = deep("users", "aaa", "bbb");
+        d.source_columns
+            .insert("users".into(), vec!["id".into(), "email".into()]);
+        d.dest_columns.insert("users".into(), vec!["id".into()]);
+
+        refine_with_contents(&mut report, &d);
+
+        assert_eq!(
+            report.tables[0].verdict,
+            TableVerdict::SchemaMismatch {
+                missing: vec!["email".into()],
+                extra: vec![],
+            }
+        );
+        assert!(!report.passed());
+    }
+
+    #[test]
+    fn an_extra_destination_column_is_reported_too() {
+        let mut report = matching_report("users", 10);
+        let mut d = deep("users", "same", "same");
+        d.source_columns.insert("users".into(), vec!["id".into()]);
+        d.dest_columns
+            .insert("users".into(), vec!["id".into(), "migrated_at".into()]);
+
+        refine_with_contents(&mut report, &d);
+        assert_eq!(
+            report.tables[0].verdict,
+            TableVerdict::SchemaMismatch {
+                missing: vec![],
+                extra: vec!["migrated_at".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn column_order_alone_is_not_a_mismatch() {
+        // A restore may reorder columns; that is not data loss.
+        let mut report = matching_report("users", 10);
+        let mut d = deep("users", "same", "same");
+        d.source_columns
+            .insert("users".into(), vec!["id".into(), "email".into()]);
+        d.dest_columns
+            .insert("users".into(), vec!["email".into(), "id".into()]);
+
+        refine_with_contents(&mut report, &d);
+        assert_eq!(report.tables[0].verdict, TableVerdict::Match);
+    }
+
+    #[test]
+    fn an_existing_row_count_failure_is_not_relabelled() {
+        // The user can already see the counts differ; saying the contents also
+        // differ is noise on a problem they are looking at.
+        let mut expected = BTreeMap::new();
+        expected.insert("orders".to_string(), 10u64);
+        let mut actual = BTreeMap::new();
+        actual.insert("orders".to_string(), 9u64);
+        let mut report = build_report(&expected, &actual, &[], &BTreeMap::new());
+
+        refine_with_contents(&mut report, &deep("orders", "aaa", "bbb"));
+
+        assert!(matches!(
+            report.tables[0].verdict,
+            TableVerdict::RowCountMismatch { .. }
+        ));
+        assert_eq!(report.failures, 1);
+    }
+
+    #[test]
+    fn the_markdown_export_explains_a_content_mismatch() {
+        let mut report = matching_report("orders", 42);
+        refine_with_contents(&mut report, &deep("orders", "aaa", "bbb"));
+        let md = report.to_markdown();
+        assert!(md.contains("CONTENT MISMATCH"), "got: {md}");
+        assert!(md.contains("42 rows on both sides"), "got: {md}");
     }
 }

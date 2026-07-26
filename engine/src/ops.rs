@@ -177,6 +177,12 @@ pub struct VerifyRequest<'a> {
     pub tables_with_data: &'a [String],
     /// Tables expected to exist but be empty.
     pub schema_only: &'a [String],
+    /// Also compare table contents and columns, not just row counts.
+    ///
+    /// Costs a full scan of every table on both sides, which is why it is a
+    /// choice rather than the default — but it is the only thing that catches
+    /// the right number of rows holding the wrong bytes.
+    pub deep: bool,
 }
 
 /// Compare a restored database against what the backup said it contained.
@@ -216,7 +222,27 @@ pub async fn verify_restore(
     .await?;
     drop(dest);
 
-    let report = verify::build_report(&expected, &actual, request.schema_only, &BTreeMap::new());
+    let mut report =
+        verify::build_report(&expected, &actual, request.schema_only, &BTreeMap::new());
+
+    // Row counts are cheap and always available; digests need a full scan. The
+    // deep pass runs second and only ever *downgrades* a match, so a table that
+    // could not be digested stays reported as matching rather than as suspect.
+    if request.deep {
+        ctx.emit(JobPhase::Verify, "comparing table contents").await;
+        match deep_compare(&request, store, &expected).await {
+            Ok(deep) => verify::refine_with_contents(&mut report, &deep),
+            Err(e) => {
+                // Losing the deep comparison weakens verification but must not
+                // fail a restore that the row counts say is good.
+                ctx.emit_warn(
+                    JobPhase::Verify,
+                    format!("could not compare table contents: {e}"),
+                )
+                .await;
+            }
+        }
+    }
 
     let level = if report.passed() {
         JobPhase::Done
@@ -238,6 +264,90 @@ pub async fn verify_restore(
     }
 
     Ok(report)
+}
+
+/// Collect digests and column lists from both sides.
+async fn deep_compare(
+    request: &VerifyRequest<'_>,
+    store: &Store,
+    expected: &BTreeMap<String, u64>,
+) -> Result<verify::DeepComparison, OpError> {
+    let mut tables: Vec<String> = request.tables_with_data.to_vec();
+    tables.extend_from_slice(request.schema_only);
+
+    let source = reach(request.source_profile, store).await?;
+    let (source_digests, source_columns) = digest_tables(
+        request.source_profile,
+        &source.endpoint,
+        request.source_database,
+        &tables,
+    )
+    .await?;
+    drop(source);
+
+    let dest = reach(request.dest_profile, store).await?;
+    let (dest_digests, dest_columns) = digest_tables(
+        request.dest_profile,
+        &dest.endpoint,
+        request.dest_database,
+        &tables,
+    )
+    .await?;
+    drop(dest);
+
+    Ok(verify::DeepComparison {
+        source_digests,
+        dest_digests,
+        source_columns,
+        dest_columns,
+        row_counts: expected.clone(),
+    })
+}
+
+type DigestsAndColumns = (
+    BTreeMap<String, Option<String>>,
+    BTreeMap<String, Vec<String>>,
+);
+
+async fn digest_tables(
+    profile: &ConnectionProfile,
+    endpoint: &Endpoint,
+    database: &str,
+    tables: &[String],
+) -> Result<DigestsAndColumns, OpError> {
+    let params = ConnectParams {
+        engine: profile.engine,
+        host: endpoint.host.clone(),
+        port: endpoint.port,
+        user: endpoint.user.clone(),
+        password: endpoint.password.clone(),
+        database: Some(database.to_string()),
+    };
+    let introspector = crate::db::connect(&params).await?;
+
+    let mut digests = BTreeMap::new();
+    let mut columns = BTreeMap::new();
+
+    for table in tables {
+        // A table that cannot be digested is recorded as `None`, never
+        // skipped: the refinement step needs to know the difference between
+        // "compared and equal" and "could not compare".
+        match introspector.table_digest(database, table).await {
+            Ok(d) => {
+                digests.insert(table.clone(), d);
+            }
+            Err(e) => {
+                tracing::debug!("could not digest {database}.{table}: {e}");
+                digests.insert(table.clone(), None);
+            }
+        }
+        if let Ok(cols) = introspector.column_names(database, table).await {
+            columns.insert(table.clone(), cols);
+        }
+    }
+
+    introspector.close().await;
+    Ok((digests, columns))
 }
 
 /// Exact `COUNT(*)` for each table, skipping ones that do not exist.
@@ -326,6 +436,13 @@ pub struct SyncRequest {
     pub restore: EngineRestoreOptions,
     /// Compare exact row counts once the restore finishes.
     pub verify: bool,
+    /// Also compare table contents and columns.
+    ///
+    /// Defaulted so a stored request written before this existed still
+    /// deserialises — an old schedule keeps its old, shallower behaviour
+    /// rather than silently acquiring a full table scan.
+    #[serde(default)]
+    pub deep_verify: bool,
     /// Applied to the source's backup directory after a successful run.
     pub retention: Option<RetentionPolicy>,
     /// Required when the destination naming strategy is destructive.
@@ -405,6 +522,7 @@ pub async fn sync(
                     dest_database: &target,
                     tables_with_data: &with_data,
                     schema_only: &schema_only,
+                    deep: request.deep_verify,
                 },
                 store,
                 ctx,

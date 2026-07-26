@@ -92,6 +92,7 @@ fn action(restore: Option<ScheduleRestore>) -> ScheduleAction {
         backup: EngineBackupOptions::Mysql(MysqlBackupOptions::default()),
         restore,
         verify: true,
+        deep_verify: false,
         retention: Some(RetentionPolicy {
             keep_last: Some(7),
             max_age_days: Some(30),

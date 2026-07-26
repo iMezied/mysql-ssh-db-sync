@@ -87,6 +87,13 @@ pub struct ScheduleAction {
     /// Present exactly when the schedule has a destination profile.
     pub restore: Option<ScheduleRestore>,
     pub verify: bool,
+    /// Compare table contents, not only row counts.
+    ///
+    /// Off by default and defaulted on deserialise: it costs a full scan of
+    /// every table on both sides, and an existing schedule must not silently
+    /// acquire that cost on upgrade.
+    #[serde(default)]
+    pub deep_verify: bool,
     pub retention: Option<RetentionPolicy>,
 }
 
@@ -265,6 +272,7 @@ impl Schedule {
             naming: restore.naming.clone(),
             restore: restore.options.clone(),
             verify: self.action.verify,
+            deep_verify: self.action.deep_verify,
             retention: self.action.retention,
             // Never populated. See the module docs: an unattended run has
             // nobody to confirm a destructive restore, so it must not be able
@@ -363,6 +371,7 @@ mod tests {
             backup: EngineBackupOptions::Mysql(MysqlBackupOptions::default()),
             restore,
             verify: true,
+            deep_verify: false,
             retention: None,
         }
     }

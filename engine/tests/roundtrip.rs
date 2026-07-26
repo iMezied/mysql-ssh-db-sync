@@ -395,6 +395,7 @@ db_test! {
 
         let report = ops::verify_restore(
             ops::VerifyRequest {
+                deep: true,
                 source_profile: &source,
                 dest_profile: &dest,
                 source_database: "fixture",
@@ -612,6 +613,7 @@ db_test! {
                         options: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
                     }),
                     verify: true,
+                    deep_verify: false,
                     retention: None,
                 },
                 webhook_url: None,
@@ -759,6 +761,7 @@ db_test! {
                     backup: EngineBackupOptions::Mysql(MysqlBackupOptions::default()),
                     restore: None,
                     verify: false,
+                    deep_verify: false,
                     // Keep one. The newest is never deleted, so after two runs
                     // exactly one artifact must remain.
                     retention: Some(db_sync_engine::retention::RetentionPolicy {
@@ -962,5 +965,107 @@ db_test! {
             leftovers.is_empty(),
             "nothing may be dumped before the check runs, found {leftovers:?}"
         );
+    }
+}
+
+// ── Content verification ────────────────────────────────────────────────
+
+db_test! {
+    #[ignore = "requires an unlocked OS keychain"]
+    async fn a_digest_catches_corruption_that_a_row_count_misses() {
+        // The case row counts are blind to, and the reason digests exist: the
+        // right number of rows holding the wrong bytes. Verified against a real
+        // server, by restoring correctly and then editing one value.
+        require_containers!();
+        let (store, _dir) = temp_store().await;
+        let out = tempfile::tempdir().unwrap();
+
+        let source = profile(&store, "digest-source", "root", "testroot").await;
+        let dest = profile(&store, "digest-dest", "dbsync", "testpass").await;
+        let _cleanup = Cleanup(vec![source.id, dest.id]);
+
+        let ctx = JobContext::new(Uuid::new_v4());
+        let artifact = ops::backup(&source, &backup_request(out.path().to_path_buf()), &store, &ctx)
+            .await
+            .expect("backup");
+
+        let target = ops::restore(
+            &dest,
+            &RestoreRequest {
+                artifact_path: artifact,
+                naming: TargetNaming::NewTimestamped { prefix: "digest".into() },
+                engine: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
+                verify_checksum: true,
+                typed_confirmation: None,
+            },
+            &store,
+            &ctx,
+        )
+        .await
+        .expect("restore");
+
+        let with_data = vec!["users".to_string()];
+        let verify_request = || ops::VerifyRequest {
+            deep: true,
+            source_profile: &source,
+            dest_profile: &dest,
+            source_database: "fixture",
+            dest_database: &target,
+            tables_with_data: &with_data,
+            schema_only: &[],
+        };
+
+        // A faithful restore passes both layers.
+        let report = ops::verify_restore(verify_request(), &store, &ctx).await.unwrap();
+        assert!(report.passed(), "a faithful restore should verify: {}", report.to_markdown());
+
+        // Change one value without changing the row count.
+        let _ = tokio::process::Command::new("docker")
+            .args([
+                "exec", "db-sync-mysql-1", "mysql", "-uroot", "-ptestroot",
+                "--default-character-set=utf8mb4", target.as_str(),
+                "-e", "UPDATE users SET email = CONCAT(email, '.tampered') LIMIT 1",
+            ])
+            .output()
+            .await
+            .expect("docker exec");
+
+        // Row counts still agree...
+        assert_eq!(
+            query_scalar(&target, "SELECT COUNT(*) FROM users").await,
+            query_scalar("fixture", "SELECT COUNT(*) FROM users").await,
+            "the tampering must not change the row count, or this proves nothing"
+        );
+
+        // ...but the digest does not.
+        let report = ops::verify_restore(verify_request(), &store, &ctx).await.unwrap();
+        assert!(
+            !report.passed(),
+            "a single changed value must fail verification: {}",
+            report.to_markdown()
+        );
+        assert!(
+            report.to_markdown().contains("CONTENT MISMATCH"),
+            "got: {}",
+            report.to_markdown()
+        );
+
+        // And a shallow run over the same tampered data still passes, which is
+        // exactly the gap this milestone closes.
+        let mut shallow = verify_request();
+        shallow.deep = false;
+        let shallow_report = ops::verify_restore(shallow, &store, &ctx).await.unwrap();
+        assert!(
+            shallow_report.passed(),
+            "row counts alone cannot see this, which is the point"
+        );
+
+        let _ = tokio::process::Command::new("docker")
+            .args([
+                "exec", "db-sync-mysql-1", "mysql", "-uroot", "-ptestroot",
+                "-e", &format!("DROP DATABASE IF EXISTS `{target}`"),
+            ])
+            .output()
+            .await;
     }
 }
