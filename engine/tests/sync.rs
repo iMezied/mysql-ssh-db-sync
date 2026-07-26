@@ -11,6 +11,7 @@ use db_sync_engine::backup::{
     BackupRequest, CommonBackupOptions, EngineBackupOptions, MysqlBackupOptions, TableSelection,
 };
 use db_sync_engine::job::JobContext;
+use db_sync_engine::mask::{MaskRule, MaskTransform};
 use db_sync_engine::ops::{self, SyncRequest};
 use db_sync_engine::plan::{SyncPlanCreate, parse_tables_conf};
 use db_sync_engine::profile::{
@@ -540,5 +541,203 @@ db_test! {
             .await
             .expect_err("dropping a database must require confirmation");
         assert!(format!("{err}").contains("type its name"), "got: {err}");
+    }
+}
+
+// ── Masking ─────────────────────────────────────────────────────────────
+
+/// Decompress an artifact and return its text, for asserting on what the
+/// backup file actually contains.
+async fn artifact_text(path: &str) -> String {
+    let out = tokio::process::Command::new("gzip")
+        .args(["-dc", path])
+        .output()
+        .await
+        .expect("gunzip the artifact");
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// Databases on the destination whose name starts with `prefix`.
+async fn databases_starting_with(prefix: &str) -> Vec<String> {
+    let listed = query_scalar(
+        "mysql",
+        &format!(
+            "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA \
+             WHERE SCHEMA_NAME LIKE '{prefix}%';"
+        ),
+    )
+    .await;
+    listed
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+db_test! {
+    #[ignore = "requires an unlocked OS keychain"]
+    async fn masking_rewrites_the_destination_but_never_the_artifact() {
+        // The documented limitation, asserted rather than trusted: the backup
+        // file is exactly as sensitive as the source. If this ever starts
+        // failing because the artifact *is* masked, the README and the module
+        // docs are wrong and have to change with it.
+        require_containers!();
+        let (store, _dir) = temp_store().await;
+        let out = tempfile::tempdir().unwrap();
+
+        let source = profile(&store, "mk-src", Engine::Mysql, "root", "testroot").await;
+        let dest = profile(&store, "mk-dst", Engine::Mysql, "dbsync", "testpass").await;
+        let _cleanup = Cleanup(vec![source.id, dest.id]);
+
+        let ctx = JobContext::new(Uuid::new_v4());
+        let request = SyncRequest {
+            backup: backup_request(out.path().to_path_buf()),
+            naming: TargetNaming::NewTimestamped { prefix: "mkok".into() },
+            restore: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
+            verify: true,
+            deep_verify: true,
+            masking: vec![MaskRule::email("users", "email")],
+            retention: None,
+            typed_confirmation: None,
+        };
+
+        let outcome = ops::sync(&source, &dest, &request, &store, &ctx)
+            .await
+            .expect("a masked sync should succeed");
+
+        // The destination is masked.
+        let remaining = query_scalar(
+            &outcome.target_database,
+            "SELECT COUNT(*) FROM users WHERE email NOT LIKE '%@example.invalid';",
+        )
+        .await;
+        assert_eq!(remaining, "0", "every address should have been rewritten");
+        assert_eq!(
+            query_scalar(&outcome.target_database, "SELECT COUNT(*) FROM users;").await,
+            "3",
+            "masking rewrites rows, it does not remove them"
+        );
+
+        // The report says so, and only ever says so after the read-back.
+        let report = outcome.masking.expect("a masked sync reports what it masked");
+        assert!(report.verified);
+        assert_eq!(report.columns, vec!["users.email"]);
+        assert_eq!(report.rows_rewritten, 3);
+
+        // The artifact is NOT masked. This is the cost of doing the work on
+        // the destination, and it is stated everywhere it could matter.
+        let dump = artifact_text(&outcome.artifact_path).await;
+        assert!(
+            dump.contains("ada@example.com"),
+            "the artifact holds the real data; if this changed, the docs must too"
+        );
+
+        // Deep verification still passes: the masked table is recorded as not
+        // compared, and every other table is compared normally.
+        let verification = outcome.verification.expect("verification was requested");
+        assert!(
+            verification.passed(),
+            "masking must not make verification fail:\n{}",
+            verification.to_markdown()
+        );
+
+        let _ = query_scalar(
+            "mysql",
+            &format!("DROP DATABASE IF EXISTS `{}`;", outcome.target_database),
+        )
+        .await;
+    }
+}
+
+db_test! {
+    #[ignore = "requires an unlocked OS keychain"]
+    async fn a_masking_failure_destroys_the_destination() {
+        // The guarantee the whole feature rests on. `display_name` is NOT
+        // NULL, so the UPDATE is rejected — and a database holding real
+        // addresses must not survive that.
+        require_containers!();
+        let (store, _dir) = temp_store().await;
+        let out = tempfile::tempdir().unwrap();
+
+        let source = profile(&store, "mf-src", Engine::Mysql, "root", "testroot").await;
+        let dest = profile(&store, "mf-dst", Engine::Mysql, "dbsync", "testpass").await;
+        let _cleanup = Cleanup(vec![source.id, dest.id]);
+
+        let ctx = JobContext::new(Uuid::new_v4());
+        let request = SyncRequest {
+            backup: backup_request(out.path().to_path_buf()),
+            naming: TargetNaming::NewTimestamped { prefix: "mkfail".into() },
+            restore: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
+            verify: true,
+            deep_verify: false,
+            masking: vec![MaskRule {
+                table: "users".into(),
+                column: "display_name".into(),
+                transform: MaskTransform::Null,
+            }],
+            retention: None,
+            typed_confirmation: None,
+        };
+
+        let err = ops::sync(&source, &dest, &request, &store, &ctx)
+            .await
+            .expect_err("NULLing a NOT NULL column cannot succeed");
+        assert!(
+            !matches!(err, ops::OpError::UnmaskedDataLeftBehind { .. }),
+            "the drop itself must have worked: {err}"
+        );
+
+        let survivors = databases_starting_with("mkfail").await;
+        assert!(
+            survivors.is_empty(),
+            "a half-masked database was left standing: {survivors:?}"
+        );
+    }
+}
+
+db_test! {
+    #[ignore = "requires an unlocked OS keychain"]
+    async fn a_rule_naming_a_missing_column_fails_before_anything_is_dumped()  {
+        // The check exists to be cheap. If it ran after the backup, the remedy
+        // would be dropping a database somebody may already be connected to.
+        require_containers!();
+        let (store, _dir) = temp_store().await;
+        let out = tempfile::tempdir().unwrap();
+
+        let source = profile(&store, "mp-src", Engine::Mysql, "root", "testroot").await;
+        let dest = profile(&store, "mp-dst", Engine::Mysql, "dbsync", "testpass").await;
+        let _cleanup = Cleanup(vec![source.id, dest.id]);
+
+        let ctx = JobContext::new(Uuid::new_v4());
+        let request = SyncRequest {
+            backup: backup_request(out.path().to_path_buf()),
+            naming: TargetNaming::NewTimestamped { prefix: "mkpre".into() },
+            restore: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
+            verify: true,
+            deep_verify: false,
+            // The real column is `email`.
+            masking: vec![MaskRule::email("users", "email_address")],
+            retention: None,
+            typed_confirmation: None,
+        };
+
+        let err = ops::sync(&source, &dest, &request, &store, &ctx)
+            .await
+            .expect_err("a rule that protects nothing must not run");
+        assert!(
+            err.to_string().contains("email_address"),
+            "the error should name the rule: {err}"
+        );
+
+        let written: Vec<_> = std::fs::read_dir(out.path()).unwrap().collect();
+        assert!(
+            written.is_empty(),
+            "the check must run before the dump, not after: {written:?}"
+        );
+        assert!(
+            databases_starting_with("mkpre").await.is_empty(),
+            "and nothing should have been restored"
+        );
     }
 }
