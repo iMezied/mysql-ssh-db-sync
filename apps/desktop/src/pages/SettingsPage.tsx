@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import PageHeader from "@/components/PageHeader";
@@ -85,6 +86,8 @@ export default function SettingsPage() {
           )}
         </section>
 
+        <BackupKeySection />
+
         <CommandLineSection />
 
         <section className="space-y-3">
@@ -103,6 +106,160 @@ export default function SettingsPage() {
         </section>
       </div>
     </>
+  );
+}
+
+/**
+ * The key that encrypted backups are written to.
+ *
+ * The export deliberately writes to a file and reports only its path. No
+ * command in this app returns a secret to the webview — the same rule that
+ * governs database passwords — so the key never sits in a JS string where a
+ * script in the page, or an open devtools console, could read it.
+ */
+function BackupKeySection() {
+  const queryClient = useQueryClient();
+  const status = useQuery({ queryKey: ["backup-key"], queryFn: api.backupKeyStatus });
+  const [exportedTo, setExportedTo] = useState<string | null>(null);
+  const [recipients, setRecipients] = useState<string | null>(null);
+
+  const invalidate = () => {
+    void queryClient.invalidateQueries({ queryKey: ["backup-key"] });
+  };
+
+  const generate = useMutation({ mutationFn: api.generateBackupKey, onSuccess: invalidate });
+  const exportKey = useMutation({
+    mutationFn: api.exportBackupKeyToFile,
+    onSuccess: (path) => {
+      setExportedTo(path);
+      invalidate();
+    },
+  });
+  const saveRecipients = useMutation({
+    mutationFn: (keys: string[]) => api.setBackupKeyRecipients(keys),
+    onSuccess: invalidate,
+  });
+
+  const key = status.data;
+  const recipientText =
+    recipients ?? (key?.extra_recipients ?? []).join("\n");
+
+  return (
+    <section className="space-y-3">
+      <h2 className="text-sm font-medium text-slate-200">Backup encryption</h2>
+
+      <div className="panel space-y-4 p-4">
+        {!key?.exists ? (
+          <>
+            <p className="max-w-2xl text-xs leading-relaxed text-slate-500">
+              No key yet. Encrypted backups are blocked until one exists and has
+              been exported — an artifact encrypted to a key nobody has a copy of
+              passes every integrity check and is unreadable forever.
+            </p>
+            <button
+              onClick={() => generate.mutate()}
+              disabled={generate.isPending}
+              className="rounded-md bg-blue-600 px-3 py-1.5 text-sm font-medium text-white transition hover:bg-blue-500 disabled:opacity-50"
+            >
+              {generate.isPending ? "Generating…" : "Generate a key"}
+            </button>
+          </>
+        ) : (
+          <>
+            <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-xs">
+              <dt className="text-slate-500">Public key</dt>
+              <dd className="break-all font-mono text-slate-300">{key.public}</dd>
+            </dl>
+
+            {!key.exported ? (
+              <div className="space-y-2 rounded-md border border-amber-500/30 bg-amber-500/5 p-3">
+                <p className="text-xs leading-relaxed text-amber-200/90">
+                  <strong className="font-semibold">Not exported yet.</strong>{" "}
+                  Encrypted backups stay blocked until you have a copy of this
+                  key somewhere other than this machine. Losing it makes every
+                  encrypted artifact permanently unreadable.
+                </p>
+                <button
+                  onClick={() => exportKey.mutate()}
+                  disabled={exportKey.isPending}
+                  className="rounded-md bg-blue-600 px-3 py-1.5 text-sm font-medium text-white transition hover:bg-blue-500 disabled:opacity-50"
+                >
+                  {exportKey.isPending ? "Writing…" : "Export the key to a file"}
+                </button>
+              </div>
+            ) : (
+              <p className="text-xs text-slate-500">
+                Exported at least once. Encrypted backups are allowed.{" "}
+                <button
+                  className="text-blue-400 underline-offset-2 hover:underline"
+                  onClick={() => exportKey.mutate()}
+                  disabled={exportKey.isPending}
+                >
+                  Export again
+                </button>
+              </p>
+            )}
+
+            {exportedTo && (
+              <div className="space-y-1.5 rounded-md border border-slate-800 bg-slate-950 p-3">
+                <p className="text-xs text-slate-300">
+                  Written to{" "}
+                  <code className="text-slate-200">{exportedTo}</code>
+                </p>
+                <p className="text-xs leading-relaxed text-amber-300/90">
+                  Move it into a password manager or offline storage and delete
+                  the file. It is readable only by you, but it is still a
+                  plaintext secret sitting on the same machine as the backups it
+                  decrypts.
+                </p>
+              </div>
+            )}
+
+            <div className="space-y-2">
+              <label className="field-label" htmlFor="extra-recipients">
+                Additional recipients
+              </label>
+              <textarea
+                id="extra-recipients"
+                rows={3}
+                className="field-input font-mono text-xs"
+                placeholder="age1..."
+                value={recipientText}
+                onChange={(e) => setRecipients(e.target.value)}
+              />
+              <p className="max-w-2xl text-xs leading-relaxed text-slate-500">
+                One <code className="text-slate-400">age1…</code> public key per
+                line. These can decrypt <em>future</em> backups as well as you —
+                a colleague's key here is what makes a restore possible when you
+                are unreachable. This installation's own key is always included.
+              </p>
+              <button
+                onClick={() =>
+                  saveRecipients.mutate(
+                    recipientText
+                      .split("\n")
+                      .map((l) => l.trim())
+                      .filter(Boolean),
+                  )
+                }
+                disabled={saveRecipients.isPending || recipients === null}
+                className="rounded-md border border-slate-700 px-3 py-1.5 text-sm text-slate-300 transition hover:bg-slate-800 disabled:opacity-50"
+              >
+                {saveRecipients.isPending ? "Saving…" : "Save recipients"}
+              </button>
+            </div>
+          </>
+        )}
+
+        {[generate, exportKey, saveRecipients].map((m, i) =>
+          m.isError ? (
+            <p key={i} className="text-xs text-red-400">
+              {(m.error as Error).message}
+            </p>
+          ) : null,
+        )}
+      </div>
+    </section>
   );
 }
 

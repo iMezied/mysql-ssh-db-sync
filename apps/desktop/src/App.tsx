@@ -8,6 +8,7 @@ import BackupPage from "@/pages/BackupPage";
 import RestorePage from "@/pages/RestorePage";
 import SyncPage from "@/pages/SyncPage";
 import SchedulesPage from "@/pages/SchedulesPage";
+import MaskingPage from "@/pages/MaskingPage";
 import LibraryPage from "@/pages/LibraryPage";
 import SettingsPage from "@/pages/SettingsPage";
 import { events } from "@/bindings";
@@ -26,6 +27,7 @@ export default function App() {
           <Route path="/restore" element={<RestorePage />} />
           <Route path="/sync" element={<SyncPage />} />
           <Route path="/schedules" element={<SchedulesPage />} />
+          <Route path="/masking" element={<MaskingPage />} />
           <Route path="/library" element={<LibraryPage />} />
           <Route path="/jobs" element={<JobsPage />} />
           <Route path="/settings" element={<SettingsPage />} />

@@ -1054,3 +1054,41 @@ moved underneath it is as visible as one whose table selection did.
 Corrupt masking JSON is a `StoreError::Corrupt`, never an empty list. Reading
 unparseable rules as "no masking" would hand somebody an unmasked destination
 while the plan still claims the column is protected.
+
+## M9 — The encryption key is exported to a file, not returned to the webview
+
+`commands.rs` opens with a rule this project has held since M0: **no command
+returns a secret.** A password can be written to the keychain and its presence
+queried; there is deliberately no "get password". A value returned across the
+IPC boundary is readable by anything running in the page.
+
+That rule is why encryption had no GUI for three milestones. Escrowing the
+backup key means getting the secret in front of a human, and the obvious
+implementation — return it and render it — is precisely the thing the rule
+forbids. A key sitting in a React state atom is a key in a heap snapshot, a
+devtools console, and any script that gets into the page.
+
+So `export_backup_key_to_file` writes the secret to a file and returns **the
+path**. The UI can say where it went and tell the user to move it into a
+password manager; the value never becomes a JS string. That keeps the M0 rule
+intact rather than carving an exception into it for the one secret that most
+needs protecting.
+
+The file is opened with `mode(0o600)` as part of *creating* it, not chmodded
+afterwards. The difference matters on a shared machine: a chmod after the fact
+leaves a window in which the key exists at the default umask. Both the mode and
+the truncation are covered by tests — truncation because an age secret is a
+fixed length, so a shorter second export would otherwise leave a readable tail
+of the first.
+
+## M9 — The masking UI leads with what masking does not do
+
+The page's first element is a warning, before the connection picker, and it
+says the backup file is not masked.
+
+That is not decoration. The whole feature exists so a production copy can be
+handed to people who should not see production, and the most likely way for it
+to hurt someone is a user who configures masking, sees "3 columns masked", and
+concludes the artifacts in their backup folder are now safe to share. Every
+other surface — module docs, README, `dbsync mask list` — says the same thing,
+because the one place a person forms that belief is the place they set it up.

@@ -294,6 +294,8 @@ Masking rewrites columns so a production copy can be handed to people who are
 not cleared to see production. Rules live on the sync plan, so every schedule
 running that plan inherits them.
 
+Rules are edited on the **Masking** page in the app, or from the CLI:
+
 ```bash
 dbsync mask add nightly users email --transform email
 dbsync mask add nightly users ssn   --transform null
@@ -516,6 +518,10 @@ a schedule that comes due, moves data, verifies it, and enforces retention.
 - **Masking protects the destination, not the artifact.** The backup file still
   holds the real data; a masked sync leaves the destination masked or drops it.
   See [Masking](#masking).
+- **The encryption key is exported to a file, never to the webview.** Settings
+  can ask for the key to be escrowed and is told where it landed; the secret
+  itself never becomes a JS string. The file is created `0600` as part of
+  opening it, so it is never briefly world-readable.
 
 ## Roadmap
 
@@ -535,9 +541,8 @@ a schedule that comes due, moves data, verifies it, and enforces retention.
 | **M12** | Slack and Teams webhook rendering | **Partly** — library analytics outstanding |
 
 Outstanding: off-site destinations (M10), team features (M13), MongoDB and SQL
-Server (M14), and library size/growth analytics. Masking and encryption are
-currently CLI-only; neither has a GUI yet. Restore drills have no scheduled
-kind — they run from cron or the CLI.
+Server (M14), and library size/growth analytics. Restore drills have no
+scheduled kind — they run from cron or the CLI.
 
 Not in scope for v1: incremental/binlog/WAL sync, multi-user access control.
 Trait seams are left where they would attach.

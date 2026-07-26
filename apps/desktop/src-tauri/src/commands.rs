@@ -12,6 +12,7 @@
 use std::path::PathBuf;
 
 use db_sync_engine::backup::{BackupRequest, TableSelection};
+use db_sync_engine::backupkey::{self, KeyStatus};
 use db_sync_engine::connect::{self, ConnectionReport};
 use db_sync_engine::cron::{CronExpression, ScheduleTimezone};
 use db_sync_engine::db::{DatabaseInfo, TableInfo};
@@ -19,6 +20,7 @@ use db_sync_engine::events::{JobKind, JobPhase};
 use db_sync_engine::job::JobRecord;
 use db_sync_engine::job::{JobContext, JobOutcome};
 use db_sync_engine::library::{self, Artifact, IntegrityCheck};
+use db_sync_engine::mask::MaskRule;
 use db_sync_engine::ops::{self, SyncRequest};
 use db_sync_engine::plan::{self, SyncPlan, SyncPlanCreate};
 use db_sync_engine::profile::{ConnectionProfile, ProfileCreate, ProfileUpdate};
@@ -27,6 +29,7 @@ use db_sync_engine::schedule::{Schedule, ScheduleCreate, ScheduleUpdate};
 use db_sync_engine::secrets::{self, SecretKind};
 use db_sync_engine::settings::{self, AppSettings};
 use db_sync_engine::store::StoreError;
+use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri::State;
@@ -578,6 +581,153 @@ pub async fn delete_sync_plan(state: State<'_, AppState>, id: Uuid) -> CmdResult
     Ok(state.store.delete_sync_plan(id).await?)
 }
 
+#[tauri::command]
+#[specta::specta]
+pub async fn set_sync_plan_masking(
+    state: State<'_, AppState>,
+    id: Uuid,
+    masking: Vec<MaskRule>,
+) -> CmdResult<SyncPlan> {
+    Ok(state.store.set_sync_plan_masking(id, masking).await?)
+}
+
+/// The SQL a masking run would send to the destination.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+pub struct MaskingPreview {
+    /// One `UPDATE` per table.
+    pub updates: Vec<String>,
+    /// The read-back; every count must be zero or the sync aborts.
+    pub checks: Vec<String>,
+    /// Rules that would not run, with the reason.
+    pub inert: Vec<db_sync_engine::mask::InertRule>,
+}
+
+/// Show what masking would do, without running it.
+///
+/// The salt appears as a bound placeholder rather than a literal, here and in
+/// the real statements, so this output is safe to paste into a ticket.
+#[tauri::command]
+#[specta::specta]
+pub async fn masking_preview(
+    state: State<'_, AppState>,
+    plan_id: Uuid,
+) -> CmdResult<MaskingPreview> {
+    use db_sync_engine::mask;
+
+    let plan = state
+        .store
+        .get_sync_plan(plan_id)
+        .await?
+        .ok_or_else(|| CommandError::new("not_found", "no such sync plan"))?;
+    let profile = state.store.require_profile(plan.profile_id).await?;
+
+    let active: Vec<MaskRule> = plan.active_masking().into_iter().cloned().collect();
+    let with_data = plan.tables_with_data();
+    let inert = plan
+        .masking
+        .iter()
+        .filter(|r| !with_data.contains(&r.table))
+        .map(|rule| db_sync_engine::mask::InertRule {
+            rule: rule.clone(),
+            reason: format!(
+                "{} is not in this plan as a table carrying data, so no rows reach the \
+                 destination to mask",
+                rule.table
+            ),
+        })
+        .collect();
+
+    let placeholder = "<salt bound at run time>";
+    Ok(MaskingPreview {
+        updates: mask::update_statements(profile.engine, &active, placeholder)
+            .map_err(|e| CommandError::new("invalid", e.to_string()))?
+            .into_iter()
+            .map(|u| u.statement.sql)
+            .collect(),
+        checks: mask::check_statements(profile.engine, &active)
+            .map_err(|e| CommandError::new("invalid", e.to_string()))?
+            .into_iter()
+            .map(|c| c.statement.sql)
+            .collect(),
+        inert,
+    })
+}
+
+// ── Backup encryption key ───────────────────────────────────────────────
+
+#[tauri::command]
+#[specta::specta]
+pub async fn backup_key_status(state: State<'_, AppState>) -> CmdResult<KeyStatus> {
+    backupkey::status(&state.store)
+        .await
+        .map_err(|e| CommandError::new("key", e.to_string()))
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn generate_backup_key(state: State<'_, AppState>) -> CmdResult<KeyStatus> {
+    backupkey::ensure_exists(&state.store)
+        .await
+        .map_err(|e| CommandError::new("key", e.to_string()))
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn set_backup_key_recipients(
+    state: State<'_, AppState>,
+    keys: Vec<String>,
+) -> CmdResult<KeyStatus> {
+    backupkey::set_extra_recipients(&state.store, &keys)
+        .await
+        .map_err(|e| CommandError::new("key", e.to_string()))?;
+    backup_key_status(state).await
+}
+
+/// Write the secret key to a file and return where it went.
+///
+/// The secret is deliberately **not** returned. The webview can ask for the
+/// key to be escrowed and can be told where it landed, but there is no command
+/// anywhere in this app that hands a secret to the frontend — the same rule
+/// that governs database passwords. Copying it out of a file is the user's
+/// job, and it means the value never sits in a JS string, a React state atom,
+/// or a devtools console.
+#[tauri::command]
+#[specta::specta]
+pub async fn export_backup_key_to_file(state: State<'_, AppState>) -> CmdResult<String> {
+    let secret = backupkey::export(&state.store)
+        .await
+        .map_err(|e| CommandError::new("key", e.to_string()))?;
+
+    let dir = db_sync_engine::paths::app_data_dir()
+        .map_err(|e| CommandError::new("io", e.to_string()))?;
+    let path = dir.join("backup-key.txt");
+
+    write_secret_file(&path, secret.expose_secret())
+        .map_err(|e| CommandError::new("io", e.to_string()))?;
+
+    Ok(path.display().to_string())
+}
+
+/// Write a secret to a file only its owner can read.
+///
+/// The mode is set as part of *creating* the file rather than afterwards, so
+/// there is no window in which the secret exists at the default umask and
+/// another user on a shared machine could read it.
+fn write_secret_file(path: &std::path::Path, secret: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut file = options.open(path)?;
+    writeln!(file, "{secret}")
+}
+
 /// Parse a legacy `tables.conf` into selections.
 ///
 /// Lets an existing Bash-tool setup be carried over without retyping a couple
@@ -977,6 +1127,40 @@ mod tests {
     #[test]
     fn an_embedded_quote_cannot_break_out_of_the_crontab_line() {
         assert_eq!(shell_quote("/tmp/it's here"), r"'/tmp/it'\''s here'");
+    }
+
+    #[test]
+    fn an_exported_key_is_readable_only_by_its_owner() {
+        // The whole reason the export writes a file instead of returning the
+        // key: it stays out of the webview. That is only an improvement if the
+        // file it lands in is not world-readable.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup-key.txt");
+        write_secret_file(&path, "AGE-SECRET-KEY-TEST").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "AGE-SECRET-KEY-TEST\n"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "got {mode:o}");
+        }
+    }
+
+    #[test]
+    fn re_exporting_does_not_leave_the_old_key_behind() {
+        // Truncation matters: an age secret is a fixed length, so a shorter
+        // second write would leave a readable tail of the first.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup-key.txt");
+        write_secret_file(&path, "AGE-SECRET-KEY-A-VERY-LONG-ONE").unwrap();
+        write_secret_file(&path, "SHORT").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "SHORT\n");
     }
 }
 

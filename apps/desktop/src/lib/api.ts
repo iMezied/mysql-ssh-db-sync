@@ -1,4 +1,4 @@
-import { commands, type CommandError } from "@/bindings";
+import { commands, type CommandError, type MaskRule } from "@/bindings";
 
 /**
  * tauri-specta returns a discriminated result rather than throwing. Unwrap it
@@ -85,4 +85,15 @@ export const api = {
     unwrap(commands.setAppSettings(...args)),
   cliStatus: () => unwrap(commands.cliStatus()),
   installCli: () => unwrap(commands.installCli()),
+
+  setSyncPlanMasking: (id: string, masking: MaskRule[]) =>
+    unwrap(commands.setSyncPlanMasking(id, masking)),
+  maskingPreview: (planId: string) => unwrap(commands.maskingPreview(planId)),
+
+  backupKeyStatus: () => unwrap(commands.backupKeyStatus()),
+  generateBackupKey: () => unwrap(commands.generateBackupKey()),
+  setBackupKeyRecipients: (keys: string[]) =>
+    unwrap(commands.setBackupKeyRecipients(keys)),
+  /** Writes the secret to a file and returns the path. It never returns the key. */
+  exportBackupKeyToFile: () => unwrap(commands.exportBackupKeyToFile()),
 };

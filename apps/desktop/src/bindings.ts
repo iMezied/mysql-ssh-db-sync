@@ -70,6 +70,28 @@ export const commands = {
 	 *  of hundred table names.
 	 */
 	importTablesConf: (contents: string) => typedError<TableSelection[], CommandError>(__TAURI_INVOKE("import_tables_conf", { contents })),
+	setSyncPlanMasking: (id: string, masking: MaskRule[]) => typedError<SyncPlan, CommandError>(__TAURI_INVOKE("set_sync_plan_masking", { id, masking })),
+	/**
+	 *  Show what masking would do, without running it.
+	 * 
+	 *  The salt appears as a bound placeholder rather than a literal, here and in
+	 *  the real statements, so this output is safe to paste into a ticket.
+	 */
+	maskingPreview: (planId: string) => typedError<MaskingPreview, CommandError>(__TAURI_INVOKE("masking_preview", { planId })),
+	backupKeyStatus: () => typedError<KeyStatus, CommandError>(__TAURI_INVOKE("backup_key_status")),
+	generateBackupKey: () => typedError<KeyStatus, CommandError>(__TAURI_INVOKE("generate_backup_key")),
+	setBackupKeyRecipients: (keys: string[]) => typedError<KeyStatus, CommandError>(__TAURI_INVOKE("set_backup_key_recipients", { keys })),
+	/**
+	 *  Write the secret key to a file and return where it went.
+	 * 
+	 *  The secret is deliberately **not** returned. The webview can ask for the
+	 *  key to be escrowed and can be told where it landed, but there is no command
+	 *  anywhere in this app that hands a secret to the frontend — the same rule
+	 *  that governs database passwords. Copying it out of a file is the user's
+	 *  job, and it means the value never sits in a JS string, a React state atom,
+	 *  or a devtools console.
+	 */
+	exportBackupKeyToFile: () => typedError<string, CommandError>(__TAURI_INVOKE("export_backup_key_to_file")),
 	/**  Start a restore and return its job id immediately. */
 	startRestore: (profileId: string, request: RestoreRequest) => typedError<string, CommandError>(__TAURI_INVOKE("start_restore", { profileId, request })),
 	backupDirectory: () => typedError<string, CommandError>(__TAURI_INVOKE("backup_directory")),
@@ -340,6 +362,11 @@ export type HostKeyPrompt = {
 	previous_fingerprint: string | null,
 };
 
+export type InertRule = {
+	rule: MaskRule,
+	reason: string,
+};
+
 /**  Result of checking an artifact against its manifest. */
 export type IntegrityCheck = { status: "ok" } | { status: "mismatch"; expected: string; actual: string } | { status: "no_manifest" } | { status: "unreadable"; detail: string };
 
@@ -383,6 +410,20 @@ export type JobRecord = {
 	log: string,
 };
 
+/**
+ *  What the UI is allowed to know about the backup key.
+ * 
+ *  The secret half never appears here — [`export`] is the only way out, and it
+ *  is a deliberate, separate action.
+ */
+export type KeyStatus = {
+	exists: boolean,
+	/**  `age1...`, safe to display. */
+	public: string | null,
+	exported: boolean,
+	extra_recipients: string[],
+};
+
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
 /**  One column, one transform. */
@@ -414,6 +455,16 @@ export type MaskTransform =
  *  post-mask check has the final say.
  */
 { kind: "constant"; value: string };
+
+/**  The SQL a masking run would send to the destination. */
+export type MaskingPreview = {
+	/**  One `UPDATE` per table. */
+	updates: string[],
+	/**  The read-back; every count must be zero or the sync aborts. */
+	checks: string[],
+	/**  Rules that would not run, with the reason. */
+	inert: InertRule[],
+};
 
 export type MysqlBackupOptions = {
 	/**  Consistent snapshot without locking. Only meaningful for InnoDB. */
