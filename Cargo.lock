@@ -1362,6 +1362,7 @@ dependencies = [
  "chrono-tz",
  "directories",
  "flate2",
+ "hmac 0.12.1",
  "keyring",
  "libc",
  "reqwest",

@@ -39,6 +39,9 @@ sqlx = { version = "0.8", features = [
 # engine/Cargo.toml so the native backend is always enabled. See DECISIONS.md.
 async-trait = "0.1"
 sha2 = "0.10"
+# SigV4 request signing. Paired with sha2 0.10 — the versions must match,
+# because hmac takes its digest implementation from it.
+hmac = "0.12"
 flate2 = "1"
 
 # Webhook delivery only. `default-features = false` keeps OpenSSL out of the

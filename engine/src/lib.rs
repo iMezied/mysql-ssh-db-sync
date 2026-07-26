@@ -32,6 +32,7 @@ pub mod plan;
 pub mod profile;
 pub mod restore;
 pub mod retention;
+pub mod s3;
 pub mod schedule;
 pub mod scheduler;
 pub mod secrets;
