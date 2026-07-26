@@ -296,6 +296,31 @@ impl BackupRequest {
             ));
         }
 
+        // Encryption streams, and a directory-format dump is written by the
+        // tool itself as many separate files with no stream to wrap. Silently
+        // producing an unencrypted artifact for a request that asked for
+        // encryption is the one outcome that must never happen, so the
+        // combination is refused instead.
+        if self.common.encrypt
+            && let EngineBackupOptions::Postgres(o) = &self.engine
+            && o.format != PgDumpFormat::Plain
+        {
+            return Err(BackupError::Invalid(format!(
+                "encryption needs a single output stream, and the {:?} format writes its own                  archive. Use the plain format to encrypt a PostgreSQL backup.",
+                o.format
+            )));
+        }
+
+        if self.common.encrypt
+            && let EngineBackupOptions::Mysql(o) = &self.engine
+            && o.parallel_threads.is_some()
+        {
+            return Err(BackupError::Invalid(
+                "encryption needs a single output stream, and a parallel dump writes a directory                  of files. Turn off one or the other."
+                    .into(),
+            ));
+        }
+
         // A WHERE filter on a schema-only table silently does nothing; that is
         // almost always a mistake in the plan.
         for s in &self.common.selections {
@@ -420,6 +445,70 @@ mod tests {
             engine: EngineBackupOptions::Mysql(MysqlBackupOptions::default()),
         };
         assert!(req.validate(&profile(Engine::Mysql)).is_err());
+    }
+
+    // ── Encryption ──────────────────────────────────────────────────────
+
+    #[test]
+    fn encryption_is_refused_for_postgres_archive_formats() {
+        // These formats have pg_dump write its own files, so there is no
+        // stream to encrypt. Producing a plaintext artifact for a request that
+        // asked for encryption is the one outcome that must never happen.
+        for format in [PgDumpFormat::Custom, PgDumpFormat::Directory] {
+            let mut c = common();
+            c.encrypt = true;
+            let req = BackupRequest {
+                common: c,
+                engine: EngineBackupOptions::Postgres(PostgresBackupOptions {
+                    format,
+                    ..Default::default()
+                }),
+            };
+            let err = req.validate(&profile(Engine::Postgres)).unwrap_err();
+            assert!(
+                err.to_string().contains("single output stream"),
+                "{format:?} should be refused, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn encryption_is_allowed_for_the_plain_postgres_format() {
+        let mut c = common();
+        c.encrypt = true;
+        let req = BackupRequest {
+            common: c,
+            engine: EngineBackupOptions::Postgres(PostgresBackupOptions {
+                format: PgDumpFormat::Plain,
+                ..Default::default()
+            }),
+        };
+        assert!(req.validate(&profile(Engine::Postgres)).is_ok());
+    }
+
+    #[test]
+    fn encryption_and_parallel_mysql_dump_are_mutually_exclusive() {
+        let mut c = common();
+        c.encrypt = true;
+        let req = BackupRequest {
+            common: c,
+            engine: EngineBackupOptions::Mysql(MysqlBackupOptions {
+                parallel_threads: Some(4),
+                ..Default::default()
+            }),
+        };
+        assert!(req.validate(&profile(Engine::Mysql)).is_err());
+    }
+
+    #[test]
+    fn an_ordinary_mysql_backup_may_be_encrypted() {
+        let mut c = common();
+        c.encrypt = true;
+        let req = BackupRequest {
+            common: c,
+            engine: EngineBackupOptions::Mysql(MysqlBackupOptions::default()),
+        };
+        assert!(req.validate(&profile(Engine::Mysql)).is_ok());
     }
 
     #[test]

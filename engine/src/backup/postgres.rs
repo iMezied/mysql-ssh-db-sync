@@ -14,8 +14,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
-use flate2::Compression;
-use flate2::write::GzEncoder;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
@@ -48,6 +46,8 @@ struct DumpPlan {
     excluded: Vec<String>,
     artifact: PathBuf,
     globals_path: Option<PathBuf>,
+    /// Public keys to encrypt to. Empty means the artifact is not encrypted.
+    recipients: Vec<String>,
 }
 
 enum DumpProgress {
@@ -61,6 +61,8 @@ pub async fn run_postgres_backup(
     request: &BackupRequest,
     endpoint: Endpoint,
     server_version: String,
+    // Public keys to encrypt the artifact to. Empty means no encryption.
+    recipients: &[String],
     ctx: &JobContext,
 ) -> Result<PathBuf, BackupError> {
     request.validate(profile)?;
@@ -166,6 +168,7 @@ pub async fn run_postgres_backup(
         excluded,
         artifact: artifact.clone(),
         globals_path: globals_path.clone(),
+        recipients: recipients.to_vec(),
     };
 
     let current_child: Arc<Mutex<Option<ChildHandle>>> = Arc::new(Mutex::new(None));
@@ -262,7 +265,8 @@ pub async fn run_postgres_backup(
         artifact_filename: filename,
         size_bytes: total_bytes,
         sha256,
-        encrypted: false,
+        encrypted: !recipients.is_empty(),
+        encryption_recipients: recipients.to_vec(),
     };
 
     manifest
@@ -339,7 +343,9 @@ fn run_dump(
                 .map_err(|e| BackupError::Io(format!("could not create the artifact: {e}")))?;
             restrict_permissions(&plan.artifact);
 
-            let mut writer = GzEncoder::new(std::io::BufWriter::new(file), Compression::default());
+            let mut writer =
+                crate::crypto::ArtifactSink::new(std::io::BufWriter::new(file), &plan.recipients)
+                    .map_err(|e| BackupError::Io(e.to_string()))?;
 
             let (child, stdout, stderr) = cmd.spawn_streaming()?;
             {
@@ -553,6 +559,7 @@ mod tests {
 
     fn plan(format: PgDumpFormat) -> DumpPlan {
         DumpPlan {
+            recipients: Vec::new(),
             pg_dump: PathBuf::from("/usr/bin/pg_dump"),
             pg_dumpall: Some(PathBuf::from("/usr/bin/pg_dumpall")),
             endpoint: Endpoint {

@@ -20,8 +20,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
-use flate2::Compression;
-use flate2::write::GzEncoder;
 use secrecy::SecretString;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
@@ -59,6 +57,8 @@ struct DumpPlan {
     include_triggers: bool,
     artifact: PathBuf,
     column_statistics_off: bool,
+    /// Public keys to encrypt to. Empty means the artifact is not encrypted.
+    recipients: Vec<String>,
 }
 
 /// Progress reported from the blocking worker.
@@ -82,6 +82,8 @@ pub async fn run_mysql_backup(
     request: &BackupRequest,
     endpoint: Endpoint,
     server_version: String,
+    // Public keys to encrypt the artifact to. Empty means no encryption.
+    recipients: &[String],
     ctx: &JobContext,
 ) -> Result<PathBuf, BackupError> {
     request.validate(profile)?;
@@ -138,7 +140,15 @@ pub async fn run_mysql_backup(
         .map_err(|e| BackupError::Io(format!("could not create the output directory: {e}")))?;
 
     let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
-    let filename = format!("{}_{}.sql.gz", request.common.database, timestamp);
+    // The extension states what the file is. A `.sql.gz` that is actually
+    // ciphertext produces a baffling gzip error the first time someone reaches
+    // for it outside this app.
+    let suffix = if recipients.is_empty() {
+        "sql.gz"
+    } else {
+        "sql.gz.age"
+    };
+    let filename = format!("{}_{}.{suffix}", request.common.database, timestamp);
     let artifact = request.common.output_dir.join(&filename);
 
     let plan = DumpPlan {
@@ -151,6 +161,7 @@ pub async fn run_mysql_backup(
         include_triggers: options.triggers,
         artifact: artifact.clone(),
         column_statistics_off,
+        recipients: recipients.to_vec(),
     };
 
     // The currently-running child, so cancellation can reach into the blocking
@@ -241,7 +252,8 @@ pub async fn run_mysql_backup(
         artifact_filename: filename,
         size_bytes: total_bytes,
         sha256,
-        encrypted: false,
+        encrypted: !recipients.is_empty(),
+        encryption_recipients: recipients.to_vec(),
     };
 
     manifest
@@ -272,7 +284,9 @@ fn run_dump(
         .map_err(|e| BackupError::Io(format!("could not create the artifact: {e}")))?;
     restrict_permissions(&plan.artifact);
 
-    let mut writer = GzEncoder::new(std::io::BufWriter::new(file), Compression::default());
+    let mut writer =
+        crate::crypto::ArtifactSink::new(std::io::BufWriter::new(file), &plan.recipients)
+            .map_err(|e| BackupError::Io(e.to_string()))?;
 
     let _ = tx.send(DumpProgress::Phase(
         JobPhase::DumpSchema,
@@ -326,10 +340,10 @@ fn run_dump(
             }
         }
 
-        let bytes = writer
-            .get_ref()
-            .get_ref()
-            .metadata()
+        // Stat the path rather than reaching through the writer: the number of
+        // layers now depends on whether encryption is on, and progress
+        // reporting has no business knowing that.
+        let bytes = std::fs::metadata(&plan.artifact)
             .map(|m| m.len())
             .unwrap_or(0);
         let _ = tx.send(DumpProgress::Table {
@@ -367,9 +381,12 @@ fn run_dump(
         }
     }
 
+    // Finishing matters more than it looks: gzip writes its CRC and length
+    // here, and age its final authenticated chunk. Dropping the writer instead
+    // leaves a file that looks complete and is not.
     let buf = writer
         .finish()
-        .map_err(|e| BackupError::Io(format!("could not finish compression: {e}")))?;
+        .map_err(|e| BackupError::Io(format!("could not finish the artifact stream: {e}")))?;
     let file = buf
         .into_inner()
         .map_err(|e| BackupError::Io(format!("could not flush the artifact: {e}")))?;
@@ -580,6 +597,7 @@ mod tests {
 
     fn plan() -> DumpPlan {
         DumpPlan {
+            recipients: Vec::new(),
             mysqldump: PathBuf::from("/usr/bin/mysqldump"),
             endpoint: Endpoint {
                 host: "127.0.0.1".into(),

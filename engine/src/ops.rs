@@ -115,10 +115,34 @@ pub async fn backup(
     let version =
         server_version(profile, &reachable.endpoint, Some(&request.common.database)).await?;
 
+    // Resolved here rather than inside each engine so both get the same rule,
+    // and so the escrow check runs before a single byte is dumped: discovering
+    // that the key was never exported *after* an hour-long dump would be an
+    // expensive way to learn it.
+    let recipients = if request.common.encrypt {
+        ctx.emit(JobPhase::Initializing, "resolving encryption recipients")
+            .await;
+        let keys = crate::backupkey::ensure_ready_for_encryption(store)
+            .await
+            .map_err(|e| BackupError::Invalid(e.to_string()))?;
+        ctx.emit(
+            JobPhase::Initializing,
+            format!("encrypting to {} recipient(s)", keys.len()),
+        )
+        .await;
+        keys
+    } else {
+        Vec::new()
+    };
+
     let endpoint = reachable.endpoint.clone();
     let artifact = match profile.engine {
-        Engine::Mysql => run_mysql_backup(profile, request, endpoint, version, ctx).await?,
-        Engine::Postgres => run_postgres_backup(profile, request, endpoint, version, ctx).await?,
+        Engine::Mysql => {
+            run_mysql_backup(profile, request, endpoint, version, &recipients, ctx).await?
+        }
+        Engine::Postgres => {
+            run_postgres_backup(profile, request, endpoint, version, &recipients, ctx).await?
+        }
     };
 
     Ok(artifact)

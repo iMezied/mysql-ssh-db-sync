@@ -31,6 +31,13 @@ tempfile = "3"
 # beats a string check that lets a typo through until 03:00 three weeks later.
 url = "2"
 reqwest.workspace = true
+# Streaming authenticated encryption for backup artifacts.
+#
+# age's STREAM construction chunks and authenticates as it goes, which is what
+# a multi-gigabyte dump needs. Composing AES-GCM by hand would mean owning
+# nonce derivation and chunk framing — precisely where file-encryption bugs
+# live, and precisely the code you cannot test your way out of after the fact.
+age = "0.11"
 
 [target.'cfg(unix)'.dependencies]
 # Process-group signalling: killing only the direct child orphans a pipeline.

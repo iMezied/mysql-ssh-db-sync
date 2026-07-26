@@ -170,6 +170,7 @@ mod tests {
                 size_bytes: body.len() as u64,
                 sha256: sha256_file(&path).unwrap(),
                 encrypted: false,
+                encryption_recipients: Vec::new(),
             };
             manifest.write(&path).unwrap();
         }

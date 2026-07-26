@@ -273,6 +273,7 @@ mod tests {
             size_bytes: 0,
             sha256: String::new(),
             encrypted: false,
+            encryption_recipients: Vec::new(),
         }
     }
 

@@ -72,6 +72,13 @@ pub struct BackupManifest {
     /// SHA-256 of the artifact, used to detect corruption before a restore.
     pub sha256: String,
     pub encrypted: bool,
+    /// Public keys this artifact was encrypted to.
+    ///
+    /// Recorded so a restore that cannot decrypt can say *which* key is needed
+    /// rather than only that it failed. Defaulted so manifests written before
+    /// encryption existed still parse.
+    #[serde(default)]
+    pub encryption_recipients: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -180,6 +187,7 @@ mod tests {
             size_bytes: 3,
             sha256: sha.into(),
             encrypted: false,
+            encryption_recipients: Vec::new(),
         }
     }
 

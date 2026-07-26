@@ -818,3 +818,149 @@ db_test! {
         );
     }
 }
+
+// ── Encryption at rest ──────────────────────────────────────────────────
+
+db_test! {
+    #[ignore = "requires an unlocked OS keychain"]
+    async fn an_encrypted_backup_round_trips_and_is_unreadable_without_the_key() {
+        require_containers!();
+        let (store, _dir) = temp_store().await;
+        let out = tempfile::tempdir().unwrap();
+
+        let source = profile(&store, "enc-source", "root", "testroot").await;
+        let dest = profile(&store, "enc-dest", "dbsync", "testpass").await;
+        let _cleanup = Cleanup(vec![source.id, dest.id]);
+
+        // A key must exist and be escrowed before an encrypted backup runs.
+        db_sync_engine::backupkey::ensure_exists(&store).await.unwrap();
+        let exported = db_sync_engine::backupkey::export(&store).await.unwrap();
+
+        let mut request = backup_request(out.path().to_path_buf());
+        request.common.encrypt = true;
+
+        let ctx = JobContext::new(Uuid::new_v4());
+        let artifact = ops::backup(&source, &request, &store, &ctx)
+            .await
+            .expect("encrypted backup");
+
+        // ── The artifact really is ciphertext ────────────────────────────
+        assert!(
+            artifact.to_string_lossy().ends_with(".sql.gz.age"),
+            "the extension must say what the file is, got {}",
+            artifact.display()
+        );
+        assert!(
+            db_sync_engine::crypto::looks_encrypted(&artifact),
+            "the artifact does not start with an age header"
+        );
+
+        let raw = std::fs::read(&artifact).unwrap();
+        for probe in [b"CREATE TABLE".as_slice(), b"INSERT INTO".as_slice()] {
+            assert!(
+                !raw.windows(probe.len()).any(|w| w == probe),
+                "plaintext SQL survived into an encrypted artifact"
+            );
+        }
+
+        // ── The manifest names the key needed to read it ─────────────────
+        let manifest = BackupManifest::read(&artifact).expect("manifest");
+        assert!(manifest.encrypted);
+        assert_eq!(manifest.encryption_recipients.len(), 1);
+        manifest.verify_artifact(&artifact).expect("checksum covers the ciphertext");
+
+        // ── And it restores, as a user without SUPER ─────────────────────
+        let restore = RestoreRequest {
+            artifact_path: artifact.clone(),
+            naming: TargetNaming::NewTimestamped { prefix: "enc_restore".into() },
+            engine: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
+            verify_checksum: true,
+            typed_confirmation: None,
+        };
+        let target = ops::restore(&dest, &restore, &store, &ctx)
+            .await
+            .expect("restore of an encrypted artifact");
+
+        assert_eq!(
+            query_scalar(&target, "SELECT COUNT(*) FROM users").await,
+            query_scalar("fixture", "SELECT COUNT(*) FROM users").await,
+            "the decrypted restore must match the source"
+        );
+
+        // ── Without the key it is unreadable ─────────────────────────────
+        // Replacing the installation key simulates the machine that made the
+        // backup being gone. The artifact must refuse to restore, not restore
+        // something wrong.
+        let (other_secret, _other_public) = db_sync_engine::crypto::generate_identity();
+        db_sync_engine::backupkey::import(
+            &store,
+            secrecy::ExposeSecret::expose_secret(&other_secret),
+        )
+        .await
+        .unwrap();
+
+        let err = ops::restore(&dest, &restore, &store, &ctx)
+            .await
+            .expect_err("a foreign key must not decrypt this artifact");
+        let message = err.to_string();
+        assert!(
+            message.contains("decrypt") || message.contains("key"),
+            "the failure should name the cause, got: {message}"
+        );
+
+        // Put the real key back so the keychain is left as we found it.
+        db_sync_engine::backupkey::import(
+            &store,
+            secrecy::ExposeSecret::expose_secret(&exported),
+        )
+        .await
+        .unwrap();
+
+        let _ = tokio::process::Command::new("docker")
+            .args([
+                "exec", "db-sync-mysql-1", "mysql", "-uroot", "-ptestroot",
+                "-e", &format!("DROP DATABASE IF EXISTS `{target}`"),
+            ])
+            .output()
+            .await;
+    }
+}
+
+db_test! {
+    #[ignore = "requires an unlocked OS keychain"]
+    async fn an_encrypted_backup_is_refused_until_the_key_is_escrowed() {
+        // The whole reason escrow is enforced: an artifact encrypted to a key
+        // nobody has a copy of is worse than no artifact at all.
+        require_containers!();
+        let (store, _dir) = temp_store().await;
+        let out = tempfile::tempdir().unwrap();
+
+        let source = profile(&store, "escrow-source", "root", "testroot").await;
+        let _cleanup = Cleanup(vec![source.id]);
+
+        db_sync_engine::backupkey::ensure_exists(&store).await.unwrap();
+        // Deliberately not exported.
+
+        let mut request = backup_request(out.path().to_path_buf());
+        request.common.encrypt = true;
+
+        let ctx = JobContext::new(Uuid::new_v4());
+        let err = ops::backup(&source, &request, &store, &ctx)
+            .await
+            .expect_err("an un-escrowed key must block an encrypted backup");
+        assert!(
+            err.to_string().contains("exported"),
+            "the message must say what to do, got: {err}"
+        );
+
+        let leftovers: Vec<_> = std::fs::read_dir(out.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "nothing may be dumped before the check runs, found {leftovers:?}"
+        );
+    }
+}

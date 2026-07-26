@@ -19,6 +19,12 @@ pub enum SecretKind {
     DbPassword,
     /// Passphrase protecting the SSH private key file.
     SshKeyPassphrase,
+    /// The installation's age identity for encrypting backup artifacts.
+    ///
+    /// Application-scoped rather than per-profile: one key encrypts every
+    /// artifact, so a restore does not depend on which profile made the backup.
+    /// Stored under [`APP_SCOPE`] for that reason.
+    BackupKey,
 }
 
 impl SecretKind {
@@ -26,9 +32,16 @@ impl SecretKind {
         match self {
             SecretKind::DbPassword => "db",
             SecretKind::SshKeyPassphrase => "ssh",
+            SecretKind::BackupKey => "backup-key",
         }
     }
 }
+
+/// The pseudo-profile application-wide secrets are filed under.
+///
+/// The nil UUID can never collide with a real profile: `Uuid::new_v4` does not
+/// generate it, and no profile is ever created with it.
+pub const APP_SCOPE: Uuid = Uuid::nil();
 
 fn account(profile_id: Uuid, kind: SecretKind) -> String {
     format!("{}#{}", profile_id, kind.suffix())
@@ -72,6 +85,10 @@ pub fn has_secret(profile_id: Uuid, kind: SecretKind) -> Result<bool, SecretErro
 }
 
 /// Remove every secret belonging to a profile. Called on profile deletion.
+///
+/// Deliberately does NOT touch [`SecretKind::BackupKey`]: that is
+/// application-scoped, and deleting a profile must never destroy the key that
+/// decrypts every artifact ever taken.
 pub fn delete_all_for_profile(profile_id: Uuid) -> Result<(), SecretError> {
     for kind in [SecretKind::DbPassword, SecretKind::SshKeyPassphrase] {
         let entry = keyring::Entry::new(KEYRING_SERVICE, &account(profile_id, kind))?;

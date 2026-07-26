@@ -8,7 +8,6 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use flate2::read::GzDecoder;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
@@ -39,6 +38,35 @@ pub async fn run_mysql_restore(
 ) -> Result<String, RestoreError> {
     let manifest = BackupManifest::read(&request.artifact_path).ok();
     request.validate(profile, manifest.as_ref())?;
+
+    // Trust the bytes on disk over the manifest. A manifest can be absent,
+    // stale or hand-edited; the age header cannot lie about what the file is,
+    // and getting this wrong means either feeding ciphertext to `mysql` or
+    // silently skipping decryption.
+    let identity = if crate::crypto::looks_encrypted(&request.artifact_path) {
+        let key = crate::backupkey::identity().map_err(|_| {
+            let recipients = manifest
+                .as_ref()
+                .map(|m| m.encryption_recipients.join(", "))
+                .filter(|r| !r.is_empty())
+                .unwrap_or_else(|| "(not recorded)".into());
+            RestoreError::Invalid(format!(
+                "this artifact is encrypted and no backup key is available on this machine. It                  was encrypted to: {recipients}. Import that key in Settings before restoring."
+            ))
+        })?;
+        Some(key)
+    } else {
+        if manifest.as_ref().is_some_and(|m| m.encrypted) {
+            // The manifest says encrypted and the file is not. Something
+            // replaced the artifact; restoring it anyway would be restoring
+            // something nobody vouched for.
+            return Err(RestoreError::Invalid(
+                "the manifest says this artifact is encrypted, but the file is not. It has been                  replaced or corrupted; refusing to restore it."
+                    .into(),
+            ));
+        }
+        None
+    };
 
     let EngineRestoreOptions::Mysql(options) = &request.engine else {
         return Err(RestoreError::EngineMismatch {
@@ -119,6 +147,7 @@ pub async fn run_mysql_restore(
         endpoint,
         target: target.clone(),
         artifact: request.artifact_path.clone(),
+        identity,
         artifact_size,
         options: options.clone(),
         drop_first: request.naming.is_destructive(),
@@ -145,6 +174,8 @@ struct RestoreWorker {
     endpoint: Endpoint,
     target: String,
     artifact: PathBuf,
+    /// Present when the artifact is encrypted; the key that reads it.
+    identity: Option<secrecy::SecretString>,
     artifact_size: u64,
     options: MysqlRestoreOptions,
     drop_first: bool,
@@ -285,10 +316,14 @@ impl RestoreWorker {
 
         // Progress is measured against the compressed size, which is what the
         // user sees on disk.
+        // Counting happens on the *outermost* layer so progress tracks the
+        // bytes actually on disk, which is the number the user can see.
+        // Decryption, then decompression, sit inside it.
         let counted = CountingReader::new(file);
         let counter = counted.counter.clone();
-        let decoder = GzDecoder::new(counted);
-        let mut reader = std::io::BufReader::with_capacity(1 << 16, decoder);
+        let decoded = crate::crypto::artifact_reader(counted, self.identity.as_ref())
+            .map_err(|e| RestoreError::Invalid(e.to_string()))?;
+        let mut reader = std::io::BufReader::with_capacity(1 << 16, decoded);
 
         let mut buf = Vec::with_capacity(1 << 16);
         let mut last_report = 0u64;
@@ -406,6 +441,7 @@ mod tests {
 
     fn worker(naming: &TargetNaming) -> RestoreWorker {
         RestoreWorker {
+            identity: None,
             mysql: PathBuf::from("/usr/bin/mysql"),
             endpoint: Endpoint {
                 host: "127.0.0.1".into(),

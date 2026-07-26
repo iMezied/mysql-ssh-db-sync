@@ -13,8 +13,10 @@
 //!   * [`backup`], [`restore`], [`verify`], [`retention`] — operations.
 
 pub mod backup;
+pub mod backupkey;
 pub mod connect;
 pub mod cron;
+pub mod crypto;
 pub mod db;
 pub mod definer;
 pub mod events;
