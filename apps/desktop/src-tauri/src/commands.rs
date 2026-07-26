@@ -16,6 +16,7 @@ use db_sync_engine::backupkey::{self, KeyStatus};
 use db_sync_engine::connect::{self, ConnectionReport};
 use db_sync_engine::cron::{CronExpression, ScheduleTimezone};
 use db_sync_engine::db::{DatabaseInfo, TableInfo};
+use db_sync_engine::destination::{Destination, DestinationCreate, DestinationUpdate};
 use db_sync_engine::events::{JobKind, JobPhase};
 use db_sync_engine::job::JobRecord;
 use db_sync_engine::job::{JobContext, JobOutcome};
@@ -1164,6 +1165,216 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "SHORT\n");
     }
+}
+
+// ── Off-site destinations ───────────────────────────────────────────────
+
+/// A destination as the UI sees it.
+///
+/// The destination itself carries no secret — see [`db_sync_engine::destination`]
+/// — so it crosses the boundary whole. What is added here is the one fact the
+/// UI needs and cannot derive: whether a credential has been filed for it. A
+/// destination with no key is configured and unusable, which looks identical
+/// to a working one in every other respect.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct DestinationView {
+    #[serde(flatten)]
+    pub destination: Destination,
+    pub has_credential: bool,
+    /// Where this points, e.g. `s3://backups/prod`.
+    pub location: String,
+}
+
+fn destination_view(destination: Destination) -> DestinationView {
+    let has_credential =
+        secrets::has_secret(destination.id, SecretKind::ObjectStoreSecret).unwrap_or(false);
+    DestinationView {
+        location: destination.kind.describe(),
+        destination,
+        has_credential,
+    }
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_destinations(state: State<'_, AppState>) -> CmdResult<Vec<DestinationView>> {
+    Ok(state
+        .store
+        .list_destinations()
+        .await?
+        .into_iter()
+        .map(destination_view)
+        .collect())
+}
+
+/// Create a destination and file its credential.
+///
+/// The secret arrives here and goes straight to the keychain; it is never
+/// stored in the database and never returned. This is the only direction a
+/// secret is allowed to travel across this boundary.
+#[tauri::command]
+#[specta::specta]
+pub async fn create_destination(
+    state: State<'_, AppState>,
+    input: DestinationCreate,
+    secret_access_key: String,
+) -> CmdResult<DestinationView> {
+    if secret_access_key.trim().is_empty() {
+        return Err(CommandError::new(
+            "invalid",
+            "a secret access key is required; without one the destination cannot be used",
+        ));
+    }
+
+    let created = state.store.create_destination(input).await?;
+    // Filed after the row exists, so a rejected configuration never leaves a
+    // credential behind with nothing pointing at it.
+    secrets::set_secret(
+        created.id,
+        SecretKind::ObjectStoreSecret,
+        secret_access_key.trim(),
+    )?;
+    Ok(destination_view(created))
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn update_destination(
+    state: State<'_, AppState>,
+    id: Uuid,
+    patch: DestinationUpdate,
+) -> CmdResult<DestinationView> {
+    Ok(destination_view(
+        state.store.update_destination(id, patch).await?,
+    ))
+}
+
+/// Replace a destination's secret access key.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_destination_credential(
+    state: State<'_, AppState>,
+    id: Uuid,
+    secret_access_key: String,
+) -> CmdResult<DestinationView> {
+    let destination = state.store.require_destination(id).await?;
+    if secret_access_key.trim().is_empty() {
+        return Err(CommandError::new(
+            "invalid",
+            "an empty key would leave this destination unusable; remove it instead",
+        ));
+    }
+    secrets::set_secret(id, SecretKind::ObjectStoreSecret, secret_access_key.trim())?;
+    Ok(destination_view(destination))
+}
+
+/// Delete a destination and the credential belonging to it.
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_destination(state: State<'_, AppState>, id: Uuid) -> CmdResult<bool> {
+    ops::forget_destination(&state.store, id)
+        .await
+        .map_err(|e| CommandError::new("destination", e.to_string()))
+}
+
+/// What a reachability check found.
+///
+/// A struct rather than a `Result` across the boundary, because "this one is
+/// broken" is information the page shows rather than an error that stops it.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct DestinationCheck {
+    pub ok: bool,
+    pub detail: String,
+}
+
+/// Check that a destination is reachable and its credential is accepted.
+///
+/// Narrow on purpose, and the UI says so: this proves the endpoint resolves,
+/// the credential is valid and the bucket can be listed. It does not prove the
+/// credential can *write* — only a write proves that.
+#[tauri::command]
+#[specta::specta]
+pub async fn test_destination(state: State<'_, AppState>, id: Uuid) -> CmdResult<DestinationCheck> {
+    let destination = state.store.require_destination(id).await?;
+    Ok(match ops::test_destination(&destination).await {
+        Ok(()) => DestinationCheck {
+            ok: true,
+            detail: format!(
+                "{} is reachable and accepts the key",
+                destination.kind.describe()
+            ),
+        },
+        Err(e) => DestinationCheck {
+            ok: false,
+            detail: e.to_string(),
+        },
+    })
+}
+
+/// Upload an artifact that is already on disk to every enabled destination.
+///
+/// For backfilling artifacts taken before a destination existed, and for
+/// retrying one whose upload failed. Returns a job id immediately and follows
+/// the same event stream as a backup, because an upload of a large artifact is
+/// exactly as long-running as the dump that produced it.
+///
+/// Deliberately writes no job-history row: history records what a *profile*
+/// did, and a manual push has no profile behind it. Inventing one would put a
+/// row in the list attributed to a connection that was not involved.
+#[tauri::command]
+#[specta::specta]
+pub async fn push_artifact_offsite(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+) -> CmdResult<Uuid> {
+    let artifact = PathBuf::from(&path);
+    if !artifact.is_file() {
+        return Err(CommandError::new(
+            "not_found",
+            format!("{path} is not a file"),
+        ));
+    }
+
+    let job_id = Uuid::new_v4();
+    let ctx = JobContext::with_sender(job_id, state.event_tx.clone());
+    state.jobs.register(&ctx).await;
+
+    let store = state.store.clone();
+    let jobs = state.jobs.clone();
+
+    tauri::async_runtime::spawn(async move {
+        let outcome = match ops::push_offsite(&artifact, &store, &ctx).await {
+            Ok(results) => {
+                let failures = ops::push_failures(&results);
+                if failures.is_empty() {
+                    JobOutcome::Success
+                } else {
+                    // Already emitted per destination by `push_offsite`; this
+                    // is the line that makes the job as a whole read as failed.
+                    ctx.emit_error(
+                        JobPhase::Done,
+                        format!("{} destination(s) failed", failures.len()),
+                    )
+                    .await;
+                    JobOutcome::Failed
+                }
+            }
+            Err(e) => {
+                ctx.emit_error(JobPhase::Done, e.to_string()).await;
+                JobOutcome::Failed
+            }
+        };
+
+        jobs.unregister(job_id).await;
+        let _ = JobFinished {
+            job_id: job_id.to_string(),
+            outcome: outcome.as_str().to_string(),
+        }
+        .emit(&app);
+    });
+
+    Ok(job_id)
 }
 
 // ── Command-line tool ───────────────────────────────────────────────────

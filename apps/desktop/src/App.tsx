@@ -10,6 +10,7 @@ import SyncPage from "@/pages/SyncPage";
 import SchedulesPage from "@/pages/SchedulesPage";
 import MaskingPage from "@/pages/MaskingPage";
 import LibraryPage from "@/pages/LibraryPage";
+import DestinationsPage from "@/pages/DestinationsPage";
 import SettingsPage from "@/pages/SettingsPage";
 import { events } from "@/bindings";
 
@@ -29,6 +30,7 @@ export default function App() {
           <Route path="/schedules" element={<SchedulesPage />} />
           <Route path="/masking" element={<MaskingPage />} />
           <Route path="/library" element={<LibraryPage />} />
+          <Route path="/offsite" element={<DestinationsPage />} />
           <Route path="/jobs" element={<JobsPage />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="*" element={<Navigate to="/profiles" replace />} />

@@ -1265,3 +1265,24 @@ Two related fixes came out of the same reading:
 whose timestamp cannot be parsed is left out of the candidate list entirely
 rather than being given `Utc::now()` — a substituted date is a decision made on
 a number that means nothing.
+
+## M10 — The destinations page leads with what a failed upload costs
+
+The first time a bucket is unreachable, a backup that ran fine and wrote a
+valid artifact turns red in the job list. That is the correct outcome and it is
+surprising, so the page says it before it happens rather than leaving someone
+to work it out from a failure at 3am — including the part that is easy to miss,
+that local retention is skipped too.
+
+The second thing the page is built around is the destination that has no stored
+credential. It is configured, it is enabled, it appears in the list, and it
+cannot upload anything. Every other row looks the same. So `DestinationView`
+carries a `has_credential` flag the engine model has no reason to know about,
+and the row renders it in red — this is the one state where a quiet UI would be
+actively harmful.
+
+`test_destination` is deliberately narrow, and the success message says so:
+listing a bucket proves the endpoint resolves, the credential is valid and the
+bucket exists. It does not prove the credential can *write*. "Test passed"
+invites the opposite reading, so the sentence that follows it removes the
+invitation.

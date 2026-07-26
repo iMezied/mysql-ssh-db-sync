@@ -48,6 +48,10 @@ fn app_with(store: Store, store_path: PathBuf) -> MockApp {
             db_sync_desktop::commands::backup_key_status,
             db_sync_desktop::commands::generate_backup_key,
             db_sync_desktop::commands::set_backup_key_recipients,
+            db_sync_desktop::commands::list_destinations,
+            db_sync_desktop::commands::create_destination,
+            db_sync_desktop::commands::update_destination,
+            db_sync_desktop::commands::delete_destination,
         ])
         .build(mock_context(noop_assets()))
         .expect("mock app should build");
@@ -330,4 +334,149 @@ fn key_commands_answer_over_ipc_without_returning_a_secret() {
             "a secret crossed the IPC boundary: {text}"
         );
     }
+}
+
+// ── Off-site destinations ───────────────────────────────────────────────
+
+fn s3_kind() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "s3",
+        "endpoint": "https://s3.eu-west-1.amazonaws.com",
+        "region": "eu-west-1",
+        "bucket": "acme-backups",
+        "prefix": "prod",
+        "path_style": false,
+        "access_key_id": "AKIDEXAMPLE"
+    })
+}
+
+#[test]
+fn a_destination_with_no_credential_is_refused_before_it_is_stored() {
+    // A destination without a key looks configured and cannot upload. Refusing
+    // at creation is the only point at which the user is still looking at the
+    // form; the alternative surfaces at 3am as a failed backup.
+    //
+    // Runs without a keychain because the validation happens first.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (store, path, _dir, _plan) = rt.block_on(seeded());
+    let app = app_with(store, path);
+
+    let error = invoke_err(
+        &app,
+        "create_destination",
+        serde_json::json!({
+            "input": { "name": "off-site", "kind": s3_kind(), "enabled": true },
+            "secretAccessKey": "   "
+        }),
+    );
+    assert_eq!(error["kind"], "invalid", "got {error}");
+
+    let listed = invoke(&app, "list_destinations", serde_json::json!({}));
+    assert!(
+        listed.as_array().unwrap().is_empty(),
+        "nothing may have been stored: {listed}"
+    );
+}
+
+#[test]
+fn a_plaintext_http_destination_is_refused_over_ipc() {
+    // The engine refuses it; this proves the refusal survives the boundary as
+    // an error the form can show rather than as a panic or a silent success.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (store, path, _dir, _plan) = rt.block_on(seeded());
+    let app = app_with(store, path);
+
+    let mut kind = s3_kind();
+    kind["endpoint"] = serde_json::json!("http://s3.example.com");
+
+    let error = invoke_err(
+        &app,
+        "create_destination",
+        serde_json::json!({
+            "input": { "name": "insecure", "kind": kind, "enabled": true },
+            "secretAccessKey": "a-real-looking-secret"
+        }),
+    );
+    assert_eq!(error["kind"], "invalid", "got {error}");
+    assert!(
+        error["message"].as_str().unwrap().contains("https://"),
+        "the error must carry the fix: {error}"
+    );
+}
+
+#[test]
+#[ignore = "requires an unlocked OS keychain"]
+fn a_destination_round_trips_over_ipc_without_its_secret() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (store, path, _dir, _plan) = rt.block_on(seeded());
+    let app = app_with(store, path);
+
+    let created = invoke(
+        &app,
+        "create_destination",
+        serde_json::json!({
+            "input": {
+                "name": "off-site",
+                "kind": s3_kind(),
+                "enabled": true,
+                "retention": { "keep_last": 30, "max_age_days": null }
+            },
+            "secretAccessKey": "wJalrXUtnFEMI-TESTVALUE"
+        }),
+    );
+
+    // Cleaned up however this test ends.
+    let id: uuid::Uuid = serde_json::from_value(created["id"].clone()).unwrap();
+    struct Cleanup(uuid::Uuid);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = db_sync_engine::secrets::delete_for_destination(self.0);
+        }
+    }
+    let _cleanup = Cleanup(id);
+
+    assert_eq!(created["name"], "off-site");
+    assert_eq!(created["location"], "s3://acme-backups/prod");
+    assert_eq!(
+        created["has_credential"], true,
+        "the UI needs to know a key was filed: {created}"
+    );
+
+    // The rule the whole command surface exists to keep.
+    let text = created.to_string();
+    assert!(
+        !text.contains("wJalrXUtnFEMI-TESTVALUE"),
+        "a secret crossed the IPC boundary: {text}"
+    );
+    assert!(
+        text.contains("AKIDEXAMPLE"),
+        "the key id is not secret and says which credential is in use: {text}"
+    );
+
+    // Disabling keeps the credential — pausing a destination for an afternoon
+    // must not mean setting it up again.
+    let disabled = invoke(
+        &app,
+        "update_destination",
+        serde_json::json!({
+            "id": id,
+            "patch": { "name": null, "kind": null, "enabled": false, "retention": null }
+        }),
+    );
+    assert_eq!(disabled["enabled"], false);
+    assert_eq!(disabled["has_credential"], true, "got {disabled}");
+    assert_eq!(disabled["name"], "off-site", "an absent field is untouched");
+
+    assert_eq!(
+        invoke(&app, "delete_destination", serde_json::json!({ "id": id })),
+        true
+    );
+    assert!(
+        !db_sync_engine::secrets::has_secret(
+            id,
+            db_sync_engine::secrets::SecretKind::ObjectStoreSecret
+        )
+        .unwrap(),
+        "deleting the destination must take its credential with it"
+    );
 }

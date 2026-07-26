@@ -372,6 +372,12 @@ dbsync destination test              # exits non-zero if any is unusable
 dbsync destination push backup.sql.gz   # backfill or retry one artifact
 ```
 
+The desktop app has the same thing under **Off-site**, with presets for S3, R2,
+B2 and MinIO. The Library page's *Send off-site* button is the `push` command.
+A destination with no stored credential is called out in red there, because it
+looks identical to a working one in every other respect and the whole value of
+having one is the belief that a second copy exists.
+
 ### What is guaranteed
 
 - **A failed upload fails the job.** A backup that was written locally but never
@@ -619,12 +625,12 @@ a schedule that comes due, moves data, verifies it, and enforces retention.
 | **M7** | Verification beyond row counts: content digests and column comparison | **Done** |
 | **M8** | Restore drills — proving an artifact restores, on a schedule | **Done** |
 | **M9** | Column-level masking on the destination, with a verified read-back | **Done** |
-| **M10** | Off-site destinations: S3-compatible upload, credentials, off-site retention, CLI | **Partly** — no GUI page yet |
+| **M10** | Off-site destinations: S3-compatible upload, credentials, off-site retention, CLI and GUI | **Done** |
 | **M12** | Slack and Teams webhook rendering | **Partly** — library analytics outstanding |
 
-Outstanding: a destinations page in the GUI, team features (M13), MongoDB and
-SQL Server (M14), and library size/growth analytics. Restore drills have no
-scheduled kind — they run from cron or the CLI.
+Outstanding: team features (M13), MongoDB and SQL Server (M14), and library
+size/growth analytics. Restore drills have no scheduled kind — they run from
+cron or the CLI.
 
 Not in scope for v1: incremental/binlog/WAL sync, multi-user access control.
 Trait seams are left where they would attach.

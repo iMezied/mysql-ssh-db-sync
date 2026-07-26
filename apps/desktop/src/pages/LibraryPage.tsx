@@ -1,6 +1,13 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, FileArchive, ShieldAlert, ShieldCheck, Trash2 } from "lucide-react";
+import {
+  Check,
+  CloudUpload,
+  FileArchive,
+  ShieldAlert,
+  ShieldCheck,
+  Trash2,
+} from "lucide-react";
 
 import PageHeader from "@/components/PageHeader";
 import { api } from "@/lib/api";
@@ -31,6 +38,19 @@ export default function LibraryPage() {
     mutationFn: (path: string) => api.deleteArtifact(path),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["artifacts"] }),
   });
+
+  // For artifacts taken before a destination was configured, and for retrying
+  // one whose upload failed. Progress and per-destination results arrive on
+  // the normal job event stream, so this returns as soon as the job starts.
+  const destinations = useQuery({
+    queryKey: ["destinations"],
+    queryFn: api.listDestinations,
+  });
+  const push = useMutation({
+    mutationFn: (path: string) => api.pushArtifactOffsite(path),
+  });
+  const enabledDestinations =
+    destinations.data?.filter((d) => d.enabled).length ?? 0;
 
   return (
     <>
@@ -66,8 +86,11 @@ export default function LibraryPage() {
               check={checks[a.path]}
               checking={check.isPending && check.variables === a.path}
               deleting={remove.isPending && remove.variables === a.path}
+              pushing={push.isPending && push.variables === a.path}
+              offsiteCount={enabledDestinations}
               onCheck={() => check.mutate(a.path)}
               onDelete={() => remove.mutate(a.path)}
+              onPush={() => push.mutate(a.path)}
             />
           ))}
         </div>
@@ -81,15 +104,21 @@ function ArtifactRow({
   check,
   checking,
   deleting,
+  pushing,
+  offsiteCount,
   onCheck,
   onDelete,
+  onPush,
 }: {
   artifact: Artifact;
   check: IntegrityCheck | undefined;
   checking: boolean;
   deleting: boolean;
+  pushing: boolean;
+  offsiteCount: number;
   onCheck: () => void;
   onDelete: () => void;
+  onPush: () => void;
 }) {
   return (
     <div className="panel px-4 py-3">
@@ -136,6 +165,19 @@ function ArtifactRow({
             className="rounded-md border border-slate-700 px-2.5 py-1.5 text-xs text-slate-300 transition hover:bg-slate-800 disabled:opacity-50"
           >
             {checking ? "Checking…" : "Verify"}
+          </button>
+          <button
+            onClick={onPush}
+            disabled={pushing || offsiteCount === 0}
+            title={
+              offsiteCount === 0
+                ? "No enabled off-site destinations"
+                : `Upload this artifact and its manifest to ${offsiteCount} destination(s)`
+            }
+            className="inline-flex items-center gap-1.5 rounded-md border border-slate-700 px-2.5 py-1.5 text-xs text-slate-300 transition hover:bg-slate-800 disabled:opacity-40"
+          >
+            <CloudUpload className="h-3.5 w-3.5" />
+            {pushing ? "Sending…" : "Send off-site"}
           </button>
           <button
             onClick={onDelete}

@@ -96,4 +96,17 @@ export const api = {
     unwrap(commands.setBackupKeyRecipients(keys)),
   /** Writes the secret to a file and returns the path. It never returns the key. */
   exportBackupKeyToFile: () => unwrap(commands.exportBackupKeyToFile()),
+
+  listDestinations: () => unwrap(commands.listDestinations()),
+  /** The secret goes in and is never returned; it lands in the OS keychain. */
+  createDestination: (...args: Parameters<typeof commands.createDestination>) =>
+    unwrap(commands.createDestination(...args)),
+  updateDestination: (...args: Parameters<typeof commands.updateDestination>) =>
+    unwrap(commands.updateDestination(...args)),
+  setDestinationCredential: (id: string, secret: string) =>
+    unwrap(commands.setDestinationCredential(id, secret)),
+  deleteDestination: (id: string) => unwrap(commands.deleteDestination(id)),
+  testDestination: (id: string) => unwrap(commands.testDestination(id)),
+  pushArtifactOffsite: (path: string) =>
+    unwrap(commands.pushArtifactOffsite(path)),
 };

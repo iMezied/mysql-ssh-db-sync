@@ -140,6 +140,41 @@ export const commands = {
 	schedulerStatus: () => typedError<SchedulerStatus, CommandError>(__TAURI_INVOKE("scheduler_status")),
 	getAppSettings: () => typedError<AppSettings, CommandError>(__TAURI_INVOKE("get_app_settings")),
 	setAppSettings: (next: AppSettings) => typedError<AppSettings, CommandError>(__TAURI_INVOKE("set_app_settings", { next })),
+	listDestinations: () => typedError<DestinationView[], CommandError>(__TAURI_INVOKE("list_destinations")),
+	/**
+	 *  Create a destination and file its credential.
+	 * 
+	 *  The secret arrives here and goes straight to the keychain; it is never
+	 *  stored in the database and never returned. This is the only direction a
+	 *  secret is allowed to travel across this boundary.
+	 */
+	createDestination: (input: DestinationCreate, secretAccessKey: string) => typedError<DestinationView, CommandError>(__TAURI_INVOKE("create_destination", { input, secretAccessKey })),
+	updateDestination: (id: string, patch: DestinationUpdate) => typedError<DestinationView, CommandError>(__TAURI_INVOKE("update_destination", { id, patch })),
+	/**  Replace a destination's secret access key. */
+	setDestinationCredential: (id: string, secretAccessKey: string) => typedError<DestinationView, CommandError>(__TAURI_INVOKE("set_destination_credential", { id, secretAccessKey })),
+	/**  Delete a destination and the credential belonging to it. */
+	deleteDestination: (id: string) => typedError<boolean, CommandError>(__TAURI_INVOKE("delete_destination", { id })),
+	/**
+	 *  Check that a destination is reachable and its credential is accepted.
+	 * 
+	 *  Narrow on purpose, and the UI says so: this proves the endpoint resolves,
+	 *  the credential is valid and the bucket can be listed. It does not prove the
+	 *  credential can *write* — only a write proves that.
+	 */
+	testDestination: (id: string) => typedError<DestinationCheck, CommandError>(__TAURI_INVOKE("test_destination", { id })),
+	/**
+	 *  Upload an artifact that is already on disk to every enabled destination.
+	 * 
+	 *  For backfilling artifacts taken before a destination existed, and for
+	 *  retrying one whose upload failed. Returns a job id immediately and follows
+	 *  the same event stream as a backup, because an upload of a large artifact is
+	 *  exactly as long-running as the dump that produced it.
+	 * 
+	 *  Deliberately writes no job-history row: history records what a *profile*
+	 *  did, and a manual push has no profile behind it. Inventing one would put a
+	 *  row in the list attributed to a connection that was not involved.
+	 */
+	pushArtifactOffsite: (path: string) => typedError<string, CommandError>(__TAURI_INVOKE("push_artifact_offsite", { path })),
 	cliStatus: () => typedError<CliStatus, CommandError>(__TAURI_INVOKE("cli_status")),
 	/**
 	 *  Link the bundled `dbsync` somewhere a terminal will find it.
@@ -318,6 +353,87 @@ export type DbConfig = {
 	user: string,
 	database: string | null,
 };
+
+export type Destination = {
+	id: string,
+	name: string,
+	kind: DestinationKind,
+	/**
+	 *  Disabled destinations are skipped by every backup but keep their
+	 *  configuration and their credential, so turning one off for an
+	 *  afternoon does not mean setting it up again.
+	 */
+	enabled: boolean,
+	/**
+	 *  Retention applied to the objects *at this destination*.
+	 * 
+	 *  Separate from the local policy on purpose. Off-site storage is usually
+	 *  cheaper and is the copy that survives losing the machine, so keeping
+	 *  more there than locally is the common case — a single shared policy
+	 *  would force the two to move together.
+	 */
+	retention: RetentionPolicy,
+	created_at: string,
+	updated_at: string,
+};
+
+/**
+ *  What a reachability check found.
+ * 
+ *  A struct rather than a `Result` across the boundary, because "this one is
+ *  broken" is information the page shows rather than an error that stops it.
+ */
+export type DestinationCheck = {
+	ok: boolean,
+	detail: string,
+};
+
+/**  What the caller supplies to create one. The secret is handled separately. */
+export type DestinationCreate = {
+	name: string,
+	kind: DestinationKind,
+	enabled?: boolean,
+	retention?: RetentionPolicy,
+};
+
+/**
+ *  The transports a destination can use.
+ * 
+ *  A tagged enum rather than a bare struct because the persisted form is JSON
+ *  in a single column: adding SFTP or a second object-store dialect later is a
+ *  new variant, not a migration.
+ */
+export type DestinationKind = 
+/**
+ *  Anything speaking the S3 API: AWS, Cloudflare R2, Backblaze B2,
+ *  Wasabi, MinIO.
+ */
+{
+	kind: "s3",
+} & S3Destination;
+
+/**  A partial edit. `None` leaves a field alone. */
+export type DestinationUpdate = {
+	name: string | null,
+	kind: DestinationKind | null,
+	enabled: boolean | null,
+	retention: RetentionPolicy | null,
+};
+
+/**
+ *  A destination as the UI sees it.
+ * 
+ *  The destination itself carries no secret — see [`db_sync_engine::destination`]
+ *  — so it crosses the boundary whole. What is added here is the one fact the
+ *  UI needs and cannot derive: whether a credential has been filed for it. A
+ *  destination with no key is configured and unusable, which looks identical
+ *  to a working one in every other respect.
+ */
+export type DestinationView = {
+	has_credential: boolean,
+	/**  Where this points, e.g. `s3://backups/prod`. */
+	location: string,
+} & Destination;
 
 /**
  *  A supported database engine.
@@ -676,6 +792,19 @@ export type RunReport = {
 	verification: VerificationSummary | null,
 	removed_artifacts: number | null,
 	error: string | null,
+};
+
+/**  An S3-compatible bucket. No secret: see the module docs. */
+export type S3Destination = {
+	/**  Base URL with scheme, e.g. `https://s3.eu-west-1.amazonaws.com`. */
+	endpoint: string,
+	region: string,
+	bucket: string,
+	/**  Key prefix, so one bucket can hold several sources. */
+	prefix?: string,
+	/**  `https://endpoint/bucket/key` rather than `https://bucket.endpoint/key`. */
+	path_style?: boolean,
+	access_key_id: string,
 };
 
 /**  A named, recurring job. */

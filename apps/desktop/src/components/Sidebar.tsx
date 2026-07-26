@@ -2,6 +2,7 @@ import { NavLink } from "react-router-dom";
 import {
   Archive,
   ArrowLeftRight,
+  CloudUpload,
   CalendarClock,
   Database,
   DownloadCloud,
@@ -21,6 +22,7 @@ const links = [
   { to: "/schedules", label: "Schedules", icon: CalendarClock },
   { to: "/masking", label: "Masking", icon: EyeOff },
   { to: "/library", label: "Library", icon: Archive },
+  { to: "/offsite", label: "Off-site", icon: CloudUpload },
   { to: "/jobs", label: "Jobs", icon: ListChecks },
   { to: "/settings", label: "Settings", icon: Settings },
 ] as const;

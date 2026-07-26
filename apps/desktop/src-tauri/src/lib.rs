@@ -150,6 +150,13 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             commands::scheduler_status,
             commands::get_app_settings,
             commands::set_app_settings,
+            commands::list_destinations,
+            commands::create_destination,
+            commands::update_destination,
+            commands::set_destination_credential,
+            commands::delete_destination,
+            commands::test_destination,
+            commands::push_artifact_offsite,
             commands::cli_status,
             commands::install_cli,
         ])
