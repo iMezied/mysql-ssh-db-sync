@@ -105,10 +105,14 @@ jobs:
       - name: Start MySQL, PostgreSQL and sshd
         run: docker compose -f docker-compose.test.yml up -d --wait
 
-      # The engine shells out to these; they are never bundled (GPL — see
-      # DECISIONS.md), so CI installs them the same way a user would.
-      - name: Install MySQL client tools
-        run: sudo apt-get update && sudo apt-get install -y mysql-client
+      # The engine shells out to these; they are never bundled (GPL applies to
+      # mysqldump — see DECISIONS.md), so CI installs them as a user would.
+      # The PostgreSQL client major version must match the fixture server: a
+      # newer pg_dump emits directives an older server rejects on restore.
+      - name: Install database client tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mysql-client postgresql-client
 
       - name: Build CLI
         run: cargo build -p db-sync-cli

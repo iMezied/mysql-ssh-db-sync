@@ -267,7 +267,11 @@ db_test! {
 
         let info = db.server_info().await.expect("server info");
         assert_eq!(info.engine, Engine::Postgres);
-        assert!(info.version.starts_with("16"), "expected PostgreSQL 16, got {}", info.version);
+        assert!(
+            info.version.starts_with("18"),
+            "expected PostgreSQL 18, got {}",
+            info.version
+        );
         assert!(info.can_read_catalog);
         db.close().await;
     }

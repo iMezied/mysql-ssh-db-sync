@@ -5,7 +5,12 @@ import { AlertTriangle, Database, Play, Search } from "lucide-react";
 import PageHeader from "@/components/PageHeader";
 import { api } from "@/lib/api";
 import { cn, formatBytes } from "@/lib/utils";
-import type { BackupRequest, TableInfo } from "@/bindings";
+import type {
+  BackupRequest,
+  EngineBackupOptions,
+  PgDumpFormat,
+  TableInfo,
+} from "@/bindings";
 
 type TableMode = "schema_and_data" | "schema_only" | "exclude";
 
@@ -37,6 +42,7 @@ export default function BackupPage() {
   const [filter, setFilter] = useState("");
   const [modes, setModes] = useState<Record<string, TableMode>>({});
   const [started, setStarted] = useState<string | null>(null);
+  const [pgFormat, setPgFormat] = useState<PgDumpFormat>("custom");
 
   const profiles = useQuery({ queryKey: ["profiles"], queryFn: api.listProfiles });
   const backupDir = useQuery({
@@ -84,22 +90,23 @@ export default function BackupPage() {
     [tables.data, modes],
   );
 
-  const start = useMutation({
-    mutationFn: () => {
-      const rows = tables.data ?? [];
-      const request: BackupRequest = {
-        common: {
-          database,
-          selections: rows.map((t) => ({
-            name: t.name,
-            mode: modes[keyOf(t)] ?? "schema_only",
-            where_filter: null,
-          })),
-          output_dir: backupDir.data ?? "",
-          compress: true,
-          encrypt: false,
-        },
-        engine: {
+  const selectedProfile = profiles.data?.find((p) => p.id === profileId);
+
+  const engineOptions = (): EngineBackupOptions =>
+    selectedProfile?.engine === "postgres"
+      ? {
+          engine: "postgres",
+          format: pgFormat,
+          no_owner: true,
+          no_privileges: true,
+          blobs: true,
+          schemas: [],
+          serializable_deferrable: false,
+          parallel_jobs: null,
+          include_globals: false,
+          extra_flags: [],
+        }
+      : {
           engine: "mysql",
           single_transaction: true,
           hex_blob: true,
@@ -114,19 +121,35 @@ export default function BackupPage() {
           strip_definer: true,
           parallel_threads: null,
           extra_flags: [],
+        };
+
+  const start = useMutation({
+    mutationFn: () => {
+      const rows = tables.data ?? [];
+      const request: BackupRequest = {
+        common: {
+          database,
+          selections: rows.map((t) => ({
+            // Schema-qualified. A bare name matches in every schema for
+            // PostgreSQL, which would exclude data from a same-named table
+            // elsewhere.
+            name: keyOf(t),
+            mode: modes[keyOf(t)] ?? "schema_only",
+            where_filter: null,
+          })),
+          output_dir: backupDir.data ?? "",
+          compress: true,
+          encrypt: false,
         },
+        engine: engineOptions(),
       };
       return api.startBackup(profileId, request);
     },
     onSuccess: (jobId) => setStarted(jobId),
   });
 
-  const selectedProfile = profiles.data?.find((p) => p.id === profileId);
   const canRun =
-    profileId !== "" &&
-    database !== "" &&
-    (tables.data?.length ?? 0) > 0 &&
-    selectedProfile?.engine === "mysql";
+    profileId !== "" && database !== "" && (tables.data?.length ?? 0) > 0;
 
   const setVisibleTo = (mode: TableMode) => {
     setModes((prev) => {
@@ -304,9 +327,18 @@ export default function BackupPage() {
               </button>
 
               {selectedProfile?.engine === "postgres" && (
-                <span className="text-xs text-amber-400">
-                  PostgreSQL backup arrives in the next milestone.
-                </span>
+                <label className="flex items-center gap-2 text-xs text-slate-400">
+                  Format
+                  <select
+                    className="rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-xs text-slate-200"
+                    value={pgFormat}
+                    onChange={(e) => setPgFormat(e.target.value as PgDumpFormat)}
+                  >
+                    <option value="custom">Custom (selective + parallel restore)</option>
+                    <option value="directory">Directory (parallel dump)</option>
+                    <option value="plain">Plain SQL (no selective restore)</option>
+                  </select>
+                </label>
               )}
 
               {backupDir.data && (

@@ -20,15 +20,17 @@ uuid.workspace = true
 chrono.workspace = true
 sqlx.workspace = true
 async-trait.workspace = true
+sha2.workspace = true
+flate2.workspace = true
+specta.workspace = true
 directories = "5"
+russh = "0.62"
+# Used at runtime for pg_restore's TOC filter, not just in tests.
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 # Process-group signalling: killing only the direct child orphans a pipeline.
 libc = "0.2"
-sha2.workspace = true
-flate2.workspace = true
-specta.workspace = true
-russh = "0.62"
 
 # keyring's credential store is chosen by feature flag. With default features it
 # compiles to an in-memory mock that loses everything between Entry instances,
@@ -46,5 +48,4 @@ keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
-tempfile = "3"
 secrecy.workspace = true

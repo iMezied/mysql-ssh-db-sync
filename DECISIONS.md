@@ -405,3 +405,79 @@ installs keg-only into `/opt/homebrew/opt/mysql-client/bin` — not on `PATH`.
 locations, because a GUI app launched from Finder does not inherit the shell's
 `PATH` at all. Discovery finding a keg-only install is a small proof that the
 search list is doing real work.
+
+---
+
+## M3′ — PostgreSQL backup and restore
+
+### One pg_dump pass, not three
+
+MySQL needs separate schema, data and trigger passes. PostgreSQL does not:
+`--exclude-table-data` keeps a table's structure while dropping its rows, which
+is exactly what the UI's "schema only" selection means, and `pg_dump` already
+emits constraints, indexes and triggers *after* the data. The trigger-ordering
+bug that bit the MySQL path cannot arise here.
+
+Table names are schema-qualified throughout. A bare PostgreSQL pattern matches
+in every schema, so `--exclude-table-data=orders` would also strip the rows
+from `reporting.orders`. The UI sends `schema.table` for both engines.
+
+### A newer pg_dump produces a dump an older server cannot restore
+
+`pg_dump` 18 emits `SET transaction_timeout = 0`. That parameter arrived in
+PostgreSQL 17, so restoring such a dump into a 16 server aborts with
+"unrecognized configuration parameter". The *dump* succeeds — only the restore
+fails, potentially much later.
+
+The original guard treated one major version of drift as fine and only warned
+beyond that. It now warns for **any** client-newer-than-server gap, names the
+restore hazard, and names the client version to install instead. Dumping with a
+newer client is still allowed, because it is correct when the destination is
+equally new.
+
+Found by running the round-trip against a PostgreSQL 16 fixture with the
+host's `pg_dump` 18. The test fixture now runs a server matching the client,
+since matching versions is what the app recommends; the mismatch cases are
+covered by unit tests on `check_pg_dump_compatibility`.
+
+### Selective restore filters data entries only
+
+`pg_restore -L` takes a filtered table of contents. Filtering table
+*definitions* as well looks tempting and is a trap: a TOC line for an index or
+constraint names the index, not the table it belongs to, so there is no way to
+tell from `--list` output which ones belong to a table being dropped. With
+`--exit-on-error` set, the first orphaned index aborts the whole restore.
+
+So the full schema is always restored and selection controls which tables'
+rows come with it. That is also the more useful reading of "restore only these
+tables", and it leaves the destination structurally complete either way.
+
+### Archive formats write themselves; plain SQL is piped
+
+`custom` and `directory` are given `--file` and left to write their own output,
+which is also what makes `--jobs` possible for the directory format. Plain SQL
+goes to stdout so it can be gzipped in flight, the same as the MySQL path.
+
+A directory archive has no single file to hash, so its manifest records no
+checksum rather than a misleading one, and the restore path skips the
+integrity check for that format instead of failing it.
+
+### psql needs ON_ERROR_STOP
+
+By default `psql` reports success having skipped statements that failed, which
+would report a broken restore as a good one. Every invocation sets
+`ON_ERROR_STOP=1`, and `pg_restore` gets `--exit-on-error` for the same reason.
+
+The target database is created from a connection to `postgres`, because a
+database cannot be created from inside itself.
+
+### Target-specific dependency sections are easy to get wrong
+
+An earlier edit inserted `libc` under `[target.'cfg(unix)'.dependencies]` and
+silently swept `sha2`, `flate2`, `specta` and `russh` into that section with
+it. Everything still built on macOS and Linux; the Windows CI job would have
+failed on four missing crates. `tempfile` later landed inside the *Linux*
+target block the same way.
+
+Worth checking the whole manifest after any edit near a `[target....]` header —
+appending to `[dependencies]` is not what a naive text insertion does.

@@ -126,8 +126,18 @@ impl CompatibilityVerdict {
     }
 }
 
-/// `pg_dump` refuses to dump from a server newer than itself, and the failure
-/// mode is a confusing mid-dump error. Check before opening a tunnel.
+/// Check `pg_dump` against the server it will read.
+///
+/// Two distinct hazards, and they point in opposite directions:
+///
+/// * **Client older than the server** — `pg_dump` refuses outright, part-way
+///   through, with a confusing message. Blocked.
+/// * **Client newer than the server** — the dump *succeeds*, but embeds
+///   directives the older server does not understand, so it fails on restore.
+///   pg_dump 18 emits `SET transaction_timeout = 0`, a parameter introduced in
+///   PostgreSQL 17; restoring that into a 16 server aborts with "unrecognized
+///   configuration parameter". Warned, with the fix named, because dumping with
+///   a newer client is fine when the destination is equally new.
 pub fn check_pg_dump_compatibility(client: Version, server: Version) -> CompatibilityVerdict {
     if client.major < server.major {
         return CompatibilityVerdict::Blocked(format!(
@@ -136,10 +146,13 @@ pub fn check_pg_dump_compatibility(client: Version, server: Version) -> Compatib
             server.major
         ));
     }
-    if client.major > server.major + 1 {
+    if client.major > server.major {
         return CompatibilityVerdict::Warn(format!(
-            "pg_dump {client} is much newer than the server ({server}); \
-             this usually works but is untested by the vendor."
+            "pg_dump {client} is newer than the server ({server}). The dump will \
+             succeed, but it may contain directives this server version does not \
+             understand, so restoring it back into a PostgreSQL {} server can fail. \
+             Use PostgreSQL {} client tools to match the server.",
+            server.major, server.major
         ));
     }
     CompatibilityVerdict::Ok
@@ -201,15 +214,10 @@ mod tests {
     }
 
     #[test]
-    fn newer_pg_dump_is_ok_within_one_major() {
-        assert!(
-            check_pg_dump_compatibility(Version::new(17, 0, 0), Version::new(16, 2, 0)).is_ok()
-        );
-    }
-
-    #[test]
-    fn much_newer_pg_dump_warns_but_does_not_block() {
-        let verdict = check_pg_dump_compatibility(Version::new(18, 0, 0), Version::new(15, 0, 0));
+    fn even_one_major_newer_is_flagged() {
+        // Not "close enough": PostgreSQL 17 added transaction_timeout, which a
+        // 16 server rejects when restoring a dump taken with a 17 client.
+        let verdict = check_pg_dump_compatibility(Version::new(17, 0, 0), Version::new(16, 2, 0));
         assert!(matches!(verdict, CompatibilityVerdict::Warn(_)));
     }
 

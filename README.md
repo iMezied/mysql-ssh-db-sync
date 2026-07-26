@@ -3,10 +3,10 @@
 Cross-server database backup, restore and sync for MySQL and PostgreSQL — a
 desktop app for DBAs, plus a headless CLI that does exactly the same things.
 
-> **Status: M2′.** MySQL backup and restore work end to end over SSH tunnels,
-> with exact-count verification. PostgreSQL support lands next — see
-> [Roadmap](#roadmap). The original Bash tool in this repo still works and is
-> unchanged; see [Legacy tool](#legacy-tool).
+> **Status: M3′.** MySQL and PostgreSQL backup and restore both work end to end
+> over SSH tunnels, with exact-count verification, parallel and selective
+> restore for PostgreSQL archives. The original Bash tool in this repo still
+> works and is unchanged; see [Legacy tool](#legacy-tool).
 
 ---
 
@@ -128,11 +128,22 @@ must be able to do.
 Requires Rust (stable, edition 2024 — 1.85+), Node 20+, Docker for the
 integration fixtures, and the MySQL client tools.
 
-The engine shells out to `mysqldump` and `mysql`; they are never bundled (see
-[DECISIONS.md](DECISIONS.md) on the GPL implications). Install them with
-`brew install mysql-client` on macOS or `apt install mysql-client` on Debian.
-Homebrew installs keg-only, which is fine — discovery searches that location
-even though it is not on `PATH`.
+The engine shells out to `mysqldump`/`mysql` and `pg_dump`/`pg_restore`/`psql`;
+they are never bundled (see [DECISIONS.md](DECISIONS.md) on the GPL
+implications for `mysqldump`).
+
+```bash
+brew install mysql-client libpq        # macOS
+apt install mysql-client postgresql-client   # Debian
+```
+
+Homebrew installs both keg-only, which is fine — discovery searches those
+locations even though they are not on `PATH`.
+
+**Match the PostgreSQL client major version to the server you back up.** A
+newer `pg_dump` produces a dump an older server cannot restore: `pg_dump` 18
+emits `SET transaction_timeout = 0`, which PostgreSQL 16 rejects. The app warns
+when it detects this.
 
 ```bash
 cargo build --workspace
@@ -192,6 +203,12 @@ It dumps the fixture through a tunnel, restores it as a user without SUPER, and
 checks that binary payloads, unicode identifiers, a foreign-key cycle and rows
 containing the literal text `DEFINER=` all survive.
 
+The PostgreSQL equivalent covers all three dump formats and selective restore:
+
+```bash
+cargo test -p db-sync-engine --test roundtrip_pg -- --ignored
+```
+
 Keychain tests touch the real OS credential store, so they are `#[ignore]`d —
 CI runners have no unlocked keychain. Run them locally after changing anything
 credential related:
@@ -221,8 +238,8 @@ cargo test -p db-sync-engine --test keychain -- --ignored
 | **M0** | Engine/CLI/GUI split, persistence, secrets, options model, DEFINER filter, verification, retention, test harness, CI | **Done** |
 | **M1′** | SSH tunnels (russh) with jump hosts and host-key pinning, table introspection, test-connection | **Done** |
 | **M2′** | MySQL backup and restore end to end, cancellation, backup library, verification | **Done** |
-| **M3′** | PostgreSQL backup and restore, formats, parallel and selective restore | Next |
-| **M4′** | Sync wizard, scheduler, notifications, retention enforcement, packaging | |
+| **M3′** | PostgreSQL backup and restore, formats, parallel and selective restore | **Done** |
+| **M4′** | Sync wizard, scheduler, notifications, retention enforcement, packaging | Next |
 
 Not in scope for v1: data masking, incremental/binlog/WAL sync, cloud upload,
 multi-user access control. Trait seams are left where they would attach.

@@ -30,7 +30,13 @@ services:
       start_period: 30s
 
   postgres:
-    image: postgres:16
+    # Matched to the pg_dump major version the host provides. A newer pg_dump
+    # emits directives an older server rejects on restore — pg_dump 18 against
+    # a 16 server produces `SET transaction_timeout = 0`, which 16 does not
+    # recognise. Matching versions is what the app recommends, so it is what
+    # the fixture exercises. The mismatch cases are covered by unit tests on
+    # check_pg_dump_compatibility.
+    image: postgres:18
     environment:
       POSTGRES_PASSWORD: testpass
       POSTGRES_USER: dbsync

@@ -8,13 +8,13 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::backup::mysql::Endpoint;
-use crate::backup::{BackupError, BackupRequest, run_mysql_backup};
+use crate::backup::{BackupError, BackupRequest, run_mysql_backup, run_postgres_backup};
 use crate::connect::{self, ConnectError};
 use crate::db::ConnectParams;
 use crate::events::{JobKind, JobPhase};
 use crate::job::{JobContext, JobOutcome, JobRecord};
 use crate::profile::ConnectionProfile;
-use crate::restore::{RestoreError, RestoreRequest, run_mysql_restore};
+use crate::restore::{RestoreError, RestoreRequest, run_mysql_restore, run_postgres_restore};
 use crate::secrets::{self, SecretKind};
 use crate::ssh::TunnelHandle;
 use crate::store::Store;
@@ -33,8 +33,6 @@ pub enum OpError {
     Db(#[from] crate::db::DbError),
     #[error(transparent)]
     Store(#[from] crate::store::StoreError),
-    #[error("{0} is not supported yet for this engine")]
-    Unsupported(&'static str),
 }
 
 /// A tunnel plus the local endpoint the tools should talk to.
@@ -93,10 +91,6 @@ pub async fn backup(
     store: &Store,
     ctx: &JobContext,
 ) -> Result<PathBuf, OpError> {
-    if profile.engine != Engine::Mysql {
-        return Err(OpError::Unsupported("PostgreSQL backup"));
-    }
-
     ctx.emit(JobPhase::SshConnect, "connecting to the source")
         .await;
     let reachable = reach(profile, store).await?;
@@ -106,8 +100,11 @@ pub async fn backup(
     let version =
         server_version(profile, &reachable.endpoint, Some(&request.common.database)).await?;
 
-    let artifact =
-        run_mysql_backup(profile, request, reachable.endpoint.clone(), version, ctx).await?;
+    let endpoint = reachable.endpoint.clone();
+    let artifact = match profile.engine {
+        Engine::Mysql => run_mysql_backup(profile, request, endpoint, version, ctx).await?,
+        Engine::Postgres => run_postgres_backup(profile, request, endpoint, version, ctx).await?,
+    };
 
     Ok(artifact)
 }
@@ -119,15 +116,15 @@ pub async fn restore(
     store: &Store,
     ctx: &JobContext,
 ) -> Result<String, OpError> {
-    if profile.engine != Engine::Mysql {
-        return Err(OpError::Unsupported("PostgreSQL restore"));
-    }
-
     ctx.emit(JobPhase::SshConnect, "connecting to the destination")
         .await;
     let reachable = reach(profile, store).await?;
 
-    let target = run_mysql_restore(profile, request, reachable.endpoint.clone(), ctx).await?;
+    let endpoint = reachable.endpoint.clone();
+    let target = match profile.engine {
+        Engine::Mysql => run_mysql_restore(profile, request, endpoint, ctx).await?,
+        Engine::Postgres => run_postgres_restore(profile, request, endpoint, ctx).await?,
+    };
     Ok(target)
 }
 
@@ -214,6 +211,8 @@ async fn count_tables(
     database: &str,
     tables: &[String],
 ) -> Result<BTreeMap<String, u64>, OpError> {
+    // PostgreSQL can only see the database it connected to, so the target
+    // database is part of the connection rather than just the query.
     let params = ConnectParams {
         engine: profile.engine,
         host: endpoint.host.clone(),

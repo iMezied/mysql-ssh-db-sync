@@ -16,8 +16,10 @@ use crate::profile::ConnectionProfile;
 use crate::types::Engine;
 
 pub mod mysql;
+pub mod postgres;
 
 pub use mysql::run_mysql_backup;
+pub use postgres::run_postgres_backup;
 
 /// What to do with one table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]

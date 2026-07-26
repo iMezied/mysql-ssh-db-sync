@@ -10,8 +10,10 @@ use crate::profile::ConnectionProfile;
 use crate::types::{Engine, EnvironmentTag};
 
 pub mod mysql;
+pub mod postgres;
 
 pub use mysql::run_mysql_restore;
+pub use postgres::run_postgres_restore;
 
 /// How the destination database is chosen.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
