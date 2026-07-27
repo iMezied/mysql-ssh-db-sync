@@ -1543,3 +1543,61 @@ The config-import entry is written inside `share::import` rather than at each
 call site, so the CLI and the app produce the same record. An entry that only
 appeared when the import happened to go through the GUI would be worse than
 none: its absence would mean nothing.
+
+## M14 — Not attempted, and why that is the right call
+
+MongoDB and SQL Server are on the roadmap. They are not in this codebase, and
+adding a stub would be worse than the gap: an `Engine::Mongo` variant appears
+in the connection form's engine dropdown the moment it exists, and every path
+behind it would fail at the point someone relied on it. That is the exact
+failure mode this project has spent every milestone removing.
+
+The work is not plumbing. Measured against the code as it stands:
+
+- **27 exhaustive `match` arms on `Engine`**, across introspection, both backup
+  workers, both restore workers, masking, tool discovery, the CLI and the GUI.
+  Those are mechanical.
+- **Three engine-shaped abstractions** — `Introspector`, `EngineBackupOptions`,
+  `EngineRestoreOptions` — each of which assumes a relational shape.
+- **The introspection contract is SQL.** `list_tables`, `exact_row_count`,
+  `table_digest` and `column_names` are all defined in terms of tables, rows
+  and columns.
+
+### MongoDB
+
+The transport fits: `mongodump --archive --gzip` streams to stdout and
+`mongorestore --archive` reads stdin, which is the same shape the existing
+workers use. What does not fit is everything above it.
+
+- **Masking generates `UPDATE … SET`.** A document store needs `updateMany`
+  with an aggregation pipeline — a separate implementation, not a dialect
+  variation, and one where the "prove it worked" read-back has to be rewritten
+  too.
+- **`table_digest` is a SQL checksum.** Content verification would need a
+  different mechanism entirely.
+- **A `mongodb` driver dependency** joins the bundle that gets signed and
+  notarised, which is a decision this project has made carefully each time.
+
+### SQL Server
+
+The harder of the two, and the reason is architectural rather than
+incremental. `BACKUP DATABASE` writes **server-side**. This application is
+built on streaming a dump from a client, through an SSH tunnel, into a local
+artifact whose checksum it controls — and SQL Server's native mechanism does
+not produce a client-side stream at all. The alternatives are `bcp`
+(per-table export, no schema) or `mssql-scripter` (a Python tool, not a
+first-party binary this app could reasonably discover and depend on).
+
+Choosing among those changes what an "artifact" is, which is the concept every
+other feature here is built on: the manifest, the checksum, the restore drill,
+off-site upload and retention all assume one file the client produced.
+
+### What would have to be decided first
+
+1. Whether `Introspector` splits into a relational trait and a smaller common
+   one, or whether non-relational engines get a different contract.
+2. What masking means for a document store, and whether the "masked or gone"
+   guarantee survives it.
+3. What an artifact is for SQL Server, given no client-side stream.
+
+None of those is answerable by writing code faster. They are the milestone.

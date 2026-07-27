@@ -676,7 +676,16 @@ a schedule that comes due, moves data, verifies it, and enforces retention.
 
 | **M13** | Shareable configuration export/import carrying no credentials, audit trail | **Done** |
 
-Outstanding: MongoDB and SQL Server (M14).
+**M14 (MongoDB, SQL Server) is not started**, and deliberately so — a stub
+would put an engine in the connection dropdown that fails behind every path.
+It is not plumbing: 27 exhaustive `match` arms on `Engine`, three
+engine-shaped abstractions, and an introspection contract defined in terms of
+tables, rows and columns. MongoDB needs masking reimplemented as aggregation
+pipelines and content verification rebuilt; SQL Server has no client-side dump
+stream at all, so "what is an artifact" — the concept the manifest, checksum,
+drill, off-site upload and retention are all built on — has to be answered
+first. [DECISIONS.md](DECISIONS.md) records the three questions that have to be
+settled before any code is written.
 
 A drill compares exact row counts only when the backup recorded them
 (`--count-rows`, or the toggle on the Backup and Schedules pages). Without
