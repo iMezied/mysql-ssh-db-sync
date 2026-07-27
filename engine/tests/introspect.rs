@@ -410,3 +410,74 @@ db_test! {
         db.close().await;
     }
 }
+
+// ── MongoDB ─────────────────────────────────────────────────────────────
+//
+// These prove the driver works over a forwarded port: the handshake, the
+// catalog, and a pool held across many queries.
+//
+// What they do **not** prove is that `direct_connection(true)` is doing
+// anything, and it is worth being clear about that rather than letting the
+// file imply otherwise. That setting stops the driver rediscovering a replica
+// set's members by their own advertised hostnames — which through a tunnel
+// resolve to nothing on this side. The fixture is a *standalone*, which
+// advertises no members, so discovery has nothing to redirect to and these
+// pass with the setting either way. Confirmed by flipping it off and watching
+// them still pass.
+//
+// Covering it would need a replica-set fixture, which would stop exercising
+// the standalone behaviour that `--oplog` being off by default exists for.
+// The trade is recorded in `db.rs` next to the setting.
+
+db_test! {
+    async fn mongo_server_info_through_a_tunnel() {
+        require_containers!();
+        let db = introspector_for(Engine::Mongo, None).await;
+
+        let info = db.server_info().await.expect("server info");
+        assert_eq!(info.engine, Engine::Mongo);
+        assert!(
+            info.version.starts_with('7'),
+            "expected MongoDB 7, got {}",
+            info.version
+        );
+        assert!(info.can_read_catalog);
+        db.close().await;
+    }
+}
+
+db_test! {
+    async fn mongo_reads_collections_through_a_tunnel() {
+        require_containers!();
+        let db = introspector_for(Engine::Mongo, None).await;
+
+        let names: Vec<String> = db
+            .list_tables("fixture")
+            .await
+            .expect("list collections")
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(names.contains(&"users".to_string()), "got {names:?}");
+
+        // Reaching the data, not just the catalog: a tunnel that forwards the
+        // handshake and then stalls would pass the check above.
+        assert_eq!(db.exact_row_count("fixture", "users").await.unwrap(), 4);
+        db.close().await;
+    }
+}
+
+db_test! {
+    async fn mongo_holds_one_tunnel_across_many_queries() {
+        require_containers!();
+        let db = introspector_for(Engine::Mongo, None).await;
+
+        // The driver keeps a pool and reuses it. If discovery were running, a
+        // later query could be sent to a rediscovered address rather than the
+        // forwarded one, so this fails partway rather than at the first call.
+        for _ in 0..25 {
+            assert_eq!(db.exact_row_count("fixture", "orders").await.unwrap(), 3);
+        }
+        db.close().await;
+    }
+}

@@ -658,12 +658,21 @@ impl MongoIntrospector {
                 host: params.host.clone(),
                 port: Some(params.port),
             }])
-            // Load-bearing for tunnels, and the single most confusing failure
-            // in this driver if it is left off. Without it the driver runs
-            // discovery, learns the replica set members' *own* hostnames, and
-            // then tries to dial those — which from this side of an SSH tunnel
-            // resolve to nothing, or worse, to something else entirely. The
-            // endpoint we were handed is the endpoint we talk to.
+            // Only matters against a replica set, and against one it is the
+            // difference between working and failing bafflingly. Left off, the
+            // driver runs discovery, learns the members' *own* advertised
+            // hostnames, and dials those — which from this side of an SSH
+            // tunnel resolve to nothing, or worse, to something else entirely.
+            // The endpoint we were handed is the endpoint we talk to.
+            //
+            // Not covered by a test, and it cannot be with the current
+            // fixture: `tests/introspect.rs` tunnels to a *standalone*, which
+            // advertises no members, so discovery finds nothing to redirect to
+            // and the tunnelled tests pass whether this is set or not. Proving
+            // it would need a replica-set fixture — which would in turn stop
+            // exercising the standalone-only behaviour `--oplog` depends on.
+            // Recorded here rather than left as a test that looks like cover
+            // and is not.
             .direct_connection(true)
             .app_name(Some("DBSync Studio".to_string()))
             .connect_timeout(Some(std::time::Duration::from_secs(15)))
