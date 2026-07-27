@@ -7,6 +7,7 @@ import {
   Copy,
   Play,
   Plus,
+  ShieldCheck,
   Trash2,
   X,
 } from "lucide-react";
@@ -21,10 +22,16 @@ import type {
   EngineRestoreOptions,
   NotifyPolicy,
   ScheduleCreate,
+  ScheduleKind,
   ScheduleTimezone,
   ScheduleView,
   SyncPlan,
 } from "@/bindings";
+
+/** Where a new sync schedule starts. */
+const DEFAULT_SYNC_CRON = "30 2 * * *";
+/** Later than the backup, so a drill checks a finished artifact. */
+const DEFAULT_DRILL_CRON = "0 4 * * *";
 
 /** Expressions people actually want, so nobody has to remember the field order. */
 const PRESETS = [
@@ -64,7 +71,7 @@ export default function SchedulesPage() {
     <>
       <PageHeader
         title="Schedules"
-        description="Run a sync plan on a timer, unattended."
+        description="Run a backup, a sync, or a restore drill on a timer — unattended."
       />
 
       <div className="space-y-5 p-6">
@@ -159,6 +166,15 @@ function ScheduleRow({ view }: { view: ScheduleView }) {
             <span className="text-sm font-medium text-slate-100">
               {schedule.name}
             </span>
+            {schedule.kind === "drill" && (
+              // Distinguished because the two do opposite things: a sync
+              // produces backups, a drill checks them. A list that showed
+              // them alike would make "we have four schedules" say nothing
+              // about whether any of them verifies anything.
+              <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] uppercase text-emerald-300">
+                drill
+              </span>
+            )}
             {!schedule.enabled && (
               <span className="rounded bg-slate-700 px-1.5 py-0.5 text-[10px] uppercase text-slate-300">
                 paused
@@ -178,7 +194,14 @@ function ScheduleRow({ view }: { view: ScheduleView }) {
           </p>
 
           <p className="mt-0.5 text-xs text-slate-500">
-            {schedule.dest_profile_id ? "Sync to another server" : "Backup only"}
+            {/* A drill has a destination profile too — it has to restore
+                somewhere — so this cannot be decided by that field alone,
+                or every drill would read as a cross-server sync. */}
+            {schedule.kind === "drill"
+              ? "Restores the newest backup and checks it"
+              : schedule.dest_profile_id
+                ? "Sync to another server"
+                : "Backup only"}
             {" · next "}
             {view.next_run_at
               ? new Date(view.next_run_at).toLocaleString()
@@ -273,11 +296,12 @@ function ScheduleRow({ view }: { view: ScheduleView }) {
 function ScheduleForm({ onClose }: { onClose: () => void }) {
   const queryClient = useQueryClient();
 
+  const [kind, setKind] = useState<ScheduleKind>("sync");
   const [name, setName] = useState("");
   const [sourceId, setSourceId] = useState("");
   const [planId, setPlanId] = useState("");
   const [destId, setDestId] = useState("");
-  const [cron, setCron] = useState("30 2 * * *");
+  const [cron, setCron] = useState(DEFAULT_SYNC_CRON);
   const [timezone, setTimezone] = useState<ScheduleTimezone>("local");
   const [verify, setVerify] = useState(true);
   const [catchUp, setCatchUp] = useState(true);
@@ -285,6 +309,12 @@ function ScheduleForm({ onClose }: { onClose: () => void }) {
   const [notify, setNotify] = useState<NotifyPolicy>("on_failure");
   const [webhook, setWebhook] = useState("");
   const [prefix, setPrefix] = useState("scheduled");
+  // Drill-only.
+  const [drillProfileId, setDrillProfileId] = useState("");
+  const [drillDeep, setDrillDeep] = useState(false);
+  const [drillKeepOnFailure, setDrillKeepOnFailure] = useState(false);
+
+  const isDrill = kind === "drill";
 
   const profiles = useQuery({ queryKey: ["profiles"], queryFn: api.listProfiles });
   const backupDir = useQuery({
@@ -307,6 +337,7 @@ function ScheduleForm({ onClose }: { onClose: () => void }) {
   });
 
   const source = profiles.data?.find((p) => p.id === sourceId);
+  const drillProfile = profiles.data?.find((p) => p.id === drillProfileId);
   const dest = profiles.data?.find((p) => p.id === destId);
   const plan = plans.data?.find((p: SyncPlan) => p.id === planId);
 
@@ -315,6 +346,39 @@ function ScheduleForm({ onClose }: { onClose: () => void }) {
 
   const engineBackupOptions = (): EngineBackupOptions =>
     source?.engine === "postgres"
+      ? {
+          engine: "postgres",
+          format: "custom",
+          no_owner: true,
+          no_privileges: true,
+          blobs: true,
+          schemas: [],
+          serializable_deferrable: false,
+          parallel_jobs: null,
+          include_globals: false,
+          extra_flags: [],
+        }
+      : {
+          engine: "mysql",
+          single_transaction: true,
+          hex_blob: true,
+          set_gtid_purged_off: true,
+          add_drop_table: true,
+          extended_insert: true,
+          routines: true,
+          triggers: true,
+          events: true,
+          default_character_set: "utf8mb4",
+          disable_column_statistics: false,
+          strip_definer: true,
+          parallel_threads: null,
+          extra_flags: [],
+        };
+
+  /// A drill never dumps anything; these only satisfy the shared action shape,
+  /// and the engine derives its restore options from the same engine tag.
+  const drillBackupOptions = (): EngineBackupOptions =>
+    drillProfile?.engine === "postgres"
       ? {
           engine: "postgres",
           format: "custom",
@@ -366,7 +430,38 @@ function ScheduleForm({ onClose }: { onClose: () => void }) {
 
   const create = useMutation({
     mutationFn: () => {
-      const input: ScheduleCreate = {
+      const input: ScheduleCreate = isDrill
+        ? {
+            kind: "drill",
+            name,
+            // A drill has no plan: it restores whatever artifact is newest,
+            // and the artifact already fixes what it contains.
+            plan_id: null,
+            dest_profile_id: drillProfileId,
+            cron,
+            timezone,
+            action: {
+              output_dir: backupDir.data ?? "",
+              // Backup-shaped fields a drill does not use. The engine's
+              // validate() is what keeps the combination honest.
+              compress: true,
+              encrypt: false,
+              backup: drillBackupOptions(),
+              // Refused by the engine for a drill: the scratch database name
+              // is generated there, and nothing else is droppable.
+              restore: null,
+              verify: true,
+              deep_verify: drillDeep,
+              retention: null,
+              keep_on_failure: drillKeepOnFailure,
+            },
+            webhook_url: webhook.trim() === "" ? null : webhook.trim(),
+            notify,
+            catch_up: false,
+            enabled: true,
+          }
+        : {
+        kind: "sync",
         name,
         plan_id: planId,
         dest_profile_id: destId || null,
@@ -403,12 +498,13 @@ function ScheduleForm({ onClose }: { onClose: () => void }) {
   });
 
   const cronValid = preview.isSuccess;
-  const ready =
-    name.trim() !== "" &&
-    planId !== "" &&
-    cronValid &&
-    !engineMismatch &&
-    (destId === "" || destId !== sourceId);
+  const ready = isDrill
+    ? name.trim() !== "" && drillProfileId !== "" && cronValid
+    : name.trim() !== "" &&
+      planId !== "" &&
+      cronValid &&
+      !engineMismatch &&
+      (destId === "" || destId !== sourceId);
 
   const nextRuns = useMemo(
     () => preview.data?.next_runs.slice(0, 5) ?? [],
@@ -424,16 +520,79 @@ function ScheduleForm({ onClose }: { onClose: () => void }) {
         </SmallButton>
       </div>
 
-      <label className="block max-w-md">
-        <span className="field-label">Name</span>
-        <input
-          className="field-input"
-          value={name}
-          placeholder="Nightly staging refresh"
-          onChange={(e) => setName(e.target.value)}
-        />
-      </label>
+      <div className="grid gap-3 sm:grid-cols-2">
+        <label className="block">
+          <span className="field-label">What it does</span>
+          <select
+            className="field-input"
+            value={kind}
+            onChange={(e) => {
+              const next = e.target.value as ScheduleKind;
+              setKind(next);
+              // A drill checks the newest artifact, so running it at the same
+              // time as the backup that produces one means checking last
+              // night's while tonight's is still being written. Nudged later
+              // by default; the field is still free.
+              if (next === "drill" && cron === DEFAULT_SYNC_CRON) {
+                setCron(DEFAULT_DRILL_CRON);
+              } else if (next === "sync" && cron === DEFAULT_DRILL_CRON) {
+                setCron(DEFAULT_SYNC_CRON);
+              }
+            }}
+          >
+            <option value="sync">Back up — and optionally restore elsewhere</option>
+            <option value="drill">Drill — prove the newest backup restores</option>
+          </select>
+        </label>
 
+        <label className="block">
+          <span className="field-label">Name</span>
+          <input
+            className="field-input"
+            value={name}
+            placeholder={isDrill ? "Nightly drill" : "Nightly staging refresh"}
+            onChange={(e) => setName(e.target.value)}
+          />
+        </label>
+      </div>
+
+      {isDrill && <DrillExplainer />}
+
+      {isDrill ? (
+        <>
+          <ProfilePicker
+            label="Restore into"
+            value={drillProfileId}
+            profiles={profiles.data ?? []}
+            onChange={setDrillProfileId}
+          />
+
+          {drillProfile?.environment === "prod" && (
+            <Warning>
+              {drillProfile.name} is tagged <strong>production</strong>. A drill
+              only ever creates its own scratch database and drops it again —
+              but it does run a full restore against this server every night,
+              which is load you may not want there.
+            </Warning>
+          )}
+
+          <div className="space-y-2">
+            <Checkbox checked={drillDeep} onChange={setDrillDeep}>
+              Read every row, not just count them — catches corruption a
+              <code className="mx-1 text-slate-400">COUNT(*)</code> never
+              touches, at the cost of a full scan.
+            </Checkbox>
+            <Checkbox
+              checked={drillKeepOnFailure}
+              onChange={setDrillKeepOnFailure}
+            >
+              Leave the scratch database behind when the drill fails, so the
+              wreckage can be inspected. A passing drill always cleans up.
+            </Checkbox>
+          </div>
+        </>
+      ) : (
+      <>
       <div className="grid grid-cols-2 gap-4">
         <ProfilePicker
           label="Source"
@@ -511,6 +670,8 @@ function ScheduleForm({ onClose }: { onClose: () => void }) {
           always create a new timestamped database and never drop an existing
           one, but check you meant this server.
         </Warning>
+      )}
+      </>
       )}
 
       {/* ── When ─────────────────────────────────────────────────────── */}
@@ -593,28 +754,37 @@ function ScheduleForm({ onClose }: { onClose: () => void }) {
           </Checkbox>
         )}
 
-        <Checkbox checked={catchUp} onChange={setCatchUp}>
-          Catch up a run missed while the machine was asleep
-        </Checkbox>
+        {/* Both are about producing and keeping artifacts. A drill produces
+            none — it reads the newest one — so showing either would offer a
+            control that does nothing, which is the quiet kind of wrong this
+            project keeps removing. A missed drill is also not worth making up
+            at 09:00: the next night's run answers the same question. */}
+        {!isDrill && (
+          <>
+            <Checkbox checked={catchUp} onChange={setCatchUp}>
+              Catch up a run missed while the machine was asleep
+            </Checkbox>
 
-        <label className="flex items-center gap-2 text-xs text-slate-300">
-          <input
-            type="checkbox"
-            checked={keepLast !== null}
-            onChange={(e) => setKeepLast(e.target.checked ? 7 : null)}
-            className="h-4 w-4 rounded border-slate-600 bg-slate-900"
-          />
-          Keep only the newest
-          <input
-            type="number"
-            min={1}
-            disabled={keepLast === null}
-            value={keepLast ?? 7}
-            onChange={(e) => setKeepLast(Number(e.target.value))}
-            className="w-14 rounded border border-slate-700 bg-slate-950 px-1.5 py-1 text-xs disabled:opacity-40"
-          />
-          backups
-        </label>
+            <label className="flex items-center gap-2 text-xs text-slate-300">
+              <input
+                type="checkbox"
+                checked={keepLast !== null}
+                onChange={(e) => setKeepLast(e.target.checked ? 7 : null)}
+                className="h-4 w-4 rounded border-slate-600 bg-slate-900"
+              />
+              Keep only the newest
+              <input
+                type="number"
+                min={1}
+                disabled={keepLast === null}
+                value={keepLast ?? 7}
+                onChange={(e) => setKeepLast(Number(e.target.value))}
+                className="w-14 rounded border border-slate-700 bg-slate-950 px-1.5 py-1 text-xs disabled:opacity-40"
+              />
+              backups
+            </label>
+          </>
+        )}
       </div>
 
       <div className="flex flex-wrap items-end gap-4">
@@ -787,6 +957,40 @@ function ProfilePicker({
           ))}
       </select>
     </label>
+  );
+}
+
+/**
+ * What a drill is, said where somebody is deciding whether to create one.
+ *
+ * The value is entirely in it being automatic, and the reason it needs
+ * explaining is that "restore into a scratch database every night" sounds
+ * alarming until you know it cannot touch anything else.
+ */
+function DrillExplainer() {
+  return (
+    <div className="flex gap-3 rounded-lg border border-slate-700 bg-slate-800/40 p-4">
+      <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-emerald-400" />
+      <div className="space-y-2 text-xs leading-relaxed text-slate-300">
+        <p>
+          A backup is a belief until it has been restored. A checksum proves the
+          bytes are the bytes that were written; it says nothing about whether
+          the dump was coherent or whether a server will accept it.
+        </p>
+        <p>
+          Each run takes the <strong>newest</strong> artifact in the backup
+          folder, restores it into a scratch database, checks it against its own
+          manifest, and drops it again. The scratch name is generated by the
+          engine, and a drill refuses to drop anything that does not match the
+          name it generated — so it cannot reach an existing database.
+        </p>
+        <p className="text-slate-500">
+          It checks the artifact against its manifest, not against the live
+          source. The source has moved on since the backup was taken, so
+          comparing to it would report normal drift as corruption.
+        </p>
+      </div>
+    </div>
   );
 }
 

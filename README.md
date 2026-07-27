@@ -645,8 +645,7 @@ a schedule that comes due, moves data, verifies it, and enforces retention.
 | **M12** | Slack and Teams webhook rendering | **Partly** — library analytics outstanding |
 
 Outstanding: team features (M13), MongoDB and SQL Server (M14), and library
-size/growth analytics. Drill schedules can be created from the CLI
-(`dbsync schedule add-drill`) but not yet from the app's schedules page.
+size/growth analytics.
 
 Not in scope for v1: incremental/binlog/WAL sync, multi-user access control.
 Trait seams are left where they would attach.
