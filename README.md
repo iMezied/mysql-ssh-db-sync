@@ -389,6 +389,21 @@ dbsync destination test              # exits non-zero if any is unusable
 dbsync destination push backup.sql.gz   # backfill or retry one artifact
 ```
 
+```bash
+dbsync config export --out team.json   # no credentials are in it
+dbsync config import team.json --dry-run
+dbsync config import team.json
+```
+
+A bundle carries connections, sync plans and off-site destinations — the shape
+of the work, not the ability to do it. **It contains no passwords, no SSH keys
+and no access keys**, because the types it is built from have no field one
+could occupy. It is safe to commit or attach to an onboarding document.
+Importing matches existing records by name, creates what is missing, updates
+what is there, and never removes anything the bundle omits. Imported
+destinations arrive switched off, since a destination with no credential
+cannot upload and an enabled one that cannot upload fails every backup.
+
 `dbsync library` summarises what is on disk — sizes, per-day growth, and any
 backup that came out far smaller than the one before it. It exits non-zero on
 that last one, so it works as a cron check. That failure is invisible to
@@ -651,7 +666,9 @@ a schedule that comes due, moves data, verifies it, and enforces retention.
 | **M10** | Off-site destinations: S3-compatible upload, credentials, off-site retention, CLI and GUI | **Done** |
 | **M12** | Slack and Teams webhook rendering, library size and growth analytics | **Done** |
 
-Outstanding: team features (M13) and MongoDB / SQL Server (M14).
+| **M13** | Shareable configuration export/import that carries no credentials | **Partly** — audit trail outstanding |
+
+Outstanding: an audit trail (M13), and MongoDB / SQL Server (M14).
 
 A drill compares exact row counts only when the backup recorded them
 (`--count-rows`, or the toggle on the Backup and Schedules pages). Without

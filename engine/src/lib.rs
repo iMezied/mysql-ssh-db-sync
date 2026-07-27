@@ -38,6 +38,7 @@ pub mod schedule;
 pub mod scheduler;
 pub mod secrets;
 pub mod settings;
+pub mod share;
 pub mod ssh;
 pub mod store;
 pub mod tools;

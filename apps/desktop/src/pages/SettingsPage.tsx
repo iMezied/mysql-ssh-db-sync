@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import PageHeader from "@/components/PageHeader";
 import { api } from "@/lib/api";
-import type { AppSettings } from "@/bindings";
+import type { AppSettings, ImportReport } from "@/bindings";
 
 export default function SettingsPage() {
   const queryClient = useQueryClient();
@@ -88,6 +88,8 @@ export default function SettingsPage() {
 
         <BackupKeySection />
 
+        <SharedConfigSection />
+
         <CommandLineSection />
 
         <section className="space-y-3">
@@ -117,6 +119,178 @@ export default function SettingsPage() {
  * governs database passwords — so the key never sits in a JS string where a
  * script in the page, or an open devtools console, could read it.
  */
+/**
+ * Sharing configuration with a team.
+ *
+ * The whole point is what the bundle does *not* contain, so that is what the
+ * copy leads with. A file safe to commit is only useful if people believe it
+ * is safe to commit.
+ */
+function SharedConfigSection() {
+  const queryClient = useQueryClient();
+  const [path, setPath] = useState("");
+
+  const exported = useMutation({ mutationFn: () => api.exportConfigToFile() });
+  const preview = useMutation({
+    mutationFn: () => api.previewConfigImport(path.trim()),
+  });
+  const imported = useMutation({
+    mutationFn: () => api.importConfig(path.trim()),
+    onSuccess: () => {
+      // Everything the import may have touched.
+      for (const key of ["profiles", "sync-plans", "destinations", "schedules"]) {
+        void queryClient.invalidateQueries({ queryKey: [key] });
+      }
+    },
+  });
+
+  const report = imported.data;
+
+  return (
+    <section className="space-y-3">
+      <h2 className="text-sm font-medium text-slate-200">Shared configuration</h2>
+
+      <div className="panel space-y-4 p-4">
+        <p className="max-w-3xl text-xs leading-relaxed text-slate-400">
+          A bundle carries connections, sync plans and off-site destinations —
+          the shape of the work, not the ability to do it.{" "}
+          <strong className="text-slate-200">
+            It contains no passwords, no SSH keys and no access keys
+          </strong>
+          , because the types it is built from have no field one could occupy.
+          It is safe to commit to a repository or attach to an onboarding
+          document. Whoever imports it supplies their own credentials.
+        </p>
+
+        <div className="flex flex-wrap items-center gap-3">
+          <button
+            type="button"
+            className="rounded-md bg-blue-600 px-3 py-2 text-sm font-medium text-white transition hover:bg-blue-500 disabled:opacity-50"
+            disabled={exported.isPending}
+            onClick={() => exported.mutate()}
+          >
+            {exported.isPending ? "Exporting…" : "Export a bundle"}
+          </button>
+          {exported.data && (
+            <span className="font-mono text-xs text-emerald-400">
+              → {exported.data}
+            </span>
+          )}
+          {exported.isError && (
+            <span className="text-xs text-red-400">
+              {(exported.error as Error).message}
+            </span>
+          )}
+        </div>
+
+        <div className="space-y-2 border-t border-slate-800 pt-4">
+          <label className="flex flex-col gap-1">
+            <span className="field-label">Import a bundle</span>
+            <input
+              className="field-input w-full max-w-xl font-mono text-xs"
+              value={path}
+              placeholder="/path/to/dbsync-config.json"
+              onChange={(e) => {
+                setPath(e.target.value);
+                preview.reset();
+                imported.reset();
+              }}
+            />
+          </label>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              className="rounded-md border border-slate-700 px-3 py-1.5 text-xs text-slate-300 transition hover:bg-slate-800 disabled:opacity-50"
+              disabled={!path.trim() || preview.isPending}
+              onClick={() => preview.mutate()}
+            >
+              Preview
+            </button>
+            <button
+              type="button"
+              className="rounded-md bg-blue-600 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-blue-500 disabled:opacity-50"
+              disabled={!preview.isSuccess || imported.isPending}
+              onClick={() => imported.mutate()}
+              title={
+                preview.isSuccess
+                  ? undefined
+                  : "Preview it first — an import changes this machine"
+              }
+            >
+              {imported.isPending ? "Importing…" : "Import"}
+            </button>
+          </div>
+
+          {(preview.isError || imported.isError) && (
+            <p className="text-xs text-red-400">
+              {((preview.error ?? imported.error) as Error).message}
+            </p>
+          )}
+
+          {preview.data && !report && (
+            <p className="text-xs text-slate-400">
+              {preview.data.profiles.length} connection(s),{" "}
+              {preview.data.plans.length} plan(s),{" "}
+              {preview.data.destinations.length} destination(s), exported by
+              DBSync {preview.data.engine_version}. Existing records with the
+              same name are updated; nothing is removed.
+            </p>
+          )}
+
+          {report && <ImportSummary report={report} />}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function ImportSummary({ report }: { report: ImportReport }) {
+  const created = [
+    ...report.profiles_created,
+    ...report.plans_created,
+    ...report.destinations_created,
+  ];
+  const updated = [
+    ...report.profiles_updated,
+    ...report.plans_updated,
+    ...report.destinations_updated,
+  ];
+
+  return (
+    <div className="space-y-2 text-xs">
+      <p className="text-emerald-400">
+        {created.length} created, {updated.length} updated.
+      </p>
+
+      {/* Named individually. "Some of these need credentials" is not
+          something anyone acts on. */}
+      {report.needs_credentials.length > 0 && (
+        <p className="text-amber-400">
+          These connections cannot connect until you set a password:{" "}
+          <span className="font-mono">
+            {report.needs_credentials.join(", ")}
+          </span>
+        </p>
+      )}
+      {report.destinations_needing_keys.length > 0 && (
+        <p className="text-amber-400">
+          These destinations arrived switched off and need an access key:{" "}
+          <span className="font-mono">
+            {report.destinations_needing_keys.join(", ")}
+          </span>
+        </p>
+      )}
+      {report.orphaned_plans.length > 0 && (
+        <p className="text-red-400">
+          These plans could not be imported:{" "}
+          {report.orphaned_plans.join("; ")}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function BackupKeySection() {
   const queryClient = useQueryClient();
   const status = useQuery({ queryKey: ["backup-key"], queryFn: api.backupKeyStatus });

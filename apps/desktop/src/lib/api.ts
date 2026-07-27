@@ -97,6 +97,12 @@ export const api = {
   /** Writes the secret to a file and returns the path. It never returns the key. */
   exportBackupKeyToFile: () => unwrap(commands.exportBackupKeyToFile()),
 
+  /** Writes a bundle to a file and returns the path. It carries no secrets. */
+  exportConfigToFile: () => unwrap(commands.exportConfigToFile()),
+  previewConfigImport: (path: string) =>
+    unwrap(commands.previewConfigImport(path)),
+  importConfig: (path: string) => unwrap(commands.importConfig(path)),
+
   libraryStats: (directory: string | null = null) =>
     unwrap(commands.libraryStats(directory)),
 

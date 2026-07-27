@@ -176,6 +176,9 @@ enum Command {
     /// Manage the backup encryption key.
     #[command(subcommand)]
     Key(KeyCommand),
+    /// Share configuration with a team, without sharing access.
+    #[command(subcommand)]
+    Config(ConfigCommand),
     /// Manage off-site destinations.
     ///
     /// A backup that only exists on the machine that made it is one failure
@@ -192,6 +195,32 @@ enum Command {
         /// there is nothing to gain below about 30.
         #[arg(long, default_value_t = 30)]
         interval: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Write a shareable bundle of connections, plans and destinations.
+    ///
+    /// Contains no credentials — the types it is built from have no field a
+    /// password could occupy — so the output is safe to commit to a
+    /// repository, paste into a ticket, or attach to an onboarding document.
+    Export {
+        /// Where to write it. Defaults to stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Apply a bundle to this machine.
+    ///
+    /// Matches existing records by name, creating what is missing and updating
+    /// what is there. It never writes a credential and never removes anything
+    /// the bundle omits.
+    Import {
+        /// The bundle to read. Defaults to stdin.
+        file: Option<PathBuf>,
+        /// Print what would change without changing anything.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -674,6 +703,12 @@ async fn main() -> Result<()> {
         Command::Key(cmd) => {
             let store = Store::open(&store_path).await?;
             let result = run_key_command(cmd, &store).await;
+            store.close().await;
+            result?;
+        }
+        Command::Config(cmd) => {
+            let store = Store::open(&store_path).await?;
+            let result = run_config_command(cmd, &store).await;
             store.close().await;
             result?;
         }
@@ -1234,6 +1269,120 @@ fn default_restore_options(
             )
         }
     }
+}
+
+// ── Shareable configuration ─────────────────────────────────────────────
+
+async fn run_config_command(cmd: ConfigCommand, store: &Store) -> Result<()> {
+    use db_sync_engine::share;
+
+    match cmd {
+        ConfigCommand::Export { out } => {
+            let bundle = share::export(store).await?;
+            let json = bundle.to_json()?;
+
+            match out {
+                Some(path) => {
+                    std::fs::write(&path, &json)
+                        .with_context(|| format!("could not write {}", path.display()))?;
+                    eprintln!(
+                        "wrote {} ({} connection(s), {} plan(s), {} destination(s))",
+                        path.display(),
+                        bundle.profiles.len(),
+                        bundle.plans.len(),
+                        bundle.destinations.len()
+                    );
+                    eprintln!("no credentials are in it; whoever imports it supplies their own");
+                }
+                None => println!("{json}"),
+            }
+        }
+
+        ConfigCommand::Import { file, dry_run } => {
+            let raw = match &file {
+                Some(path) => std::fs::read_to_string(path)
+                    .with_context(|| format!("could not read {}", path.display()))?,
+                None => {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut buf)
+                        .context("could not read the bundle from stdin")?;
+                    buf
+                }
+            };
+
+            let bundle = share::ConfigBundle::from_json(&raw)?;
+
+            if dry_run {
+                eprintln!(
+                    "would import {} connection(s), {} plan(s), {} destination(s) \
+                     exported {} by DBSync {}",
+                    bundle.profiles.len(),
+                    bundle.plans.len(),
+                    bundle.destinations.len(),
+                    bundle.exported_at.to_rfc3339(),
+                    bundle.engine_version
+                );
+                for p in &bundle.profiles {
+                    eprintln!("  connection  {} ({:?}, {})", p.name, p.engine, p.db.host);
+                }
+                for p in &bundle.plans {
+                    eprintln!("  plan        {} on {}", p.name, p.profile_name);
+                }
+                for d in &bundle.destinations {
+                    eprintln!("  destination {} -> {}", d.name, d.kind.describe());
+                }
+                eprintln!();
+                eprintln!("nothing was changed (--dry-run)");
+                return Ok(());
+            }
+
+            let report = share::import(store, &bundle).await?;
+
+            for (label, names) in [
+                ("created connection", &report.profiles_created),
+                ("updated connection", &report.profiles_updated),
+                ("created plan", &report.plans_created),
+                ("updated plan", &report.plans_updated),
+                ("created destination", &report.destinations_created),
+                ("updated destination", &report.destinations_updated),
+            ] {
+                for name in names {
+                    eprintln!("{label} {name}");
+                }
+            }
+
+            if report.is_empty() {
+                eprintln!("the bundle was empty; nothing changed");
+            }
+
+            // The part that needs acting on, said last so it is what remains
+            // on screen, and naming each one because "some of these need
+            // credentials" is not something anyone acts on.
+            if !report.needs_credentials.is_empty() {
+                eprintln!();
+                eprintln!("these connections cannot connect until you set a password:");
+                for name in &report.needs_credentials {
+                    eprintln!("  {name}");
+                }
+            }
+            if !report.destinations_needing_keys.is_empty() {
+                eprintln!();
+                eprintln!("these destinations are switched off until you set an access key:");
+                for name in &report.destinations_needing_keys {
+                    eprintln!("  {name}   dbsync destination set-key {name}");
+                }
+            }
+            if !report.orphaned_plans.is_empty() {
+                eprintln!();
+                eprintln!("these plans could not be imported:");
+                for detail in &report.orphaned_plans {
+                    eprintln!("  {detail}");
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // ── Off-site destinations ───────────────────────────────────────────────

@@ -1173,6 +1173,64 @@ mod tests {
     }
 }
 
+// ── Shareable configuration ─────────────────────────────────────────────
+
+/// Write a shareable bundle to a file and return the path.
+///
+/// A file rather than a string, for the same reason the backup key export is:
+/// the thing the user then does with it is put it somewhere. Unlike the key,
+/// this one carries no secret — but returning a path keeps both exports
+/// working the same way, and the file is what gets committed or attached.
+#[tauri::command]
+#[specta::specta]
+pub async fn export_config_to_file(state: State<'_, AppState>) -> CmdResult<String> {
+    let bundle = db_sync_engine::share::export(&state.store)
+        .await
+        .map_err(|e| CommandError::new("share", e.to_string()))?;
+
+    let path = default_backup_dir()
+        .parent()
+        .unwrap_or(&default_backup_dir())
+        .join("dbsync-config.json");
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| CommandError::new("io", format!("could not create {parent:?}: {e}")))?;
+    }
+    std::fs::write(
+        &path,
+        bundle
+            .to_json()
+            .map_err(|e| CommandError::new("share", e.to_string()))?,
+    )
+    .map_err(|e| CommandError::new("io", format!("could not write {path:?}: {e}")))?;
+
+    Ok(path.display().to_string())
+}
+
+/// Read a bundle and report what it would change, without changing anything.
+#[tauri::command]
+#[specta::specta]
+pub async fn preview_config_import(path: String) -> CmdResult<db_sync_engine::share::ConfigBundle> {
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| CommandError::new("io", format!("could not read {path}: {e}")))?;
+    db_sync_engine::share::ConfigBundle::from_json(&raw)
+        .map_err(|e| CommandError::new("share", e.to_string()))
+}
+
+/// Apply a bundle. Never writes a credential; never removes anything.
+#[tauri::command]
+#[specta::specta]
+pub async fn import_config(
+    state: State<'_, AppState>,
+    path: String,
+) -> CmdResult<db_sync_engine::share::ImportReport> {
+    let bundle = preview_config_import(path).await?;
+    db_sync_engine::share::import(&state.store, &bundle)
+        .await
+        .map_err(|e| CommandError::new("share", e.to_string()))
+}
+
 /// Size and growth across the backup library.
 #[tauri::command]
 #[specta::specta]

@@ -142,6 +142,19 @@ export const commands = {
 	setAppSettings: (next: AppSettings) => typedError<AppSettings, CommandError>(__TAURI_INVOKE("set_app_settings", { next })),
 	/**  Size and growth across the backup library. */
 	libraryStats: (directory: string | null) => typedError<LibraryStats, CommandError>(__TAURI_INVOKE("library_stats", { directory })),
+	/**
+	 *  Write a shareable bundle to a file and return the path.
+	 * 
+	 *  A file rather than a string, for the same reason the backup key export is:
+	 *  the thing the user then does with it is put it somewhere. Unlike the key,
+	 *  this one carries no secret — but returning a path keeps both exports
+	 *  working the same way, and the file is what gets committed or attached.
+	 */
+	exportConfigToFile: () => typedError<string, CommandError>(__TAURI_INVOKE("export_config_to_file")),
+	/**  Read a bundle and report what it would change, without changing anything. */
+	previewConfigImport: (path: string) => typedError<ConfigBundle, CommandError>(__TAURI_INVOKE("preview_config_import", { path })),
+	/**  Apply a bundle. Never writes a credential; never removes anything. */
+	importConfig: (path: string) => typedError<ImportReport, CommandError>(__TAURI_INVOKE("import_config", { path })),
 	listDestinations: () => typedError<DestinationView[], CommandError>(__TAURI_INVOKE("list_destinations")),
 	/**
 	 *  Create a destination and file its credential.
@@ -321,6 +334,16 @@ export type CommonBackupOptions = {
 	 *  existed does not silently acquire the cost, matching `deep_verify`.
 	 */
 	record_row_counts?: boolean,
+};
+
+export type ConfigBundle = {
+	bundle_version: number,
+	exported_at: string,
+	/**  The version of DBSync that wrote it, for a human reading a diff. */
+	engine_version: string,
+	profiles: SharedProfile[],
+	plans: SharedPlan[],
+	destinations: SharedDestination[],
 };
 
 export type ConnectionProfile = {
@@ -524,6 +547,26 @@ export type HostKeyPrompt = {
 	changed: boolean,
 	/**  The fingerprint we had pinned, when `changed`. */
 	previous_fingerprint: string | null,
+};
+
+/**  What an import changed, and what it deliberately did not. */
+export type ImportReport = {
+	profiles_created: string[],
+	profiles_updated: string[],
+	plans_created: string[],
+	plans_updated: string[],
+	destinations_created: string[],
+	destinations_updated: string[],
+	/**
+	 *  Connections that now exist but cannot connect until someone supplies a
+	 *  password. Named individually, because "some of these need credentials"
+	 *  is not something anyone acts on.
+	 */
+	needs_credentials: string[],
+	/**  Plans whose profile was not in the bundle and is not on this machine. */
+	orphaned_plans: string[],
+	/**  Destinations that exist but have no stored access key. */
+	destinations_needing_keys: string[],
 };
 
 export type InertRule = {
@@ -1067,6 +1110,47 @@ export type SchedulerStatus = {
 export type SecretStatus = {
 	has_db_password: boolean,
 	has_ssh_passphrase: boolean,
+};
+
+/**  An off-site destination, minus its credential. */
+export type SharedDestination = {
+	name: string,
+	kind: DestinationKind,
+	retention?: RetentionPolicy,
+};
+
+/**  A sync plan, keyed to its profile by name. */
+export type SharedPlan = {
+	profile_name: string,
+	name: string,
+	database: string,
+	selections: TableSelection[],
+	/**
+	 *  Masking rules travel with the plan.
+	 * 
+	 *  They describe which columns are sensitive, which is knowledge a team
+	 *  wants shared — and they carry no salt: the salt is derived from a local
+	 *  secret and never leaves the machine. See [`crate::mask`].
+	 */
+	masking?: MaskRule[],
+};
+
+/**
+ *  A connection, minus the ability to connect.
+ * 
+ *  Identified by name rather than by id: two machines generate different ids
+ *  for the same server, and an import that matched on id would duplicate
+ *  everything every time.
+ */
+export type SharedProfile = {
+	name: string,
+	engine: Engine,
+	environment: EnvironmentTag,
+	/**  Host, port, user and database. No password — there is no field for one. */
+	db: DbConfig,
+	/**  Endpoint and auth *method*. A key-file path is a path, not a key. */
+	ssh: SshConfig | null,
+	tool_overrides?: ToolOverrides,
 };
 
 /**  A backup that came out dramatically smaller than the one before it. */

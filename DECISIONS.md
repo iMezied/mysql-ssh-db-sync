@@ -1475,3 +1475,39 @@ Two smaller decisions:
 - **A single artifact reports no growth rate at all**, rather than zero.
   Inventing a rate from one point produces a number that gets quoted back later
   as if it meant something.
+
+## M13 — A config bundle has nowhere to put a secret
+
+The obvious way to share configuration is to export it and remember to redact
+the passwords. Redaction that has to be remembered is redaction that eventually
+is not, and the thing being forgotten here is a production credential in a file
+whose entire purpose is to be passed around.
+
+So the shared types are separate from the stored ones and have no field a
+secret could occupy. `SharedProfile` carries a host, a port, a user, an
+environment tag and an SSH *endpoint*; there is no password field to leave
+populated by accident. The keychain is never consulted in either direction —
+not as a policy, but because nothing in the bundle could receive what it
+returned.
+
+Three consequences worth stating:
+
+- **An SSH key path travels; the key does not.** A path is configuration. The
+  file it points at is a credential and stays on the machine that holds it.
+- **Masking rules travel; the salt does not.** Which columns are sensitive is
+  knowledge a team wants shared. The salt is derived from a local secret, and
+  anyone holding both could reverse the pseudonyms.
+- **Records match by name, not by id.** Two machines generate different ids for
+  the same server, so matching on id would duplicate everything on every
+  import.
+
+An import is additive: it creates and updates, and never removes what the
+bundle omits. "I shared my config with you" must not be able to delete a
+connection you rely on.
+
+Imported destinations arrive **disabled**. They have no credential, and an
+enabled destination that cannot upload fails every backup until somebody
+notices — which is the rule the off-site work already set.
+
+The report names each connection that still needs a password, individually.
+"Some of these need credentials" is not something anyone acts on.
