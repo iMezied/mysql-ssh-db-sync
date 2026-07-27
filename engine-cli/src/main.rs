@@ -48,6 +48,16 @@ enum Command {
     },
     /// Report the resolved store path and engine version.
     Doctor,
+    /// Show recent configuration changes.
+    ///
+    /// Distinct from `dbsync jobs`, which records what *ran*. This records
+    /// what was *changed* — a masking rule removed, a connection re-pointed,
+    /// the backup key exported — which is the question asked after an
+    /// incident and is usually not a job at all.
+    Audit {
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
     /// Summarise the backup library: sizes, growth, and backups that shrank.
     ///
     /// Exits non-zero when a backup came out dramatically smaller than the one
@@ -593,6 +603,28 @@ async fn main() -> Result<()> {
             .await;
             store.close().await;
             result?;
+        }
+        Command::Audit { limit } => {
+            let store = Store::open(&store_path).await?;
+            let entries = store.list_audit(limit).await;
+            store.close().await;
+            let entries = entries?;
+
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else if entries.is_empty() {
+                eprintln!("nothing has been changed yet");
+            } else {
+                for e in &entries {
+                    println!(
+                        "{}  {:<22} {:<28} {}",
+                        e.at.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M"),
+                        e.action,
+                        truncate(&e.subject, 28),
+                        e.detail
+                    );
+                }
+            }
         }
         Command::Library { dir } => {
             let directory = match dir {

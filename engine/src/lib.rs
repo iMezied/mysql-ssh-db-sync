@@ -12,6 +12,7 @@
 //!   * [`ssh`], [`db`], [`tools`] — connectivity and external binaries.
 //!   * [`backup`], [`restore`], [`verify`], [`retention`] — operations.
 
+pub mod audit;
 pub mod backup;
 pub mod backupkey;
 pub mod connect;

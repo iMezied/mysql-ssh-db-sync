@@ -253,3 +253,25 @@ async fn an_empty_store_exports_an_empty_bundle_rather_than_failing() {
     let parsed = ConfigBundle::from_json(&bundle.to_json().unwrap()).unwrap();
     assert_eq!(parsed.bundle_version, db_sync_engine::share::BUNDLE_VERSION);
 }
+
+#[tokio::test]
+async fn an_import_is_recorded_whichever_surface_ran_it() {
+    // Recorded inside `share::import` rather than at each call site. An entry
+    // that only appeared when the import happened to go through the GUI would
+    // be worse than none, because its absence would mean nothing.
+    let (source, _a) = store().await;
+    seed(&source).await;
+    let bundle = share::export(&source).await.unwrap();
+
+    let (target, _b) = store().await;
+    share::import(&target, &bundle).await.unwrap();
+
+    let entries = target.list_audit(10).await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].action, "config.imported");
+    assert!(
+        entries[0].detail.contains("1 connection"),
+        "the record should say what arrived: {:?}",
+        entries[0]
+    );
+}

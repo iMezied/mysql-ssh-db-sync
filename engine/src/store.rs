@@ -613,6 +613,64 @@ impl Store {
     }
 }
 
+// ── Audit log ───────────────────────────────────────────────────────────
+
+impl Store {
+    /// Record a configuration change.
+    ///
+    /// Returns `()` rather than a `Result` the caller must handle, because a
+    /// failure to write the audit row must never abort the operation being
+    /// audited: refusing to delete a profile because the log was unwritable
+    /// would be a worse outcome than an incomplete log. It is logged instead.
+    pub async fn audit(
+        &self,
+        action: crate::audit::AuditAction,
+        subject: impl Into<String>,
+        detail: impl Into<String>,
+    ) {
+        let subject = subject.into();
+        let result = sqlx::query(
+            "INSERT INTO audit_log (id, at, action, subject, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(Utc::now().to_rfc3339())
+        .bind(action.as_str())
+        .bind(&subject)
+        .bind(detail.into())
+        .execute(&self.pool)
+        .await;
+
+        if let Err(e) = result {
+            tracing::error!(
+                "could not record {} for {subject:?} in the audit log: {e}",
+                action.as_str()
+            );
+        }
+    }
+
+    /// Recent configuration changes, newest first.
+    pub async fn list_audit(&self, limit: i64) -> Result<Vec<crate::audit::AuditEntry>> {
+        let rows = sqlx::query(
+            "SELECT id, at, action, subject, detail FROM audit_log ORDER BY at DESC LIMIT ?1",
+        )
+        .bind(limit.max(1))
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(crate::audit::AuditEntry {
+                    id: parse_uuid(&row.get::<String, _>("id"), "id")?,
+                    at: parse_ts(&row.get::<String, _>("at"), "at")?,
+                    action: row.get("action"),
+                    subject: row.get("subject"),
+                    detail: row.get("detail"),
+                })
+            })
+            .collect()
+    }
+}
+
 // ── Off-site destinations ───────────────────────────────────────────────
 
 const DESTINATION_COLUMNS: &str =

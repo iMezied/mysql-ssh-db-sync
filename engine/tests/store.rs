@@ -867,3 +867,81 @@ async fn a_corrupt_destination_row_is_an_error_not_a_guess() {
     let err = store.get_destination(created.id).await.unwrap_err();
     assert!(matches!(err, StoreError::Corrupt { .. }), "{err}");
 }
+
+// ── Audit log ───────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn configuration_changes_are_recorded_newest_first() {
+    use db_sync_engine::audit::AuditAction;
+
+    let (store, _dir) = store().await;
+    store
+        .audit(
+            AuditAction::ProfileCreated,
+            "prod-eu",
+            "mysql at db.internal",
+        )
+        .await;
+    // Timestamps have sub-second resolution here, but two writes in the same
+    // millisecond would tie; a small gap keeps the assertion about ordering
+    // rather than about luck.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    store
+        .audit(AuditAction::MaskingChanged, "nightly", "0 rule(s), was 3")
+        .await;
+
+    let entries = store.list_audit(10).await.unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].action, "masking.changed");
+    assert_eq!(entries[0].subject, "nightly");
+    assert_eq!(entries[1].action, "profile.created");
+}
+
+#[tokio::test]
+async fn the_audit_log_records_that_a_secret_was_set_not_what_it_was() {
+    // The rule every other layer follows, held here too: `detail` is free-form
+    // and must never become a place a credential ends up.
+    use db_sync_engine::audit::AuditAction;
+
+    let (store, _dir) = store().await;
+    store
+        .audit(AuditAction::SecretSet, "prod-eu", "DbPassword stored")
+        .await;
+
+    let entries = store.list_audit(10).await.unwrap();
+    assert!(entries[0].detail.contains("stored"));
+    assert!(!entries[0].detail.to_lowercase().contains("hunter2"));
+}
+
+#[tokio::test]
+async fn an_unwritable_audit_row_does_not_abort_the_change_being_audited() {
+    // Refusing to delete a profile because the log could not be written would
+    // be a worse outcome than an incomplete log. Closing the pool makes every
+    // write fail; `audit` must still return.
+    use db_sync_engine::audit::AuditAction;
+
+    let (store, _dir) = store().await;
+    store.close().await;
+
+    // No panic, no propagated error — the failure is logged and swallowed.
+    store
+        .audit(AuditAction::ProfileDeleted, "gone", "backups stop")
+        .await;
+}
+
+#[tokio::test]
+async fn the_audit_limit_is_respected_and_never_zero() {
+    use db_sync_engine::audit::AuditAction;
+
+    let (store, _dir) = store().await;
+    for i in 0..5 {
+        store
+            .audit(AuditAction::ProfileCreated, format!("p{i}"), "")
+            .await;
+    }
+
+    assert_eq!(store.list_audit(3).await.unwrap().len(), 3);
+    // A zero or negative limit would return nothing and read as "no changes",
+    // which is a different claim from "you asked for none".
+    assert_eq!(store.list_audit(0).await.unwrap().len(), 1);
+}

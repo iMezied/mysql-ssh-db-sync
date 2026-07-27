@@ -1511,3 +1511,35 @@ notices — which is the rule the off-site work already set.
 
 The report names each connection that still needs a password, individually.
 "Some of these need credentials" is not something anyone acts on.
+
+## M13 — The audit trail records changes, not runs
+
+`job_history` already answers "did the backup work". It cannot answer the
+question actually asked after an incident, because that one is usually not
+about a job at all: a masking rule was removed, a connection was re-pointed at
+a different host, the backup key was exported, a shared bundle was imported
+over the top of everything.
+
+Three properties, each of which is the whole point of having one:
+
+- **There is no off switch.** A record of sensitive changes that can be
+  disabled is a record nobody can rely on, and the volume is a handful of rows
+  a week. No setting, no column, nothing to turn off.
+- **A failed write never aborts the change being audited.** `Store::audit`
+  returns `()`, not a `Result` the caller must handle. Refusing to delete a
+  profile because the log was unwritable would be a worse outcome than an
+  incomplete log; the failure is logged instead.
+- **It records that a secret was set, never what it was.** `detail` is
+  free-form, and free-form is exactly where a credential ends up if nobody
+  says otherwise.
+
+`AuditAction` is a closed enum rather than free strings, so a call site cannot
+invent a verb no reader is looking for — and the list itself documents what
+this application considers worth recording. Each consequential action carries a
+one-line `why`, because a log line nobody understands is a log line nobody
+reads.
+
+The config-import entry is written inside `share::import` rather than at each
+call site, so the CLI and the app produce the same record. An entry that only
+appeared when the import happened to go through the GUI would be worse than
+none: its absence would mean nothing.

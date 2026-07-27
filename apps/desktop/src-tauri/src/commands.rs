@@ -11,6 +11,7 @@
 
 use std::path::PathBuf;
 
+use db_sync_engine::audit::AuditAction;
 use db_sync_engine::backup::{BackupRequest, TableSelection};
 use db_sync_engine::backupkey::{self, KeyStatus};
 use db_sync_engine::connect::{self, ConnectionReport};
@@ -148,6 +149,14 @@ pub async fn create_profile(
         }
     }
 
+    state
+        .store
+        .audit(
+            AuditAction::ProfileCreated,
+            &profile.name,
+            format!("{:?} at {}", profile.engine, profile.db.host),
+        )
+        .await;
     Ok(profile)
 }
 
@@ -158,14 +167,58 @@ pub async fn update_profile(
     id: Uuid,
     patch: ProfileUpdate,
 ) -> CmdResult<ConnectionProfile> {
-    Ok(state.store.update_profile(id, patch).await?)
+    // Read first, so the record can say what actually moved. "updated" alone
+    // does not answer the question this log exists for.
+    let before = state.store.get_profile(id).await?;
+    let after = state.store.update_profile(id, patch).await?;
+
+    if let Some(before) = before {
+        let mut changes = Vec::new();
+        if before.db.host != after.db.host || before.db.port != after.db.port {
+            changes.push(format!(
+                "{}:{} -> {}:{}",
+                before.db.host, before.db.port, after.db.host, after.db.port
+            ));
+        }
+        if before.environment != after.environment {
+            changes.push(format!(
+                "{} -> {}",
+                before.environment.as_str(),
+                after.environment.as_str()
+            ));
+        }
+        if before.name != after.name {
+            changes.push(format!("renamed from {}", before.name));
+        }
+        if !changes.is_empty() {
+            state
+                .store
+                .audit(AuditAction::ProfileUpdated, &after.name, changes.join(", "))
+                .await;
+        }
+    }
+
+    Ok(after)
 }
 
 /// Delete a profile and purge every secret belonging to it.
 #[tauri::command]
 #[specta::specta]
 pub async fn delete_profile(state: State<'_, AppState>, id: Uuid) -> CmdResult<bool> {
+    let name = state
+        .store
+        .get_profile(id)
+        .await?
+        .map(|p| p.name)
+        .unwrap_or_else(|| id.to_string());
+
     let removed = state.store.delete_profile(id).await?;
+    if removed {
+        state
+            .store
+            .audit(AuditAction::ProfileDeleted, name, "backups for it stop")
+            .await;
+    }
     if removed {
         // Orphaned keychain entries would outlive the app otherwise.
         secrets::delete_all_for_profile(id)?;
@@ -198,6 +251,24 @@ pub async fn set_profile_secret(
     };
 
     secrets::set_secret(id, kind, &value)?;
+    // That one was set, never what it was.
+    state
+        .store
+        .audit(
+            AuditAction::SecretSet,
+            state
+                .store
+                .get_profile(id)
+                .await?
+                .map(|p| p.name)
+                .unwrap_or_else(|| id.to_string()),
+            if value.is_empty() {
+                format!("{kind:?} cleared")
+            } else {
+                format!("{kind:?} stored")
+            },
+        )
+        .await;
     Ok(())
 }
 
@@ -591,7 +662,23 @@ pub async fn set_sync_plan_masking(
     id: Uuid,
     masking: Vec<MaskRule>,
 ) -> CmdResult<SyncPlan> {
-    Ok(state.store.set_sync_plan_masking(id, masking).await?)
+    let before = state.store.get_sync_plan(id).await?;
+    let count = masking.len();
+    let plan = state.store.set_sync_plan_masking(id, masking).await?;
+
+    state
+        .store
+        .audit(
+            AuditAction::MaskingChanged,
+            &plan.name,
+            format!(
+                "{} rule(s), was {}",
+                count,
+                before.map(|p| p.masking.len()).unwrap_or(0)
+            ),
+        )
+        .await;
+    Ok(plan)
 }
 
 /// The SQL a masking run would send to the destination.
@@ -707,6 +794,17 @@ pub async fn export_backup_key_to_file(state: State<'_, AppState>) -> CmdResult<
 
     write_secret_file(&path, secret.expose_secret())
         .map_err(|e| CommandError::new("io", e.to_string()))?;
+
+    // Worth recording: from this moment the key exists somewhere this
+    // application does not control. The path, never the key.
+    state
+        .store
+        .audit(
+            AuditAction::BackupKeyExported,
+            path.display().to_string(),
+            "the key now exists outside this application",
+        )
+        .await;
 
     Ok(path.display().to_string())
 }
@@ -927,6 +1025,20 @@ pub async fn update_schedule(
 #[tauri::command]
 #[specta::specta]
 pub async fn delete_schedule(state: State<'_, AppState>, id: Uuid) -> CmdResult<bool> {
+    let name = state
+        .store
+        .get_schedule(id)
+        .await?
+        .map(|s| s.name)
+        .unwrap_or_else(|| id.to_string());
+    state
+        .store
+        .audit(
+            AuditAction::ScheduleDeleted,
+            name,
+            "an unattended job stops running",
+        )
+        .await;
     Ok(state.store.delete_schedule(id).await?)
 }
 
@@ -1173,6 +1285,21 @@ mod tests {
     }
 }
 
+/// Recent configuration changes, newest first.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_audit(
+    state: State<'_, AppState>,
+    // `u32`, not `i64`: specta forbids exporting BigInt-style types, and a
+    // clamp here is better than trusting the caller anyway.
+    limit: u32,
+) -> CmdResult<Vec<db_sync_engine::audit::AuditEntry>> {
+    Ok(state
+        .store
+        .list_audit(i64::from(limit.clamp(1, 500)))
+        .await?)
+}
+
 // ── Shareable configuration ─────────────────────────────────────────────
 
 /// Write a shareable bundle to a file and return the path.
@@ -1226,6 +1353,8 @@ pub async fn import_config(
     path: String,
 ) -> CmdResult<db_sync_engine::share::ImportReport> {
     let bundle = preview_config_import(path).await?;
+    // `share::import` records the audit entry itself, so the CLI and the app
+    // produce the same record.
     db_sync_engine::share::import(&state.store, &bundle)
         .await
         .map_err(|e| CommandError::new("share", e.to_string()))
@@ -1309,6 +1438,14 @@ pub async fn create_destination(
         SecretKind::ObjectStoreSecret,
         secret_access_key.trim(),
     )?;
+    state
+        .store
+        .audit(
+            AuditAction::DestinationCreated,
+            &created.name,
+            created.kind.describe(),
+        )
+        .await;
     Ok(destination_view(created))
 }
 
@@ -1347,9 +1484,28 @@ pub async fn set_destination_credential(
 #[tauri::command]
 #[specta::specta]
 pub async fn delete_destination(state: State<'_, AppState>, id: Uuid) -> CmdResult<bool> {
-    ops::forget_destination(&state.store, id)
+    let name = state
+        .store
+        .get_destination(id)
+        .await?
+        .map(|d| d.name)
+        .unwrap_or_else(|| id.to_string());
+
+    let removed = ops::forget_destination(&state.store, id)
         .await
-        .map_err(|e| CommandError::new("destination", e.to_string()))
+        .map_err(|e| CommandError::new("destination", e.to_string()))?;
+
+    if removed {
+        state
+            .store
+            .audit(
+                AuditAction::DestinationDeleted,
+                name,
+                "off-site copies stop being made",
+            )
+            .await;
+    }
+    Ok(removed)
 }
 
 /// What a reachability check found.

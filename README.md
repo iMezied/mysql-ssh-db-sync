@@ -393,6 +393,7 @@ dbsync destination push backup.sql.gz   # backfill or retry one artifact
 dbsync config export --out team.json   # no credentials are in it
 dbsync config import team.json --dry-run
 dbsync config import team.json
+dbsync audit                           # what was changed, and when
 ```
 
 A bundle carries connections, sync plans and off-site destinations — the shape
@@ -403,6 +404,13 @@ Importing matches existing records by name, creates what is missing, updates
 what is there, and never removes anything the bundle omits. Imported
 destinations arrive switched off, since a destination with no credential
 cannot upload and an enabled one that cannot upload fails every backup.
+
+`dbsync audit` shows what was *changed*, as distinct from `dbsync jobs`, which
+shows what *ran*. A masking rule removed, a connection re-pointed at a different
+host, the backup key exported, a bundle imported over the top — those are the
+events worth having after an incident, and they are usually not jobs. There is
+no setting to disable it: a record of sensitive changes that can be turned off
+is a record nobody can rely on.
 
 `dbsync library` summarises what is on disk — sizes, per-day growth, and any
 backup that came out far smaller than the one before it. It exits non-zero on
@@ -666,9 +674,9 @@ a schedule that comes due, moves data, verifies it, and enforces retention.
 | **M10** | Off-site destinations: S3-compatible upload, credentials, off-site retention, CLI and GUI | **Done** |
 | **M12** | Slack and Teams webhook rendering, library size and growth analytics | **Done** |
 
-| **M13** | Shareable configuration export/import that carries no credentials | **Partly** — audit trail outstanding |
+| **M13** | Shareable configuration export/import carrying no credentials, audit trail | **Done** |
 
-Outstanding: an audit trail (M13), and MongoDB / SQL Server (M14).
+Outstanding: MongoDB and SQL Server (M14).
 
 A drill compares exact row counts only when the backup recorded them
 (`--count-rows`, or the toggle on the Backup and Schedules pages). Without

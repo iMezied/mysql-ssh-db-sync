@@ -140,6 +140,8 @@ export const commands = {
 	schedulerStatus: () => typedError<SchedulerStatus, CommandError>(__TAURI_INVOKE("scheduler_status")),
 	getAppSettings: () => typedError<AppSettings, CommandError>(__TAURI_INVOKE("get_app_settings")),
 	setAppSettings: (next: AppSettings) => typedError<AppSettings, CommandError>(__TAURI_INVOKE("set_app_settings", { next })),
+	/**  Recent configuration changes, newest first. */
+	listAudit: (limit: number) => typedError<AuditEntry[], CommandError>(__TAURI_INVOKE("list_audit", { limit })),
 	/**  Size and growth across the backup library. */
 	libraryStats: (directory: string | null) => typedError<LibraryStats, CommandError>(__TAURI_INVOKE("library_stats", { directory })),
 	/**
@@ -259,6 +261,17 @@ export type Artifact = {
 	tables_with_data: number | null,
 	/**  `None` when there is no manifest to check against. */
 	has_manifest: boolean,
+};
+
+/**  One recorded change. */
+export type AuditEntry = {
+	id: string,
+	at: string,
+	/**  Machine-readable verb, e.g. `profile.deleted`. */
+	action: string,
+	/**  What it happened to, in words a person recognises. */
+	subject: string,
+	detail: string,
 };
 
 export type BackupRequest = {

@@ -358,6 +358,22 @@ pub async fn import(
         }
     }
 
+    // Recorded here rather than at each call site, so the CLI and the app
+    // produce the same record. An import that only showed up in the log when
+    // it happened to be done through the GUI would be worse than none: the
+    // absence of an entry would mean nothing.
+    store
+        .audit(
+            crate::audit::AuditAction::ConfigImported,
+            format!("bundle from DBSync {}", bundle.engine_version),
+            format!(
+                "{} connection(s) and {} plan(s) created or updated",
+                report.profiles_created.len() + report.profiles_updated.len(),
+                report.plans_created.len() + report.plans_updated.len()
+            ),
+        )
+        .await;
+
     Ok(report)
 }
 

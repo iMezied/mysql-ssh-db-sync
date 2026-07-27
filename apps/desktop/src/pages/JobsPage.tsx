@@ -15,6 +15,47 @@ const OUTCOME_STYLES: Record<JobOutcome, string> = {
 /** Most recent live progress lines, newest last. */
 const LIVE_LIMIT = 200;
 
+/**
+ * What was *changed*, as opposed to what ran.
+ *
+ * Job history answers "did the backup work". This answers the question asked
+ * after an incident, which is usually not about a job at all: a masking rule
+ * was removed, a connection was re-pointed, the key was exported.
+ */
+function ChangeLog() {
+  const audit = useQuery({
+    queryKey: ["audit"],
+    queryFn: () => api.listAudit(20),
+  });
+
+  if (!audit.data || audit.data.length === 0) return null;
+
+  return (
+    <section>
+      <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
+        Configuration changes
+      </h2>
+      <div className="panel divide-y divide-slate-800">
+        {audit.data.map((entry) => (
+          <div
+            key={entry.id}
+            className="flex flex-wrap items-baseline gap-x-3 gap-y-1 px-4 py-2 text-xs"
+          >
+            <span className="w-36 shrink-0 text-slate-500">
+              {formatTimestamp(entry.at)}
+            </span>
+            <span className="font-mono text-slate-300">{entry.action}</span>
+            <span className="text-slate-200">{entry.subject}</span>
+            {entry.detail && (
+              <span className="text-slate-500">{entry.detail}</span>
+            )}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 export default function JobsPage() {
   const queryClient = useQueryClient();
   const [live, setLive] = useState<ProgressEvent[]>([]);
@@ -39,10 +80,12 @@ export default function JobsPage() {
     <>
       <PageHeader
         title="Jobs"
-        description="Live progress and the durable history of every backup, restore and sync."
+        description="Live progress, the durable history of every run, and a record of what was changed."
       />
 
       <div className="space-y-6 p-6">
+        <ChangeLog />
+
         <section>
           <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
             Live activity

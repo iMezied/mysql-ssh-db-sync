@@ -65,6 +65,7 @@ export const api = {
   importTablesConf: (contents: string) =>
     unwrap(commands.importTablesConf(contents)),
   listJobs: (limit: number) => unwrap(commands.listJobs(limit)),
+  listAudit: (limit: number) => unwrap(commands.listAudit(limit)),
   cancelJob: (id: string) => unwrap(commands.cancelJob(id)),
   appInfo: () => unwrap(commands.appInfo()),
 
