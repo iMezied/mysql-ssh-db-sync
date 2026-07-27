@@ -1,43 +1,29 @@
-<!--
-  Intrinsic size is 512 with a 64-unit viewBox: Quick Look renders an SVG at
-  its declared size and will not scale a small one up, so a 64x64 declaration
-  produced a glyph sitting in the corner of the canvas. Draw big, downsample.
--->
-<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 64 64">
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
   <!--
     macOS menu-bar icon.
 
     A *template* image: macOS ignores the colour and uses only the alpha
-    channel, tinting it to match a light or dark menu bar and inverting it when
-    the menu is open. That is why this is a flat black silhouette rather than
-    the app icon — a full-colour tile in the menu bar reads as wrong on macOS
-    and stays dark-on-dark when the user switches appearance.
+    channel, tinting it for a light or dark menu bar and inverting it while the
+    menu is open. Everything outside the glyph must therefore be genuinely
+    transparent — an opaque background makes the whole square tint solid and the
+    menu bar shows a filled block instead of a glyph.
 
-    Drawn without the app icon's tile and shadow: at 16pt those become mud.
-    Regenerate with:
+    Drawn without the app icon's tile: at 16pt a tile plus glyph becomes mud.
+    The slots are cut, not painted, for the same reason as the app icon.
 
-        qlmanage -t -s 64 -o . tray-template.svg
+    Regenerate with a rasteriser that preserves alpha (NOT qlmanage):
+
+        rsvg-convert -w 44 -h 44 tray-template.svg -o ../tray-template.png
+        rsvg-convert -w 88 -h 88 tray-template.svg -o ../tray-template@2x.png
   -->
-  <g fill="#000000">
-    <!-- Top platter. -->
-    <ellipse cx="32" cy="15" rx="21" ry="7.5"/>
+  <defs>
+    <mask id="glyph">
+      <g fill="#ffffff"><path d="M 212 250 a 300 88 0 0 1 600 0 v 450 a 300 88 0 0 1 -600 0 z"/><ellipse cx="512" cy="250" rx="300" ry="88"/></g>
+      <g fill="#000000"><path d="M 212 386 a 300 88 0 0 0 600 0 v 46 a 300 88 0 0 1 -600 0 z"/><path d="M 212 524 a 300 88 0 0 0 600 0 v 46 a 300 88 0 0 1 -600 0 z"/></g>
+    </mask>
+  </defs>
 
-    <!-- Body, drawn as two bands so the gaps read as platter divisions even
-         when the whole glyph is 16 pixels tall. -->
-    <path d="M 11 20
-             a 21 7.5 0 0 0 42 0
-             v 8
-             a 21 7.5 0 0 1 -42 0
-             z"/>
-    <path d="M 11 32
-             a 21 7.5 0 0 0 42 0
-             v 8
-             a 21 7.5 0 0 1 -42 0
-             z"/>
-    <path d="M 11 44
-             a 21 7.5 0 0 0 42 0
-             v 5
-             a 21 7.5 0 0 1 -42 0
-             z"/>
+  <g mask="url(#glyph)">
+    <rect x="0" y="0" width="1024" height="1024" fill="#000000"/>
   </g>
 </svg>
