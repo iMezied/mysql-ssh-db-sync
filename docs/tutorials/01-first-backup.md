@@ -6,7 +6,7 @@ without touching the original. About fifteen minutes.
 
 ## What you'll need
 
-- MySQL or PostgreSQL you can reach, with a user that can read it
+- MySQL, PostgreSQL or MongoDB you can reach, with a user that can read it
 - The matching client tools on your machine: `mysqldump` and `mysql`, or
   `pg_dump`, `pg_restore` and `psql`
 - DBSync Studio built or installed. From a checkout:

@@ -9,7 +9,7 @@ of them.
 
 *Also called a profile in the code and the CLI.*
 
-How to reach **one database server**: engine (MySQL or PostgreSQL), host, port,
+How to reach **one database server**: engine (MySQL, PostgreSQL or MongoDB), host, port,
 user, an optional default database, an environment tag, and optionally which
 saved SSH server to tunnel through.
 

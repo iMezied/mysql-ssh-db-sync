@@ -37,6 +37,20 @@ sqlx = { version = "0.8", features = [
 # and with default features it silently falls back to an in-memory *mock* store
 # — secrets appear to save and then vanish. It is declared per-target in
 # engine/Cargo.toml so the native backend is always enabled. See DECISIONS.md.
+# MongoDB catalog access. Same role sqlx plays for the relational engines:
+# reading the catalog, counting documents and masking. Bulk dump and restore
+# still go through `mongodump`/`mongorestore`.
+#
+# `default-features = false` drops `dns-resolver`, which exists to follow
+# `mongodb+srv://` TXT/SRV records. Every connection this app makes is to an
+# explicit host and port — usually a tunnel's local end — so SRV lookup could
+# never fire, and hickory-resolver is a large dependency to sign and notarise
+# for a code path that cannot run. `rustls-tls` is kept, matching the choice
+# made for reqwest: no OpenSSL in the bundle.
+mongodb = { version = "3.8", default-features = false, features = [
+    "compat-3-0-0",
+    "rustls-tls",
+] }
 async-trait = "0.1"
 sha2 = "0.10"
 # SigV4 request signing. Paired with sha2 0.10 — the versions must match,

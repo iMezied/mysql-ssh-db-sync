@@ -11,6 +11,7 @@ import type {
   RestoreRequest,
   TargetNaming,
 } from "@/bindings";
+import { defaultRestoreOptions } from "@/lib/engineDefaults";
 
 /**
  * Restore an artifact into a database.
@@ -101,24 +102,7 @@ export default function RestorePage() {
         : { strategy: "into_existing", name: targetName.trim() };
 
   const engineOptions = (): EngineRestoreOptions =>
-    profile?.engine === "postgres"
-      ? {
-          engine: "postgres",
-          no_owner: true,
-          no_privileges: true,
-          parallel_jobs: null,
-          only_tables: [],
-          clean: false,
-        }
-      : {
-          engine: "mysql",
-          foreign_key_checks_off: true,
-          unique_checks_off: true,
-          autocommit_off: true,
-          disable_binlog: false,
-          charset: "utf8mb4",
-          collation: "utf8mb4_unicode_ci",
-        };
+    defaultRestoreOptions(profile?.engine ?? "mysql");
 
   const start = useMutation({
     mutationFn: () => {

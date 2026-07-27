@@ -47,7 +47,7 @@ continue until whoever runs the server confirms the new fingerprint.
 | Field | Notes |
 |---|---|
 | Name | Unique |
-| Engine | MySQL or PostgreSQL |
+| Engine | MySQL, PostgreSQL or MongoDB |
 | Environment | `dev`, `staging`, `prod`. Not decoration — `prod` forces typed confirmation on destructive restores. |
 | Host / Port | **See the warning below** |
 | User | Database user |

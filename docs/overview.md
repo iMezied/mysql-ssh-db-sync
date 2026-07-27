@@ -4,7 +4,7 @@
 
 ## What it is
 
-DBSync Studio copies databases. It takes a MySQL or PostgreSQL database on one
+DBSync Studio copies databases. It takes a MySQL, PostgreSQL or MongoDB database on one
 server, writes a backup file you can keep, and — when you want it — puts that
 data onto another server. It comes in two forms that share the same brain:
 
@@ -46,7 +46,7 @@ machine where it was written. The failure modes are well known and expensive:
 
 Being clear about this is part of the design, not an apology.
 
-- **MySQL and PostgreSQL only.** MongoDB and SQL Server are on the roadmap and
+- **No SQL Server.** MySQL, PostgreSQL and MongoDB are supported. SQL Server is on the roadmap and
   are not in the codebase. A stub that appears in the dropdown and fails behind
   every path would be worse than the gap. The reasoning is recorded in
   [DECISIONS.md](../DECISIONS.md).

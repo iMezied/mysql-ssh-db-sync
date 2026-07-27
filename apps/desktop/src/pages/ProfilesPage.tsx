@@ -15,14 +15,13 @@ import type {
   ProfileCreate,
   SshConnection,
 } from "@/bindings";
+import { DEFAULT_PORT, ENGINE_LABEL } from "@/lib/engineDefaults";
 
 const ENV_STYLES: Record<EnvironmentTag, string> = {
   prod: "bg-red-500/15 text-red-300 ring-red-500/30",
   staging: "bg-amber-500/15 text-amber-300 ring-amber-500/30",
   dev: "bg-emerald-500/15 text-emerald-300 ring-emerald-500/30",
 };
-
-const DEFAULT_PORT: Record<Engine, number> = { mysql: 3306, postgres: 5432 };
 
 function emptyDraft(): ProfileCreate & { db: DbConfig } {
   return {
@@ -183,8 +182,11 @@ export default function ProfilesPage() {
                     });
                   }}
                 >
-                  <option value="mysql">MySQL</option>
-                  <option value="postgres">PostgreSQL</option>
+                  {(Object.keys(ENGINE_LABEL) as Engine[]).map((e) => (
+                    <option key={e} value={e}>
+                      {ENGINE_LABEL[e]}
+                    </option>
+                  ))}
                 </select>
               </label>
 

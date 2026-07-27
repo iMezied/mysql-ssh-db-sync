@@ -1100,13 +1100,16 @@ async fn introspect_table_names(
 fn default_backup_options(
     engine: db_sync_engine::Engine,
 ) -> db_sync_engine::backup::EngineBackupOptions {
-    use db_sync_engine::backup::{EngineBackupOptions, MysqlBackupOptions, PostgresBackupOptions};
+    use db_sync_engine::backup::{
+        EngineBackupOptions, MongoBackupOptions, MysqlBackupOptions, PostgresBackupOptions,
+    };
 
     match engine {
         db_sync_engine::Engine::Mysql => EngineBackupOptions::Mysql(MysqlBackupOptions::default()),
         db_sync_engine::Engine::Postgres => {
             EngineBackupOptions::Postgres(PostgresBackupOptions::default())
         }
+        db_sync_engine::Engine::Mongo => EngineBackupOptions::Mongo(MongoBackupOptions::default()),
     }
 }
 
@@ -1206,6 +1209,23 @@ async fn run_restore(store: &Store, args: RestoreArgs<'_>, json: bool) -> Result
                 only_tables: args.only_tables,
                 parallel_jobs: args.jobs,
                 clean: args.clean,
+                ..Default::default()
+            })
+        }
+        db_sync_engine::Engine::Mongo => {
+            if args.clean {
+                bail!(
+                    "--clean is a PostgreSQL option, and {:?} is MongoDB. \
+                     Use --replace to drop collections as they are restored.",
+                    profile.name
+                );
+            }
+            // `--only-table` and `--jobs` do carry over: mongorestore filters
+            // by namespace and restores collections in parallel. Reusing the
+            // flags rather than adding MongoDB-only spellings keeps one CLI.
+            EngineRestoreOptions::Mongo(db_sync_engine::restore::MongoRestoreOptions {
+                only_collections: args.only_tables,
+                parallel_collections: args.jobs,
                 ..Default::default()
             })
         }
@@ -1373,6 +1393,9 @@ fn default_restore_options(
                 db_sync_engine::restore::PostgresRestoreOptions::default(),
             )
         }
+        db_sync_engine::Engine::Mongo => db_sync_engine::restore::EngineRestoreOptions::Mongo(
+            db_sync_engine::restore::MongoRestoreOptions::default(),
+        ),
     }
 }
 

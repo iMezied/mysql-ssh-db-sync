@@ -11,6 +11,11 @@ import type {
   PgDumpFormat,
   TableInfo,
 } from "@/bindings";
+import {
+  defaultBackupOptions,
+  ENGINE_NOUNS,
+  supportsSchemaOnly,
+} from "@/lib/engineDefaults";
 
 type TableMode = "schema_and_data" | "schema_only" | "exclude";
 
@@ -63,6 +68,28 @@ export default function BackupPage() {
     enabled: profileId !== "" && database !== "",
   });
 
+  const selectedProfile = profiles.data?.find((p) => p.id === profileId);
+  const engine = selectedProfile?.engine ?? "mysql";
+  const nouns = ENGINE_NOUNS[engine];
+
+  /**
+   * What an unselected table does.
+   *
+   * Relational engines default to structure-without-rows: every table's shape
+   * reaches the destination and the user promotes the ones that need data.
+   * MongoDB has no such middle setting — `mongodump` writes a collection whole
+   * or not at all — so the default there is what `mongodump` itself does,
+   * include it. Defaulting to "exclude" instead would mean the obvious action
+   * on this page backs up nothing.
+   */
+  const defaultMode: TableMode = supportsSchemaOnly(engine)
+    ? "schema_only"
+    : "schema_and_data";
+
+  const availableModes = (Object.keys(MODE_LABELS) as TableMode[]).filter(
+    (m) => m !== "schema_only" || supportsSchemaOnly(engine),
+  );
+
   const visible = useMemo(() => {
     const rows = tables.data ?? [];
     const needle = filter.trim().toLowerCase();
@@ -72,57 +99,27 @@ export default function BackupPage() {
 
   const counts = useMemo(() => {
     const rows = tables.data ?? [];
-    const modeOf = (t: TableInfo) => modes[keyOf(t)] ?? "schema_only";
+    const modeOf = (t: TableInfo) => modes[keyOf(t)] ?? defaultMode;
     return {
       withData: rows.filter((t) => modeOf(t) === "schema_and_data").length,
       schemaOnly: rows.filter((t) => modeOf(t) === "schema_only").length,
       excluded: rows.filter((t) => modeOf(t) === "exclude").length,
       total: rows.length,
     };
-  }, [tables.data, modes]);
+  }, [tables.data, modes, defaultMode]);
 
   const nonTransactionalSelected = useMemo(
     () =>
       (tables.data ?? []).filter(
         (t) =>
           !t.transactional &&
-          (modes[keyOf(t)] ?? "schema_only") === "schema_and_data",
+          (modes[keyOf(t)] ?? defaultMode) === "schema_and_data",
       ),
-    [tables.data, modes],
+    [tables.data, modes, defaultMode],
   );
 
-  const selectedProfile = profiles.data?.find((p) => p.id === profileId);
-
   const engineOptions = (): EngineBackupOptions =>
-    selectedProfile?.engine === "postgres"
-      ? {
-          engine: "postgres",
-          format: pgFormat,
-          no_owner: true,
-          no_privileges: true,
-          blobs: true,
-          schemas: [],
-          serializable_deferrable: false,
-          parallel_jobs: null,
-          include_globals: false,
-          extra_flags: [],
-        }
-      : {
-          engine: "mysql",
-          single_transaction: true,
-          hex_blob: true,
-          set_gtid_purged_off: true,
-          add_drop_table: true,
-          extended_insert: true,
-          routines: true,
-          triggers: true,
-          events: true,
-          default_character_set: "utf8mb4",
-          disable_column_statistics: false,
-          strip_definer: true,
-          parallel_threads: null,
-          extra_flags: [],
-        };
+    defaultBackupOptions(engine, pgFormat);
 
   const start = useMutation({
     mutationFn: () => {
@@ -135,7 +132,7 @@ export default function BackupPage() {
             // PostgreSQL, which would exclude data from a same-named table
             // elsewhere.
             name: keyOf(t),
-            mode: modes[keyOf(t)] ?? "schema_only",
+            mode: modes[keyOf(t)] ?? defaultMode,
             where_filter: null,
           })),
           output_dir: backupDir.data ?? "",
@@ -222,7 +219,7 @@ export default function BackupPage() {
 
         {tables.isError && (
           <ErrorNote
-            title="Could not list tables"
+            title={`Could not list ${nouns.tables}`}
             detail={(tables.error as Error).message}
           />
         )}
@@ -230,7 +227,7 @@ export default function BackupPage() {
         {!profileId && (
           <div className="panel flex items-center gap-3 p-8 text-sm text-slate-500">
             <Database className="h-5 w-5" />
-            Pick a connection to browse its tables.
+            Pick a connection to browse its {nouns.tables}.
           </div>
         )}
 
@@ -245,22 +242,22 @@ export default function BackupPage() {
                 <Search className="pointer-events-none absolute left-2.5 top-2.5 h-4 w-4 text-slate-600" />
                 <input
                   className="field-input pl-8"
-                  placeholder={`Filter ${tables.data.length} tables…`}
+                  placeholder={`Filter ${tables.data.length} ${nouns.tables}…`}
                   value={filter}
                   onChange={(e) => setFilter(e.target.value)}
                 />
               </div>
 
               <div className="flex gap-1.5">
-                {(Object.keys(MODE_LABELS) as TableMode[]).map((mode) => (
+                {availableModes.map((mode) => (
                   <button
                     key={mode}
                     onClick={() => setVisibleTo(mode)}
                     className="rounded-md border border-slate-700 px-2.5 py-1.5 text-xs text-slate-300 transition hover:bg-slate-800"
                     title={
                       filter
-                        ? `Apply to the ${visible.length} filtered tables`
-                        : "Apply to all tables"
+                        ? `Apply to the ${visible.length} filtered ${nouns.tables}`
+                        : `Apply to all ${nouns.tables}`
                     }
                   >
                     All &rarr; {MODE_LABELS[mode]}
@@ -285,6 +282,18 @@ export default function BackupPage() {
               <span>{counts.total} total</span>
             </div>
 
+            {engine === "mongo" && (
+              <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-3">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+                <p className="text-xs leading-relaxed text-amber-200/90">
+                  A <code>mongodump</code> of a database being written to is
+                  consistent <em>within</em> each collection, not across them.
+                  Point-in-time capture needs the oplog, which needs a replica
+                  set — on a standalone server it is not available at all.
+                </p>
+              </div>
+            )}
+
             {nonTransactionalSelected.length > 0 && (
               <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-3">
                 <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
@@ -302,14 +311,14 @@ export default function BackupPage() {
             <div className="panel divide-y divide-slate-800">
               {visible.length === 0 ? (
                 <p className="p-6 text-center text-sm text-slate-500">
-                  No tables match “{filter}”.
+                  No {nouns.tables} match “{filter}”.
                 </p>
               ) : (
                 visible.map((t) => (
                   <TableRow
                     key={keyOf(t)}
                     table={t}
-                    mode={modes[keyOf(t)] ?? "schema_only"}
+                    mode={modes[keyOf(t)] ?? defaultMode}
                     onMode={(mode) =>
                       setModes((prev) => ({ ...prev, [keyOf(t)]: mode }))
                     }

@@ -15,7 +15,7 @@ apps/desktop/
   src-tauri/       Tauri shell: commands, tray, events. Also thin.
   src/             React + TypeScript frontend
   src/bindings.ts  GENERATED — do not hand-edit
-tests/fixtures/    Seeded MySQL and PostgreSQL fixtures for the round-trips
+tests/fixtures/    Seeded MySQL, PostgreSQL and MongoDB fixtures for the round-trips
 ```
 
 The split is enforced, not aspirational: `engine/Cargo.toml` has no `tauri`

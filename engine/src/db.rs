@@ -42,6 +42,15 @@ pub struct TableInfo {
     pub transactional: bool,
 }
 
+/// A MongoDB collection is a table, a document is a row, a field is a column.
+///
+/// The mapping is stated once, here, because it is the assumption that lets
+/// [`Introspector`] stay a single trait rather than splitting into a relational
+/// contract and a document one. Where the analogy genuinely breaks — a schema
+/// that is observed rather than declared, masking that is a pipeline rather
+/// than an `UPDATE` — the code says so at the point it breaks.
+pub const MONGO_TERMINOLOGY: &str = "collection = table, document = row, field = column";
+
 impl TableInfo {
     /// Build a `TableInfo`, deriving `transactional` from the storage engine.
     pub fn new(
@@ -54,7 +63,8 @@ impl TableInfo {
     ) -> Self {
         let transactional = match storage_engine.as_deref() {
             Some(e) => e.eq_ignore_ascii_case("innodb"),
-            // PostgreSQL is always transactional.
+            // PostgreSQL always is; so is MongoDB on WiredTiger, which has been
+            // the only storage engine since 4.2. Neither reports one here.
             None => true,
         };
         Self {
@@ -103,6 +113,16 @@ pub enum DbError {
     Query(String),
     #[error("invalid identifier: {0}")]
     InvalidIdentifier(String),
+    /// A SQL-shaped entry point was handed a document store.
+    ///
+    /// Returned rather than ignored, and never reachable in normal operation:
+    /// every caller of the statement helpers dispatches on the engine first.
+    /// This exists so that a future caller that forgets fails loudly here
+    /// instead of quietly running no statements and reporting success — which,
+    /// for masking, would mean reporting a database as masked without touching
+    /// it.
+    #[error("{0} does not speak SQL; this path takes statements")]
+    NotSql(Engine),
 }
 
 /// Where to connect. `host`/`port` are usually a tunnel's local endpoint.
@@ -141,8 +161,40 @@ pub trait Introspector: Send + Sync {
     /// type). That is reported as "not compared", never as a match.
     async fn table_digest(&self, database: &str, table: &str) -> Result<Option<String>, DbError>;
     /// Column names, in ordinal order, for schema comparison.
+    ///
+    /// # What this means where there is no declared schema
+    ///
+    /// MongoDB has no column list to read, so its implementation returns the
+    /// **union of field names actually present**, in name order. Two
+    /// consequences follow, and both are deliberate:
+    ///
+    /// * A field that no document carries is indistinguishable from a field
+    ///   that does not exist. For the callers that matter — schema comparison
+    ///   and masking coverage — those are the same thing: there is nothing to
+    ///   compare and nothing to mask.
+    /// * It is a full scan, not a catalog lookup. That is the price of the
+    ///   answer being exact rather than sampled; a sample would make the same
+    ///   collection report different fields on the source and the destination
+    ///   and turn a correct restore into a schema mismatch.
+    ///
+    /// Only top-level fields are listed. A masking rule may still address a
+    /// nested field by dotted path — see [`crate::mask`], which checks the root
+    /// of the path against this list.
     async fn column_names(&self, database: &str, table: &str) -> Result<Vec<String>, DbError>;
     async fn close(&self);
+}
+
+/// The database a connection should open when the target database must not be
+/// held open — dropping it, or listing databases while creating it.
+///
+/// * PostgreSQL cannot connect without naming a database, so it borrows the
+///   conventional `postgres` bootstrap database.
+/// * MySQL and MongoDB both connect to the server rather than to a database.
+pub const fn bootstrap_database(engine: Engine) -> Option<&'static str> {
+    match engine {
+        Engine::Postgres => Some("postgres"),
+        Engine::Mysql | Engine::Mongo => None,
+    }
 }
 
 /// Quote a MySQL identifier, escaping embedded backticks.
@@ -551,6 +603,411 @@ impl Introspector for PostgresIntrospector {
     }
 }
 
+// ── MongoDB ─────────────────────────────────────────────────────────────
+
+/// Databases MongoDB creates for itself. Listing them would offer the user a
+/// backup of the server's own bookkeeping.
+pub const MONGO_SYSTEM_DATABASES: [&str; 3] = ["admin", "local", "config"];
+
+/// The database credentials are checked against.
+///
+/// Fixed rather than derived from the profile's database, and it has to be:
+/// `mongodump` resolves this differently from the driver when it is left
+/// unstated, so a backup would authenticate against one database while the
+/// introspection that verifies it authenticated against another. The two paths
+/// agreeing matters more than either default. `--authenticationDatabase=admin`
+/// is passed explicitly to the tools for the same reason.
+pub const MONGO_AUTH_SOURCE: &str = "admin";
+
+/// How many documents to hold in memory while digesting. Only ever one at a
+/// time is needed; the batch size is what the driver fetches per round trip.
+const MONGO_DIGEST_BATCH: u32 = 1000;
+
+pub struct MongoIntrospector {
+    client: mongodb::Client,
+}
+
+impl MongoIntrospector {
+    pub async fn connect(params: &ConnectParams) -> Result<Self, DbError> {
+        use mongodb::options::{ClientOptions, Credential, ServerAddress};
+
+        // Built once rather than folded in conditionally: the options builder
+        // encodes which fields are set in its *type*, so reassigning it inside
+        // an `if` does not compile.
+        let credential = match (&params.password, params.user.is_empty()) {
+            (Some(pw), _) => Some(
+                Credential::builder()
+                    .username(params.user.clone())
+                    .password(pw.expose_secret().to_string())
+                    .source(MONGO_AUTH_SOURCE.to_string())
+                    .build(),
+            ),
+            // A user with no password: a keyfile or certificate setup, or a
+            // server with authentication off that still wants a name.
+            (None, false) => Some(
+                Credential::builder()
+                    .username(params.user.clone())
+                    .source(MONGO_AUTH_SOURCE.to_string())
+                    .build(),
+            ),
+            (None, true) => None,
+        };
+
+        let options = ClientOptions::builder()
+            .hosts(vec![ServerAddress::Tcp {
+                host: params.host.clone(),
+                port: Some(params.port),
+            }])
+            // Load-bearing for tunnels, and the single most confusing failure
+            // in this driver if it is left off. Without it the driver runs
+            // discovery, learns the replica set members' *own* hostnames, and
+            // then tries to dial those — which from this side of an SSH tunnel
+            // resolve to nothing, or worse, to something else entirely. The
+            // endpoint we were handed is the endpoint we talk to.
+            .direct_connection(true)
+            .app_name(Some("DBSync Studio".to_string()))
+            .connect_timeout(Some(std::time::Duration::from_secs(15)))
+            .server_selection_timeout(Some(std::time::Duration::from_secs(15)))
+            .max_pool_size(Some(4))
+            .credential(credential)
+            .build();
+
+        let client =
+            mongodb::Client::with_options(options).map_err(|e| DbError::Connect(e.to_string()))?;
+
+        // `with_options` does not dial: it builds a client and connects lazily.
+        // A profile that cannot be reached would otherwise "connect" here and
+        // fail much later, inside whatever operation the user actually asked
+        // for, which is the wrong place to learn the host is wrong.
+        client
+            .database(MONGO_AUTH_SOURCE)
+            .run_command(mongodb::bson::doc! { "ping": 1 })
+            .await
+            .map_err(|e| DbError::Connect(e.to_string()))?;
+
+        Ok(Self { client })
+    }
+
+    fn collection(&self, database: &str, name: &str) -> mongodb::Collection<mongodb::bson::Document> {
+        self.client.database(database).collection(name)
+    }
+
+    /// The driver client, for the operations that are not catalog reads.
+    ///
+    /// [`Introspector`] is documented as read-only, and masking writes — so it
+    /// does not go through the trait, the same way [`execute_batch`] does not
+    /// for the relational engines. Nothing acquires the ability to modify data
+    /// by holding an introspector.
+    pub fn client(&self) -> &mongodb::Client {
+        &self.client
+    }
+}
+
+/// Recursively sort a document's keys so that two documents holding the same
+/// data hash the same however their fields happen to be ordered.
+///
+/// BSON preserves field order and treats it as significant, so hashing the raw
+/// encoding would report a mismatch for a restore that reordered fields but
+/// lost nothing. That is the wrong trade: a digest nobody trusts gets turned
+/// off, and then the restores that *did* lose data stop being checked at all.
+/// Reordering is not data loss, so it is normalised away.
+///
+/// Arrays keep their order, because in a document store an array's order is
+/// data.
+fn canonicalise(doc: &mongodb::bson::Document) -> mongodb::bson::Document {
+    use mongodb::bson::{Bson, Document};
+
+    fn canon_value(value: &Bson) -> Bson {
+        match value {
+            Bson::Document(d) => Bson::Document(canonicalise(d)),
+            Bson::Array(items) => Bson::Array(items.iter().map(canon_value).collect()),
+            other => other.clone(),
+        }
+    }
+
+    let mut pairs: Vec<(&str, &Bson)> = doc.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    // Duplicate keys are legal in BSON. Sorting by key alone would leave their
+    // relative order down to the input, so the value's encoding breaks the tie.
+    pairs.sort_by(|a, b| {
+        a.0.cmp(b.0)
+            .then_with(|| format!("{:?}", a.1).cmp(&format!("{:?}", b.1)))
+    });
+
+    let mut out = Document::new();
+    for (k, v) in pairs {
+        out.insert(k, canon_value(v));
+    }
+    out
+}
+
+#[async_trait]
+impl Introspector for MongoIntrospector {
+    async fn server_info(&self) -> Result<ServerInfo, DbError> {
+        use mongodb::bson::doc;
+
+        let build_info = self
+            .client
+            .database(MONGO_AUTH_SOURCE)
+            .run_command(doc! { "buildInfo": 1 })
+            .await
+            .map_err(|e| DbError::Query(e.to_string()))?;
+
+        let version = build_info
+            .get_str("version")
+            .map_err(|e| DbError::Query(format!("buildInfo carried no version: {e}")))?
+            .to_string();
+
+        // `listDatabases` is a privilege of its own: a user granted readWrite on
+        // one database connects happily and cannot enumerate. Finding that out
+        // now beats failing once a dump is already running.
+        let can_read_catalog = self.client.list_database_names().await.is_ok();
+
+        Ok(ServerInfo {
+            engine: Engine::Mongo,
+            version,
+            can_read_catalog,
+        })
+    }
+
+    async fn list_databases(&self) -> Result<Vec<DatabaseInfo>, DbError> {
+        let names = self
+            .client
+            .list_database_names()
+            .await
+            .map_err(|e| DbError::Query(e.to_string()))?;
+
+        let mut out: Vec<DatabaseInfo> = names
+            .into_iter()
+            .filter(|n| !MONGO_SYSTEM_DATABASES.contains(&n.as_str()))
+            .map(|name| DatabaseInfo {
+                name,
+                // A MongoDB database has neither. Documents carry their own
+                // encoding: BSON strings are UTF-8 by definition, and there is
+                // no server-side collation to report at this level.
+                charset: None,
+                collation: None,
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    async fn list_tables(&self, database: &str) -> Result<Vec<TableInfo>, DbError> {
+        let db = self.client.database(database);
+        let mut names = db
+            .list_collection_names()
+            .await
+            .map_err(|e| DbError::Query(format!("listing collections in {database}: {e}")))?;
+        names.sort();
+
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            // Sizes come from `$collStats`, the aggregation stage, rather than
+            // the `collStats` command, which MongoDB deprecated. Failing to
+            // read them is not fatal: the picker can list a collection it
+            // cannot size, and the numbers here are only ever a hint.
+            let stats = collection_storage_stats(&db, &name).await;
+
+            out.push(TableInfo::new(
+                None,
+                name,
+                // No storage engine is reported per collection; WiredTiger has
+                // been the only one since 4.2, and it is transactional.
+                None,
+                stats.as_ref().and_then(|s| s.count),
+                stats.as_ref().and_then(|s| s.size),
+                stats.as_ref().and_then(|s| s.index_size),
+            ));
+        }
+        Ok(out)
+    }
+
+    async fn exact_row_count(&self, database: &str, table: &str) -> Result<u64, DbError> {
+        use mongodb::bson::doc;
+
+        // `count_documents` runs an aggregation that actually counts.
+        // `estimated_document_count` reads collection metadata, which is the
+        // MongoDB spelling of a planner estimate and drifts after an unclean
+        // shutdown — exactly the failure this project replaced.
+        self.collection(database, table)
+            .count_documents(doc! {})
+            .await
+            .map_err(|e| DbError::Query(format!("counting {database}.{table}: {e}")))
+    }
+
+    /// Hashed here rather than on the server.
+    ///
+    /// The relational implementations push the digest into the database because
+    /// SQL can express one. MongoDB's equivalents are either version-gated
+    /// internals or unavailable, so the documents are streamed and hashed
+    /// locally instead. That is honest about the cost: this reads the whole
+    /// collection over the wire, which is why deep verification is opt-in.
+    ///
+    /// Order independence is kept the same way MySQL keeps it — a per-document
+    /// hash folded in with XOR — so the physical order of a restored collection
+    /// does not have to match the source's.
+    async fn table_digest(&self, database: &str, table: &str) -> Result<Option<String>, DbError> {
+        use mongodb::bson::doc;
+        use sha2::{Digest, Sha256};
+
+        let mut cursor = self
+            .collection(database, table)
+            .find(doc! {})
+            .batch_size(MONGO_DIGEST_BATCH)
+            .await
+            .map_err(|e| DbError::Query(format!("reading {database}.{table}: {e}")))?;
+
+        let mut fold = [0u8; 32];
+        let mut seen: u64 = 0;
+
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| DbError::Query(format!("reading {database}.{table}: {e}")))?
+        {
+            let doc = cursor
+                .deserialize_current()
+                .map_err(|e| DbError::Query(format!("decoding a document: {e}")))?;
+
+            let bytes = mongodb::bson::to_vec(&canonicalise(&doc))
+                .map_err(|e| DbError::Query(format!("encoding a document: {e}")))?;
+
+            let hash = Sha256::digest(&bytes);
+            for (slot, byte) in fold.iter_mut().zip(hash.iter()) {
+                *slot ^= byte;
+            }
+            seen += 1;
+        }
+
+        // An empty collection folds to all zeros, which is a real answer and
+        // not a failure to compute one — the same value the MySQL digest gives
+        // for an empty table.
+        let _ = seen;
+        Ok(Some(fold.iter().map(|b| format!("{b:02x}")).collect()))
+    }
+
+    async fn column_names(&self, database: &str, table: &str) -> Result<Vec<String>, DbError> {
+        use mongodb::bson::doc;
+
+        // The union of every top-level field name present. See the trait's
+        // documentation for why this is exact rather than sampled.
+        let pipeline = vec![
+            doc! { "$project": { "kv": { "$objectToArray": "$$ROOT" } } },
+            doc! { "$unwind": "$kv" },
+            doc! { "$group": { "_id": "$kv.k" } },
+            doc! { "$sort": { "_id": 1 } },
+        ];
+
+        let mut cursor = self
+            .collection(database, table)
+            .aggregate(pipeline)
+            // A wide collection can exceed the 100 MB in-memory limit for
+            // `$group`. Spilling is slower than failing, and far more useful.
+            .allow_disk_use(true)
+            .await
+            .map_err(|e| DbError::Query(format!("reading fields of {database}.{table}: {e}")))?;
+
+        let mut names = Vec::new();
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| DbError::Query(format!("reading fields of {database}.{table}: {e}")))?
+        {
+            let doc = cursor
+                .deserialize_current()
+                .map_err(|e| DbError::Query(format!("decoding a field name: {e}")))?;
+            if let Ok(name) = doc.get_str("_id") {
+                names.push(name.to_string());
+            }
+        }
+        Ok(names)
+    }
+
+    async fn close(&self) {
+        // The driver shuts its connection pool down when the client drops.
+        // Taking `&self` means there is no client to consume here, and calling
+        // the async `shutdown` would need one.
+    }
+}
+
+/// The three numbers `list_tables` wants out of `$collStats`.
+struct MongoStorageStats {
+    count: Option<u64>,
+    size: Option<u64>,
+    index_size: Option<u64>,
+}
+
+async fn collection_storage_stats(
+    db: &mongodb::Database,
+    name: &str,
+) -> Option<MongoStorageStats> {
+    use mongodb::bson::doc;
+
+    let mut cursor = db
+        .collection::<mongodb::bson::Document>(name)
+        .aggregate(vec![doc! { "$collStats": { "storageStats": {} } }])
+        .await
+        .ok()?;
+
+    if !cursor.advance().await.ok()? {
+        return None;
+    }
+    let doc = cursor.deserialize_current().ok()?;
+    let stats = doc.get_document("storageStats").ok()?;
+
+    /// `$collStats` reports these as int32 or int64 depending on magnitude, so
+    /// asking for one specific width would read zero for half of them.
+    fn number(stats: &mongodb::bson::Document, key: &str) -> Option<u64> {
+        match stats.get(key)? {
+            mongodb::bson::Bson::Int32(v) => Some((*v).max(0) as u64),
+            mongodb::bson::Bson::Int64(v) => Some((*v).max(0) as u64),
+            mongodb::bson::Bson::Double(v) => Some(v.max(0.0) as u64),
+            _ => None,
+        }
+    }
+
+    Some(MongoStorageStats {
+        count: number(stats, "count"),
+        size: number(stats, "size"),
+        index_size: number(stats, "totalIndexSize"),
+    })
+}
+
+/// Drop a database, in whichever dialect the engine speaks.
+///
+/// Exists so that callers with a legitimate reason to drop one — a sync that
+/// owns the database it created, a drill cleaning up after itself — do not each
+/// have to hold both the SQL spelling and the MongoDB one. Both callers guard
+/// *which* name may be passed; this only decides how.
+pub async fn drop_database(params: &ConnectParams, name: &str) -> Result<(), DbError> {
+    match params.engine {
+        Engine::Mysql => {
+            let quoted = quote_mysql_ident(name)?;
+            execute_raw(params, &format!("DROP DATABASE IF EXISTS {quoted}")).await
+        }
+        Engine::Postgres => {
+            let quoted = quote_pg_ident(name)?;
+            execute_raw(params, &format!("DROP DATABASE IF EXISTS {quoted}")).await
+        }
+        Engine::Mongo => {
+            if name.contains('\0') {
+                return Err(DbError::InvalidIdentifier(
+                    "database name contains a null byte".into(),
+                ));
+            }
+            let introspector = MongoIntrospector::connect(params).await?;
+            // Dropping a database that is not there is not an error in
+            // MongoDB, which is the `IF EXISTS` the SQL branches ask for.
+            introspector
+                .client
+                .database(name)
+                .drop()
+                .await
+                .map_err(|e| DbError::Query(format!("dropping {name}: {e}")))
+        }
+    }
+}
+
 /// A statement and the values bound into its placeholders.
 ///
 /// Values are always bound, never interpolated. Identifiers cannot be bound in
@@ -607,6 +1064,7 @@ pub async fn execute_batch(
             }
             introspector.pool.close().await;
         }
+        Engine::Mongo => return Err(DbError::NotSql(Engine::Mongo)),
     }
 
     Ok(affected)
@@ -655,6 +1113,7 @@ pub async fn fetch_count_rows(
             run!(&introspector.pool);
             introspector.pool.close().await;
         }
+        Engine::Mongo => return Err(DbError::NotSql(Engine::Mongo)),
     }
 
     Ok(out)
@@ -684,6 +1143,7 @@ pub async fn execute_raw(params: &ConnectParams, sql: &str) -> Result<(), DbErro
                 .map_err(|e| DbError::Query(format!("executing statement: {e}")))?;
             introspector.pool.close().await;
         }
+        Engine::Mongo => return Err(DbError::NotSql(Engine::Mongo)),
     }
     Ok(())
 }
@@ -693,6 +1153,7 @@ pub async fn connect(params: &ConnectParams) -> Result<Box<dyn Introspector>, Db
     match params.engine {
         Engine::Mysql => Ok(Box::new(MysqlIntrospector::connect(params).await?)),
         Engine::Postgres => Ok(Box::new(PostgresIntrospector::connect(params).await?)),
+        Engine::Mongo => Ok(Box::new(MongoIntrospector::connect(params).await?)),
     }
 }
 

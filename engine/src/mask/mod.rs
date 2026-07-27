@@ -2,17 +2,23 @@
 //!
 //! # Where masking happens, and what that costs
 //!
-//! Masking runs **on the destination, after the restore**, as SQL the
-//! destination server executes on itself. It does not happen during the dump.
+//! Masking runs **on the destination, after the restore**. It does not happen
+//! during the dump.
 //!
 //! That is a deliberate trade, and the reason is worth stating plainly:
-//! `mysqldump` and `pg_dump` have no way to apply an expression to a column.
-//! Masking inside the dump would mean writing our own dump encoder — hand-rolling
-//! the literal encoding for every column type in two engines — and a bug in that
-//! encoder does not produce a masking failure, it produces a corrupted database
-//! that restores cleanly. Asking the server that already owns the data to
-//! transform it is the option where the engine, not this crate, is responsible
-//! for type fidelity.
+//! `mysqldump`, `pg_dump` and `mongodump` have no way to apply an expression to
+//! a column. Masking inside the dump would mean writing our own dump encoder —
+//! hand-rolling the literal encoding for every column type in every engine —
+//! and a bug in that encoder does not produce a masking failure, it produces a
+//! corrupted database that restores cleanly. Acting on the destination that
+//! already holds the data is the option where the engine, not this crate, is
+//! responsible for type fidelity.
+//!
+//! For the relational engines the work *is* SQL the destination executes on
+//! itself. MongoDB is the exception and [`mongo`] says why: its aggregation
+//! language has no general-purpose hash, so the hashing transforms are computed
+//! here and written back. The guarantee below is identical either way, which is
+//! what makes the difference an implementation detail rather than a caveat.
 //!
 //! The consequence, which must never be soft-pedalled anywhere in this app:
 //!
@@ -62,6 +68,32 @@ use specta::Type;
 
 use crate::db::{DbError, Statement, quote_mysql_ident, quote_pg_ident};
 use crate::types::Engine;
+
+pub mod mongo;
+
+/// The engines that speak SQL.
+///
+/// This exists so that a document store cannot reach the statement builders at
+/// all. Every function below that composes SQL takes a `SqlDialect` rather than
+/// an [`Engine`], so "generate an `UPDATE` for MongoDB" is not a case that has
+/// to be remembered and handled — it is a sentence that does not typecheck.
+/// The conversion happens once, at the two public entry points, and MongoDB is
+/// routed to [`mongo`] before it gets there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlDialect {
+    Mysql,
+    Postgres,
+}
+
+impl SqlDialect {
+    fn of(engine: Engine) -> Result<Self, MaskError> {
+        match engine {
+            Engine::Mysql => Ok(SqlDialect::Mysql),
+            Engine::Postgres => Ok(SqlDialect::Postgres),
+            Engine::Mongo => Err(MaskError::Db(DbError::NotSql(Engine::Mongo))),
+        }
+    }
+}
 
 /// Where the masking salt lives in `app_settings`.
 pub const SALT_SETTING: &str = "masking.salt";
@@ -280,7 +312,19 @@ impl MaskingCoverage {
 ///
 /// A rule on a table that is not copied with data is *not* an error — nothing
 /// reaches the destination, so nothing is exposed — but it is reported.
+///
+/// # Nested fields
+///
+/// MongoDB rules may address a field inside a subdocument by dotted path, and
+/// [`crate::db::Introspector::column_names`] only reports top-level fields. So
+/// for a document store the check is against the **root** of the path: a rule
+/// on `profile.email` is covered when the collection has a `profile` field. It
+/// is a weaker check than the relational one, and deliberately not stronger —
+/// guessing at the shape below the root would start rejecting rules that work.
+/// The read-back in [`check_statements`] is what actually proves the masking
+/// took, and it does look at the exact path.
 pub fn plan_coverage(
+    engine: Engine,
     rules: &[MaskRule],
     tables_with_data: &[String],
     source_columns: &BTreeMap<String, Vec<String>>,
@@ -320,7 +364,17 @@ pub fn plan_coverage(
                 column: rule.column.clone(),
             })?;
 
-        if !columns.iter().any(|c| c == &rule.column) {
+        // A dotted path names a field inside a subdocument, so only its root
+        // can be checked against the field list. Relational engines get the
+        // exact match they have always had: a MySQL column called `a.b` is a
+        // column literally called `a.b`, not a path.
+        let wanted = if engine.is_relational() {
+            rule.column.as_str()
+        } else {
+            rule.column.split('.').next().unwrap_or(&rule.column)
+        };
+
+        if !columns.iter().any(|c| c == wanted) {
             return Err(MaskError::UnknownColumn {
                 table: rule.table.clone(),
                 column: rule.column.clone(),
@@ -337,10 +391,10 @@ pub fn plan_coverage(
 // ── SQL generation ──────────────────────────────────────────────────────
 
 /// Quote a table name, splitting `schema.table` for PostgreSQL.
-fn quote_table(engine: Engine, name: &str) -> Result<String, DbError> {
-    match engine {
-        Engine::Mysql => quote_mysql_ident(name),
-        Engine::Postgres => match name.split_once('.') {
+fn quote_table(dialect: SqlDialect, name: &str) -> Result<String, DbError> {
+    match dialect {
+        SqlDialect::Mysql => quote_mysql_ident(name),
+        SqlDialect::Postgres => match name.split_once('.') {
             Some((schema, table)) => Ok(format!(
                 "{}.{}",
                 quote_pg_ident(schema)?,
@@ -355,52 +409,52 @@ fn quote_table(engine: Engine, name: &str) -> Result<String, DbError> {
     }
 }
 
-fn quote_column(engine: Engine, name: &str) -> Result<String, DbError> {
-    match engine {
-        Engine::Mysql => quote_mysql_ident(name),
-        Engine::Postgres => quote_pg_ident(name),
+fn quote_column(dialect: SqlDialect, name: &str) -> Result<String, DbError> {
+    match dialect {
+        SqlDialect::Mysql => quote_mysql_ident(name),
+        SqlDialect::Postgres => quote_pg_ident(name),
     }
 }
 
 /// Render a column as text, so a check works whatever the column's type is.
-fn as_text(engine: Engine, quoted: &str) -> String {
-    match engine {
-        Engine::Mysql => format!("CAST({quoted} AS CHAR)"),
-        Engine::Postgres => format!("{quoted}::text"),
+fn as_text(dialect: SqlDialect, quoted: &str) -> String {
+    match dialect {
+        SqlDialect::Mysql => format!("CAST({quoted} AS CHAR)"),
+        SqlDialect::Postgres => format!("{quoted}::text"),
     }
 }
 
 /// Placeholders differ, so statements are built with a counter rather than a
 /// fixed string.
 struct Placeholders {
-    engine: Engine,
+    dialect: SqlDialect,
     next: usize,
 }
 
 impl Placeholders {
-    fn new(engine: Engine) -> Self {
-        Self { engine, next: 1 }
+    fn new(dialect: SqlDialect) -> Self {
+        Self { dialect, next: 1 }
     }
 
     fn take(&mut self) -> String {
         let n = self.next;
         self.next += 1;
-        match self.engine {
-            Engine::Mysql => "?".to_string(),
-            Engine::Postgres => format!("${n}"),
+        match self.dialect {
+            SqlDialect::Mysql => "?".to_string(),
+            SqlDialect::Postgres => format!("${n}"),
         }
     }
 }
 
 /// The salted digest of a column, as hex, in the destination's own SQL.
-fn digest_expr(engine: Engine, quoted_col: &str, salt: &mut impl FnMut() -> String) -> String {
+fn digest_expr(dialect: SqlDialect, quoted_col: &str, salt: &mut impl FnMut() -> String) -> String {
     let p = salt();
-    match engine {
+    match dialect {
         // CONCAT returns NULL if any argument is NULL, which is exactly the
         // NULL-preserving behaviour we want and gets it for free.
-        Engine::Mysql => format!("SHA2(CONCAT({p}, {quoted_col}), 256)"),
+        SqlDialect::Mysql => format!("SHA2(CONCAT({p}, {quoted_col}), 256)"),
         // `||` is NULL-propagating for the same reason.
-        Engine::Postgres => {
+        SqlDialect::Postgres => {
             format!("encode(sha256(convert_to({p} || {quoted_col}::text, 'UTF8')), 'hex')")
         }
     }
@@ -408,7 +462,7 @@ fn digest_expr(engine: Engine, quoted_col: &str, salt: &mut impl FnMut() -> Stri
 
 /// The `SET column = ...` expression for one rule.
 fn set_expr(
-    engine: Engine,
+    dialect: SqlDialect,
     quoted_col: &str,
     transform: &MaskTransform,
     binds: &mut Vec<String>,
@@ -422,34 +476,34 @@ fn set_expr(
 
     match transform {
         MaskTransform::Hash { .. } => {
-            let digest = digest_expr(engine, quoted_col, &mut salted);
+            let digest = digest_expr(dialect, quoted_col, &mut salted);
             let len = transform.hash_length();
-            match engine {
-                Engine::Mysql => format!("LEFT({digest}, {len})"),
-                Engine::Postgres => format!("left({digest}, {len})"),
+            match dialect {
+                SqlDialect::Mysql => format!("LEFT({digest}, {len})"),
+                SqlDialect::Postgres => format!("left({digest}, {len})"),
             }
         }
         MaskTransform::Email => {
-            let digest = digest_expr(engine, quoted_col, &mut salted);
-            match engine {
-                Engine::Mysql => {
+            let digest = digest_expr(dialect, quoted_col, &mut salted);
+            match dialect {
+                SqlDialect::Mysql => {
                     format!("CONCAT(LEFT({digest}, 16), '@{FAKE_EMAIL_DOMAIN}')")
                 }
-                Engine::Postgres => {
+                SqlDialect::Postgres => {
                     format!("left({digest}, 16) || '@{FAKE_EMAIL_DOMAIN}'")
                 }
             }
         }
         MaskTransform::Phone => {
-            let digest = digest_expr(engine, quoted_col, &mut salted);
-            match engine {
+            let digest = digest_expr(dialect, quoted_col, &mut salted);
+            match dialect {
                 // 7 hex characters is 28 bits; the modulo bias across 10^7 is
                 // irrelevant for a number that only has to look like one.
-                Engine::Mysql => format!(
+                SqlDialect::Mysql => format!(
                     "CONCAT('{FAKE_PHONE_PREFIX}', \
                      LPAD(CONV(LEFT({digest}, 7), 16, 10) % 10000000, 7, '0'))"
                 ),
-                Engine::Postgres => format!(
+                SqlDialect::Postgres => format!(
                     "'{FAKE_PHONE_PREFIX}' || \
                      lpad(((('x' || left({digest}, 7))::bit(28)::bigint) % 10000000)::text, 7, '0')"
                 ),
@@ -479,6 +533,7 @@ pub fn update_statements(
     rules: &[MaskRule],
     salt: &str,
 ) -> Result<Vec<TableStatement>, MaskError> {
+    let dialect = SqlDialect::of(engine)?;
     let mut by_table: BTreeMap<&str, Vec<&MaskRule>> = BTreeMap::new();
     for rule in rules {
         by_table.entry(rule.table.as_str()).or_default().push(rule);
@@ -486,15 +541,15 @@ pub fn update_statements(
 
     let mut out = Vec::new();
     for (table, rules) in by_table {
-        let quoted_table = quote_table(engine, table)?;
-        let mut ph = Placeholders::new(engine);
+        let quoted_table = quote_table(dialect, table)?;
+        let mut ph = Placeholders::new(dialect);
         let mut binds = Vec::new();
         let mut assignments = Vec::new();
 
         for rule in rules {
-            let quoted_col = quote_column(engine, &rule.column)?;
+            let quoted_col = quote_column(dialect, &rule.column)?;
             let expr = set_expr(
-                engine,
+                dialect,
                 &quoted_col,
                 &rule.transform,
                 &mut binds,
@@ -518,23 +573,23 @@ pub fn update_statements(
 
 /// A predicate matching rows that do **not** have the masked shape.
 fn violation_expr(
-    engine: Engine,
+    dialect: SqlDialect,
     quoted_col: &str,
     transform: &MaskTransform,
     binds: &mut Vec<String>,
     ph: &mut Placeholders,
 ) -> String {
-    let text = as_text(engine, quoted_col);
+    let text = as_text(dialect, quoted_col);
 
     match transform {
         MaskTransform::Hash { .. } => {
             let len = transform.hash_length();
-            match engine {
-                Engine::Mysql => format!(
+            match dialect {
+                SqlDialect::Mysql => format!(
                     "{quoted_col} IS NOT NULL AND \
                      (CHAR_LENGTH({text}) <> {len} OR {text} NOT REGEXP '^[0-9a-f]+$')"
                 ),
-                Engine::Postgres => format!(
+                SqlDialect::Postgres => format!(
                     "{quoted_col} IS NOT NULL AND \
                      (length({text}) <> {len} OR {text} !~ '^[0-9a-f]+$')"
                 ),
@@ -574,6 +629,7 @@ pub struct TableCheck {
 /// row, a type coercion that throws the expression away — and none of those
 /// surface as an error.
 pub fn check_statements(engine: Engine, rules: &[MaskRule]) -> Result<Vec<TableCheck>, MaskError> {
+    let dialect = SqlDialect::of(engine)?;
     let mut by_table: BTreeMap<&str, Vec<&MaskRule>> = BTreeMap::new();
     for rule in rules {
         by_table.entry(rule.table.as_str()).or_default().push(rule);
@@ -581,24 +637,24 @@ pub fn check_statements(engine: Engine, rules: &[MaskRule]) -> Result<Vec<TableC
 
     let mut out = Vec::new();
     for (table, rules) in by_table {
-        let quoted_table = quote_table(engine, table)?;
-        let mut ph = Placeholders::new(engine);
+        let quoted_table = quote_table(dialect, table)?;
+        let mut ph = Placeholders::new(dialect);
         let mut binds = Vec::new();
         let mut projections = Vec::new();
         let mut columns = Vec::new();
         let mut transforms = Vec::new();
 
         for rule in rules {
-            let quoted_col = quote_column(engine, &rule.column)?;
+            let quoted_col = quote_column(dialect, &rule.column)?;
             let violation =
-                violation_expr(engine, &quoted_col, &rule.transform, &mut binds, &mut ph);
+                violation_expr(dialect, &quoted_col, &rule.transform, &mut binds, &mut ph);
             // SUM over an empty table is NULL, and MySQL widens it to DECIMAL;
             // both are coerced here so the caller can read a plain integer.
-            projections.push(match engine {
-                Engine::Mysql => format!(
+            projections.push(match dialect {
+                SqlDialect::Mysql => format!(
                     "CAST(COALESCE(SUM(CASE WHEN {violation} THEN 1 ELSE 0 END), 0) AS SIGNED)"
                 ),
-                Engine::Postgres => {
+                SqlDialect::Postgres => {
                     format!("COALESCE(SUM(CASE WHEN {violation} THEN 1 ELSE 0 END), 0)::bigint")
                 }
             });
@@ -660,6 +716,7 @@ mod tests {
         // `email_address` protects nothing, and nothing else would notice.
         let rules = vec![MaskRule::email("users", "email")];
         let err = plan_coverage(
+            Engine::Mysql,
             &rules,
             &["users".to_string()],
             &columns(&[("users", &["id", "email_address"])]),
@@ -679,6 +736,7 @@ mod tests {
         // because it usually means the plan and the rules have drifted.
         let rules = vec![MaskRule::email("archived_users", "email")];
         let coverage = plan_coverage(
+            Engine::Mysql,
             &rules,
             &["users".to_string()],
             &columns(&[("users", &["id", "email"])]),
@@ -694,7 +752,7 @@ mod tests {
     fn a_table_that_cannot_be_introspected_stops_the_run() {
         // "We could not look" is not "the column is fine".
         let rules = vec![MaskRule::email("users", "email")];
-        let err = plan_coverage(&rules, &["users".to_string()], &BTreeMap::new()).unwrap_err();
+        let err = plan_coverage(Engine::Mysql, &rules, &["users".to_string()], &BTreeMap::new()).unwrap_err();
         assert!(matches!(err, MaskError::UnknownTable { .. }), "{err}");
     }
 
@@ -707,6 +765,7 @@ mod tests {
             MaskRule::hash("users", "email"),
         ];
         let err = plan_coverage(
+            Engine::Mysql,
             &rules,
             &["users".to_string()],
             &columns(&[("users", &["id", "email"])]),
@@ -719,6 +778,7 @@ mod tests {
     fn a_matching_rule_is_effective() {
         let rules = vec![MaskRule::email("users", "email")];
         let coverage = plan_coverage(
+            Engine::Mysql,
             &rules,
             &["users".to_string()],
             &columns(&[("users", &["id", "email"])]),

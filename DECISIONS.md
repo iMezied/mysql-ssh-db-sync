@@ -1597,60 +1597,232 @@ connection and reported in red, individually. This is the one import outcome
 where nothing failed, which is precisely the problem: a tunnelled connection
 quietly becoming a direct one is noticed when it fails, or not at all.
 
-## M14 — Not attempted, and why that is the right call
+## M14 — MongoDB, and the three questions that had to be settled first
 
-MongoDB and SQL Server are on the roadmap. They are not in this codebase, and
-adding a stub would be worse than the gap: an `Engine::Mongo` variant appears
-in the connection form's engine dropdown the moment it exists, and every path
-behind it would fail at the point someone relied on it. That is the exact
-failure mode this project has spent every milestone removing.
+The previous entry here said M14 was not attempted, and listed three questions
+that no amount of code would answer. MongoDB is now implemented. Those
+questions were the milestone, so this records how each one came out.
 
-The work is not plumbing. Measured against the code as it stands:
+### 1. `Introspector` does not split
 
-- **27 exhaustive `match` arms on `Engine`**, across introspection, both backup
-  workers, both restore workers, masking, tool discovery, the CLI and the GUI.
-  Those are mechanical.
-- **Three engine-shaped abstractions** — `Introspector`, `EngineBackupOptions`,
-  `EngineRestoreOptions` — each of which assumes a relational shape.
-- **The introspection contract is SQL.** `list_tables`, `exact_row_count`,
-  `table_digest` and `column_names` are all defined in terms of tables, rows
-  and columns.
+The proposal was to divide it into a relational trait and a smaller common one.
+That was the wrong shape. The trait's contract reads as relational because of
+its *vocabulary* — table, row, column — but what it actually asks for is: name
+the containers, name the records, count them exactly, digest them, list their
+fields. A document store answers all five.
 
-### MongoDB
+Splitting would have pushed an `if engine == Mongo` into every caller —
+verification, drills, sync, masking coverage — which is precisely what a trait
+exists to prevent. So one trait, with the mapping stated once
+(`db::MONGO_TERMINOLOGY`) and each method's documentation honest about what it
+means where the analogy strains.
 
-The transport fits: `mongodump --archive --gzip` streams to stdout and
-`mongorestore --archive` reads stdin, which is the same shape the existing
-workers use. What does not fit is everything above it.
+The place it genuinely strains is `column_names`. There is no declared schema
+to read, so the implementation returns the union of field names actually
+present. Two things follow, and both are deliberate:
 
-- **Masking generates `UPDATE … SET`.** A document store needs `updateMany`
-  with an aggregation pipeline — a separate implementation, not a dialect
-  variation, and one where the "prove it worked" read-back has to be rewritten
-  too.
-- **`table_digest` is a SQL checksum.** Content verification would need a
-  different mechanism entirely.
-- **A `mongodb` driver dependency** joins the bundle that gets signed and
-  notarised, which is a decision this project has made carefully each time.
+- **It is exact, not sampled.** A sample was the obvious cheap answer and it is
+  wrong: source and destination would sample different documents, report
+  different fields, and turn a correct restore into a schema mismatch. The
+  aggregation costs a scan. `exact_row_count` already costs one.
+- **A field no document carries is indistinguishable from a field that does not
+  exist.** For the two callers that matter — schema comparison and masking
+  coverage — those *are* the same thing.
 
-### SQL Server
+`Engine::is_relational()` is what the remaining branches test. There are three
+of them, and all three are about generating SQL.
 
-The harder of the two, and the reason is architectural rather than
-incremental. `BACKUP DATABASE` writes **server-side**. This application is
-built on streaming a dump from a client, through an SSH tunnel, into a local
-artifact whose checksum it controls — and SQL Server's native mechanism does
-not produce a client-side stream at all. The alternatives are `bcp`
-(per-table export, no schema) or `mssql-scripter` (a Python tool, not a
-first-party binary this app could reasonably discover and depend on).
+### 2. Masking is not an aggregation pipeline, and the guarantee survives anyway
 
-Choosing among those changes what an "artifact" is, which is the concept every
-other feature here is built on: the manifest, the checksum, the restore drill,
-off-site upload and retention all assume one file the client produced.
+The plan was "masking reimplemented as aggregation pipelines". Half of it is.
+The other half cannot be, and the reason is specific: **MongoDB's aggregation
+language has no general-purpose hash.** `$toHashedIndexKey` exists, but it is a
+64-bit index hash in a different output space from the salted SHA-256 the SQL
+engines produce.
 
-### What would have to be decided first
+That difference is not cosmetic. Determinism across engines is a property this
+feature sells: mask a MySQL copy and a MongoDB copy with the same salt and the
+same address becomes the same pseudonym, so the two still join. Substituting a
+different hash would quietly break that.
 
-1. Whether `Introspector` splits into a relational trait and a smaller common
-   one, or whether non-relational engines get a different contract.
-2. What masking means for a document store, and whether the "masked or gone"
-   guarantee survives it.
-3. What an artifact is for SQL Server, given no client-side stream.
+So the work splits by transform, and the split is in the types
+(`mask::mongo::MaskPlan`):
 
-None of those is answerable by writing code faster. They are the milestone.
+- `Null` and `Constant` are one `updateMany` per collection. The server does
+  all of it.
+- `Hash`, `Email` and `Phone` read the document, compute the replacement here,
+  and write it back — one `updateOne` per document.
+
+The cost is stated plainly rather than discovered later: masking a
+million-document collection with a `Hash` rule is a million round trips. There
+is no collection-level `bulkWrite` in this driver, and grouping by value only
+helps for fields that repeat, which emails and identifiers do not.
+
+Reading the values into this process is not a new exposure. The application has
+just streamed the entire source database through itself into an artifact on
+this disk.
+
+**The guarantee is unchanged**: either the destination holds masked data or it
+holds nothing. `mask::mongo::check_filters` counts documents that do not have
+the masked shape, `countDocuments` answers it, and a non-zero answer drops the
+database exactly as the SQL read-back does.
+
+Two details in that check were found by running it, not by reasoning about it:
+
+- **`$convert` with `onError`, not `$toString`.** A single document whose
+  masked field holds a subdocument makes `$toString` abort the entire
+  aggregation with `ConversionFailure`. The destination was still dropped — every
+  error on that path drops it — but the operator was handed "Unsupported
+  conversion from object to string" instead of being told which field in which
+  collection was left readable. `onError` maps it to a sentinel that cannot
+  match any masked shape, so it is counted as what it is: not masked.
+- **The read-back is what makes declining safe.** Masking refuses to replace a
+  subdocument or an array with a hash of its rendering, because silently
+  changing a document's shape is worse than declining. Declining is only
+  acceptable because the check then reports it.
+
+A rule may address a nested field by dotted path. Coverage checks the *root* of
+the path against the field list — weaker than the relational check, and
+deliberately not stronger, because guessing at the shape below the root would
+start rejecting rules that work.
+
+### 3. An artifact is still one file the client produced
+
+This was the question that blocked SQL Server, and MongoDB answers it without
+needing anything renegotiated. `mongodump --archive` writes a single
+self-describing stream to stdout carrying every collection's documents,
+indexes and options. It goes through the same pipeline as every other engine —
+`--gzip` inside the archive, then age, then the file — and the manifest,
+checksum, restore drill, off-site upload and retention all work unmodified.
+
+`--gzip` compresses *within* the archive rather than wrapping it, so
+`compress` is honoured by the tool and no second gzip layer is added.
+
+### What MongoDB is refused, rather than approximated
+
+Two options are rejected by `BackupRequest::validate`, both following the rule
+settled in M11: an option that is silently ignored while the manifest describes
+an artifact that was not produced is worse than a missing feature, because the
+restore path and the drill both believe the manifest.
+
+- **Structure-only collections.** `mongodump` writes one archive in one pass
+  with no per-collection document filter, so "structure only" would have to
+  become the whole collection or none of it. Either way a name in the
+  manifest's `tables` would be wrong, and the drill looks for exactly those.
+- **Row filters.** `mongodump --query` applies to a single `--collection`,
+  which cannot produce one archive for a database.
+
+The GUI does not offer either for a MongoDB profile, so the refusal is a
+backstop rather than the way a user finds out.
+
+### The rename that is not optional
+
+MySQL restores elsewhere by never emitting `USE`; PostgreSQL by creating the
+database and pointing the client at it. MongoDB has neither: the archive
+carries the source namespace in every entry and `mongorestore` puts it back
+where it came from.
+
+`--nsFrom=<source>.* --nsTo=<target>.*` is what redirects it, and that needs
+the source database's name — which is in the manifest. So a MongoDB restore
+**refuses to run without a manifest**, and it is the only engine that does.
+The alternative is restoring into the database the archive was dumped from,
+which on a profile pointed at production is a silent overwrite of the source.
+That also makes a selective restore filter on the *source* namespace: filtering
+on the target's name would match nothing and restore an empty database while
+reporting success.
+
+### Defaults that differ from the obvious choice
+
+- **`--oplog` is off.** It is MongoDB's `--single-transaction` analogue and it
+  requires a replica set, failing outright on a standalone — which is what most
+  development databases are. Defaulting it on would make the common case an
+  error. Without it a dump is consistent within each collection and not across
+  them; the backup page says so and the job emits a warning. The test fixture
+  is a standalone precisely so this is exercised rather than assumed.
+- **`--stopOnError` is on.** Without it `mongorestore` skips documents it could
+  not insert, writes them to stderr and exits 0 — a restore that half-worked
+  looking like one that worked. A drill checking that is checking a lie.
+- **`--authenticationDatabase=admin` is explicit**, and the driver is pinned to
+  the same source. Left unstated, the tool and the driver resolve it
+  differently, so a backup could authenticate against one database while the
+  introspection that verifies it authenticated against another.
+- **`direct_connection(true)` on the driver, `--readPreference=primaryPreferred`
+  on the tools.** Without it the driver runs discovery, learns the replica set
+  members' own advertised hostnames, and dials those — which from this side of
+  an SSH tunnel resolve to nothing, or to something else entirely.
+
+### The password has nowhere safe to go, so it goes in a file
+
+The MySQL and PostgreSQL backends hand a password to their tools through
+`MYSQL_PWD` and `PGPASSWORD`, which is the whole reason argv stays clean. **The
+MongoDB Database Tools have no equivalent environment variable**, and this was
+found by running them, not by reading about them: with `--username` and no
+`--password`, `mongodump` does not fail and does not fall back — it prompts on
+stdin, and with no terminal the job dies with
+
+    Failed: can't create session: ... auth error: ... Authentication failed.
+
+which says nothing about the actual cause. The unit tests passed throughout;
+only the round trip against the real binary showed it.
+
+`--password=…` is not the answer, because argv is readable by every user on the
+machine — the exact failure this project was built to remove. So the tools'
+`--config` file is used: YAML holding the password, created 0600 as part of
+opening it so it is never briefly world-readable, deleted when the handle
+drops. `mongorestore` needs it even more than `mongodump` does, because its
+stdin is the archive and a prompt there cannot be answered at all.
+
+The password is written as a **double-quoted** YAML scalar, not single-quoted,
+and that is also a test finding. A single-quoted scalar may legally span lines,
+so a password containing a newline puts attacker-chosen text at the start of a
+line in a file whose other recognised keys include `uri` — a setting that
+redirects the connection. YAML's folding rules mean it still parses as part of
+the password, but that makes the safety a property of the reader rather than of
+the file. Escaping the newline removes the question instead of answering it,
+and a test asserts the file is exactly one line.
+
+### The digest is computed here, not on the server
+
+The relational digests are pushed into the database because SQL can express
+one. MongoDB's equivalents are version-gated internals, so documents are
+streamed and hashed locally: SHA-256 per document, folded with XOR, which keeps
+the order independence the MySQL digest relies on.
+
+Field order is normalised away before hashing. BSON treats field order as
+significant, so hashing the raw encoding would report a mismatch for a restore
+that reordered fields and lost nothing — and a digest nobody trusts gets turned
+off, after which the restores that *did* lose data stop being checked at all.
+Array order is kept, because in a document store that is data.
+
+### The driver dependency
+
+`mongodb` 3.x, with `default-features = false`. That drops `dns-resolver`,
+which exists to follow `mongodb+srv://` records: every connection this app
+makes is to an explicit host and port, usually a tunnel's local end, so SRV
+lookup could never fire and hickory-resolver is a large thing to sign and
+notarise for a code path that cannot run. `rustls-tls` is kept, matching the
+choice made for reqwest — no OpenSSL in the bundle.
+
+## M14 — SQL Server is still not attempted, and the reason has not changed
+
+MongoDB fit because its transport produces a client-side stream. SQL Server's
+does not, and that is the whole difficulty.
+
+`BACKUP DATABASE` writes **server-side**. This application is built on
+streaming a dump from a client, through an SSH tunnel, into a local artifact
+whose checksum it controls — and there is no native mechanism that produces
+one. The alternatives are `bcp` (per-table export, no schema) or
+`mssql-scripter` (a Python tool, not a first-party binary this app could
+reasonably discover and depend on).
+
+Question 3 above was answered *for MongoDB* by finding a single-stream dump
+format. For SQL Server there is nothing to find: the question is what an
+artifact should become when the client cannot produce one, and that reshapes
+the manifest, the checksum, the restore drill, off-site upload and retention —
+every feature built on "one file". None of that is answerable by writing code
+faster.
+
+Now that MongoDB has landed, one thing is known that was not before: the
+`Introspector` seam held without splitting, and `Engine::is_relational()` marks
+the three places SQL generation actually branches. Whoever takes SQL Server on
+inherits a smaller problem than the previous entry assumed — but not this one.

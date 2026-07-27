@@ -49,7 +49,7 @@ field a secret could occupy. It is safe to commit.
 
 Stated plainly, because discovering them later is expensive:
 
-- **MySQL and PostgreSQL only.** MongoDB and SQL Server are roadmap, not
+- **No SQL Server.** MySQL, PostgreSQL and MongoDB are supported. SQL Server is roadmap, not
   product, and deliberately not stubbed.
 - **Full dumps, not continuous replication.** Recovery point is "the last
   scheduled run", not "the last transaction".

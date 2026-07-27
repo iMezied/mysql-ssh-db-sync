@@ -8,7 +8,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::backup::mysql::Endpoint;
-use crate::backup::{BackupError, BackupRequest, run_mysql_backup, run_postgres_backup};
+use crate::backup::{
+    BackupError, BackupRequest, run_mongo_backup, run_mysql_backup, run_postgres_backup,
+};
 use crate::connect::{self, ConnectError};
 use crate::db::ConnectParams;
 use crate::events::{JobKind, JobPhase};
@@ -17,7 +19,7 @@ use crate::mask::{self, MaskError, MaskRule, MaskingCoverage, MaskingReport};
 use crate::profile::ConnectionProfile;
 use crate::restore::{
     EngineRestoreOptions, RestoreError, RestoreRequest, TargetNaming, run_mysql_restore,
-    run_postgres_restore,
+    run_mongo_restore, run_postgres_restore,
 };
 use crate::retention::RetentionPolicy;
 use crate::secrets::{self, SecretKind};
@@ -216,6 +218,18 @@ pub async fn backup(
             )
             .await?
         }
+        Engine::Mongo => {
+            run_mongo_backup(
+                profile,
+                request,
+                endpoint,
+                version,
+                &recipients,
+                &row_counts,
+                ctx,
+            )
+            .await?
+        }
     };
 
     Ok(artifact)
@@ -238,6 +252,7 @@ pub async fn restore(
     let target = match profile.engine {
         Engine::Mysql => run_mysql_restore(profile, request, endpoint, ctx).await?,
         Engine::Postgres => run_postgres_restore(profile, request, endpoint, ctx).await?,
+        Engine::Mongo => run_mongo_restore(profile, request, endpoint, ctx).await?,
     };
     Ok(target)
 }
@@ -278,10 +293,7 @@ async fn check_target_exists(
         user: endpoint.user.clone(),
         password: endpoint.password.clone(),
         // PostgreSQL cannot list databases from inside the one being created.
-        database: match profile.engine {
-            Engine::Postgres => Some("postgres".to_string()),
-            Engine::Mysql => None,
-        },
+        database: crate::db::bootstrap_database(profile.engine).map(str::to_string),
     };
 
     let introspector = crate::db::connect(&params).await?;
@@ -862,7 +874,7 @@ async fn plan_masking(
     .await;
 
     let columns = source_columns(source, &request.backup.common.database, &wanted, store).await?;
-    let coverage = mask::plan_coverage(&request.masking, &tables_with_data, &columns)?;
+    let coverage = mask::plan_coverage(source.engine, &request.masking, &tables_with_data, &columns)?;
 
     for inert in &coverage.inert {
         ctx.emit_warn(
@@ -989,6 +1001,10 @@ async fn run_masking(
 ) -> Result<MaskingReport, OpError> {
     let salt = mask::derive_salt(&mask::ensure_secret(store).await?);
 
+    if dest.engine == Engine::Mongo {
+        return run_mongo_masking(dest, database, coverage, &salt, store, ctx).await;
+    }
+
     let updates = mask::update_statements(dest.engine, &coverage.effective, &salt)?;
     let checks = mask::check_statements(dest.engine, &coverage.effective)?;
 
@@ -1062,6 +1078,71 @@ async fn run_masking(
     })
 }
 
+/// Masking a document store.
+///
+/// Structurally the same three steps as the SQL path — mask, read back, report
+/// — and every error still means the destination must go, because
+/// [`mask_destination`] is what calls this. What differs is only *how* the work
+/// is expressed: see [`mask::mongo`] for why a `Hash` cannot be an aggregation
+/// pipeline and what that costs.
+async fn run_mongo_masking(
+    dest: &ConnectionProfile,
+    database: &str,
+    coverage: &MaskingCoverage,
+    salt: &str,
+    store: &Store,
+    ctx: &JobContext,
+) -> Result<MaskingReport, OpError> {
+    let reachable = reach(dest, store).await?;
+    let params = ConnectParams {
+        engine: dest.engine,
+        host: reachable.endpoint.host.clone(),
+        port: reachable.endpoint.port,
+        user: reachable.endpoint.user.clone(),
+        password: reachable.endpoint.password.clone(),
+        database: Some(database.to_string()),
+    };
+
+    let collections = coverage.tables();
+    ctx.emit(
+        JobPhase::Restore,
+        format!("masking {} collection(s) in {database}", collections.len()),
+    )
+    .await;
+
+    let rewritten = mask::mongo::apply(&params, database, &coverage.effective, salt).await?;
+    ctx.emit(
+        JobPhase::Restore,
+        format!("masked {rewritten} document(s)"),
+    )
+    .await;
+
+    // ── Prove it ────────────────────────────────────────────────────────
+    //
+    // Same reasoning as the SQL path: an update reporting success is not
+    // evidence the field is unreadable. A validator that rewrote the value, a
+    // rule that addressed a field inside an array, a document whose field held
+    // a subdocument this refuses to flatten — none of those raise an error, and
+    // all of them are counted here.
+    ctx.emit(JobPhase::Verify, "checking that masking took effect")
+        .await;
+    let columns = mask::mongo::verify(&params, database, &coverage.effective).await?;
+
+    ctx.emit(
+        JobPhase::Verify,
+        format!("{} field(s) confirmed masked", columns.len()),
+    )
+    .await;
+
+    Ok(MaskingReport {
+        tables: collections,
+        columns,
+        rows_rewritten: rewritten,
+        inert: coverage.inert.clone(),
+        verified: true,
+    })
+}
+
 /// Drop a database this run created.
 ///
 /// Separate from the drill's cleanup, which refuses any name it did not
@@ -1077,18 +1158,10 @@ async fn drop_database(dest: &ConnectionProfile, name: &str, store: &Store) -> R
         user: reachable.endpoint.user.clone(),
         password: reachable.endpoint.password.clone(),
         // Never connect *to* the database being dropped.
-        database: match dest.engine {
-            Engine::Postgres => Some("postgres".to_string()),
-            Engine::Mysql => None,
-        },
+        database: crate::db::bootstrap_database(dest.engine).map(str::to_string),
     };
 
-    let quoted = match dest.engine {
-        Engine::Mysql => crate::db::quote_mysql_ident(name),
-        Engine::Postgres => crate::db::quote_pg_ident(name),
-    }?;
-
-    crate::db::execute_raw(&params, &format!("DROP DATABASE IF EXISTS {quoted}")).await?;
+    crate::db::drop_database(&params, name).await?;
     Ok(())
 }
 
@@ -1800,18 +1873,10 @@ async fn drop_scratch_database(
         user: reachable.endpoint.user.clone(),
         password: reachable.endpoint.password.clone(),
         // Never connect *to* the database being dropped.
-        database: match dest.engine {
-            Engine::Postgres => Some("postgres".to_string()),
-            Engine::Mysql => None,
-        },
+        database: crate::db::bootstrap_database(dest.engine).map(str::to_string),
     };
 
-    let quoted = match dest.engine {
-        Engine::Mysql => crate::db::quote_mysql_ident(name),
-        Engine::Postgres => crate::db::quote_pg_ident(name),
-    }?;
-
-    crate::db::execute_raw(&params, &format!("DROP DATABASE IF EXISTS {quoted}")).await?;
+    crate::db::drop_database(&params, name).await?;
     ctx.emit(JobPhase::Cleanup, format!("dropped {name}")).await;
     Ok(())
 }

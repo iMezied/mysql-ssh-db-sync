@@ -70,11 +70,23 @@ once is handled by SQLite, but it does mean the daemon and the app both touching
 the store is a real scenario, which is why the in-app scheduler can be turned
 off.
 
-**No abstraction over engines beyond what MySQL and PostgreSQL needed.** Adding
-MongoDB or SQL Server is not plumbing: 27 exhaustive `match` arms on `Engine`,
-three engine-shaped abstractions, and an introspection contract defined in terms
-of tables, rows and columns. That is why they are not stubbed. See
-[DECISIONS.md](../../DECISIONS.md), M14.
+**One `Introspector`, not one per shape.** MongoDB was expected to force the
+trait apart into a relational contract and a document one, and it did not. Its
+vocabulary is relational — table, row, column — but what it asks for is generic:
+name the containers, name the records, count them, digest them, list their
+fields. A collection answers all five. `Engine::is_relational()` marks the three
+places that genuinely branch, and all three generate SQL.
+
+What did not carry over is masking. MongoDB's aggregation language has no
+general-purpose hash, so `mask::mongo` is a parallel implementation rather than
+a dialect: `Null` and `Constant` are one server-side `updateMany`, while the
+hashing transforms read each document and compute the replacement here. The
+read-back that proves masking took is identical in effect either way, which is
+what keeps the guarantee intact.
+
+**SQL Server is still not stubbed.** `BACKUP DATABASE` writes server-side, so
+there is no client-side stream and no artifact of the shape every other feature
+assumes. See [DECISIONS.md](../../DECISIONS.md), M14.
 
 ## The frontend
 

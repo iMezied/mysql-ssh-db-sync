@@ -100,11 +100,17 @@ fn ssh_config() -> SshConfig {
 /// many queries over it.
 static MYSQL_TUNNEL: tokio::sync::OnceCell<TunnelHandle> = tokio::sync::OnceCell::const_new();
 static PG_TUNNEL: tokio::sync::OnceCell<TunnelHandle> = tokio::sync::OnceCell::const_new();
+static MONGO_TUNNEL: tokio::sync::OnceCell<TunnelHandle> = tokio::sync::OnceCell::const_new();
 
 async fn tunnel_for(engine: Engine) -> &'static TunnelHandle {
     let (cell, service, port) = match engine {
         Engine::Mysql => (&MYSQL_TUNNEL, "mysql", 3306u16),
         Engine::Postgres => (&PG_TUNNEL, "postgres", 5432u16),
+        // Worth tunnelling rather than connecting directly: it is the one
+        // configuration where the MongoDB driver's own discovery would learn
+        // the server's advertised hostname and try to dial it. See the
+        // `direct_connection` note in db.rs.
+        Engine::Mongo => (&MONGO_TUNNEL, "mongo", 27017u16),
     };
 
     cell.get_or_init(|| async {
@@ -126,6 +132,7 @@ async fn introspector_for(engine: Engine, database: Option<&str>) -> Box<dyn Int
     let (user, password) = match engine {
         Engine::Mysql => ("root", "testroot"),
         Engine::Postgres => ("dbsync", "testpass"),
+        Engine::Mongo => ("root", "testroot"),
     };
 
     let params = ConnectParams {

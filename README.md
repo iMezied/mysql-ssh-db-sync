@@ -1,9 +1,10 @@
 # DBSync Studio
 
-Cross-server database backup, restore and sync for MySQL and PostgreSQL — a
+Cross-server database backup, restore and sync for MySQL, PostgreSQL and
+MongoDB — a
 desktop app for DBAs, plus a headless CLI that does exactly the same things.
 
-> **Status: M9.** MySQL and PostgreSQL backup and restore work end to end over
+> **Status: M15.** MySQL, PostgreSQL and MongoDB backup and restore work end to end over
 > SSH tunnels; cross-server sync runs as one job with verification and
 > retention. Scheduling, packaging, encryption at rest, content verification,
 > restore drills and column masking are in. See the
@@ -115,7 +116,7 @@ must be able to do.
 | `engine-cli/` | `dbsync` — headless entry point, JSON-lines progress |
 | `apps/desktop/src-tauri/` | Tauri commands, typed event bridge, app state |
 | `apps/desktop/src/` | React UI. `bindings.ts` is generated — never edit it |
-| `tests/fixtures/` | MySQL and PostgreSQL fixture schemas |
+| `tests/fixtures/` | MySQL, PostgreSQL and MongoDB fixtures |
 | `legacy tables.conf` | Importable — `plan::parse_tables_conf` reads the old format |
 | `tests/*.sh` | Fixture and DEFINER round-trip verification |
 
@@ -123,8 +124,8 @@ must be able to do.
 
 1. **The UI submits a `BackupRequest`** — a `CommonBackupOptions` (database,
    per-table selections, output directory) plus a per-engine variant,
-   `Mysql(..)` or `Postgres(..)`. Options that mean nothing to the other engine
-   are unrepresentable rather than silently ignored.
+   `Mysql(..)`, `Postgres(..)` or `Mongo(..)`. Options that mean nothing to
+   another engine are unrepresentable rather than silently ignored.
 
 2. **`validate()` runs before anything opens.** Engine mismatch, an empty
    selection, a row filter on a schema-only table, or parallel `pg_dump`
@@ -610,16 +611,28 @@ is the whole change once there is somewhere to publish to.
 cargo test --workspace
 ```
 
-Integration fixtures — two databases seeded with the things that break naive
-tooling (DEFINER clauses, binary payloads, FK cycles, reserved-word and unicode
-identifiers, a MyISAM table, and row data containing the literal text
-`DEFINER=`):
+Integration fixtures — three databases seeded with the things that break naive
+tooling. The SQL fixtures carry DEFINER clauses, binary payloads, FK cycles,
+reserved-word and unicode identifiers, a MyISAM table, and row data containing
+the literal text `DEFINER=`. The MongoDB fixture carries documents with
+differing field sets, a nested subdocument, an array of subdocuments, a numeric
+field where its siblings hold strings, and two documents whose field *order*
+differs while their content matches — each one an assumption the introspection
+or masking code makes:
 
 ```bash
-docker compose -f docker-compose.test.yml up -d --wait mysql postgres
+docker compose -f docker-compose.test.yml up -d --wait mysql postgres mongo
 tests/verify-fixtures.sh
 tests/verify-definer-roundtrip.sh
 docker compose -f docker-compose.test.yml down -v
+```
+
+The MongoDB suite needs only the container — it drives the driver directly, so
+no client tools have to be installed to run it:
+
+```bash
+docker compose -f docker-compose.test.yml up -d --wait mongo
+cargo test -p db-sync-engine --test mongo
 ```
 
 `verify-definer-roundtrip.sh` is the one worth understanding: it takes a real
@@ -726,20 +739,38 @@ a schedule that comes due, moves data, verifies it, and enforces retention.
 | **M8** | Restore drills — proving an artifact restores, on a schedule | **Done** |
 | **M9** | Column-level masking on the destination, with a verified read-back | **Done** |
 | **M10** | Off-site destinations: S3-compatible upload, credentials, off-site retention, CLI and GUI | **Done** |
+| **M11** | Parallel MySQL dumps: `validate` refuses `parallel_threads` rather than letting it declare a directory artifact it never produces. PostgreSQL's `parallel_jobs` is genuinely implemented | **Done** |
 | **M12** | Slack and Teams webhook rendering, library size and growth analytics | **Done** |
 | **M13** | Shareable configuration export/import carrying no credentials, audit trail | **Done** |
+| **M14** | MongoDB: introspection, `mongodump`/`mongorestore`, verification, masking, CLI and GUI. SQL Server still not attempted | **Partly done** |
 | **M15** | Saved SSH servers, shared by reference and adopted from existing configurations | **Done** |
 
-**M14 (MongoDB, SQL Server) is not started**, and deliberately so — a stub
-would put an engine in the connection dropdown that fails behind every path.
-It is not plumbing: 27 exhaustive `match` arms on `Engine`, three
-engine-shaped abstractions, and an introspection contract defined in terms of
-tables, rows and columns. MongoDB needs masking reimplemented as aggregation
-pipelines and content verification rebuilt; SQL Server has no client-side dump
-stream at all, so "what is an artifact" — the concept the manifest, checksum,
-drill, off-site upload and retention are all built on — has to be answered
-first. [DECISIONS.md](DECISIONS.md) records the three questions that have to be
-settled before any code is written.
+**MongoDB is supported; SQL Server is not**, and the split is not arbitrary.
+MongoDB fit because `mongodump --archive` produces a single client-side stream,
+so the manifest, checksum, drill, off-site upload and retention all work
+unchanged. SQL Server's `BACKUP DATABASE` writes server-side and produces no
+such stream, so "what is an artifact" — the concept every other feature is
+built on — would have to be answered first.
+
+Two things about MongoDB are worth knowing before using it, and both are
+consequences of the engine rather than of this app:
+
+- **A dump is consistent within each collection, not across them**, unless
+  oplog capture is on — which needs a replica set and is unavailable on a
+  standalone server. The backup page says so.
+- **Masking a hashed field is one write per document.** MongoDB's aggregation
+  language has no general-purpose hash, so the salted SHA-256 that keeps
+  pseudonyms consistent with the SQL engines is computed by this app. `Null`
+  and `Constant` rules stay one server-side update per collection.
+
+Structure-only collections and per-collection row filters are **refused** for
+MongoDB rather than approximated, because `mongodump` writes one archive in one
+pass; a manifest describing an artifact that was not produced is what the
+restore drill would then check against. A MongoDB restore also refuses to run
+without its manifest — the archive carries the source namespace, and without
+knowing it `mongorestore` would put every collection back into the database it
+came from. [DECISIONS.md](DECISIONS.md) records all of this, and the three
+design questions that had to be settled before any of it was written.
 
 A drill compares exact row counts only when the backup recorded them
 (`--count-rows`, or the toggle on the Backup and Schedules pages). Without

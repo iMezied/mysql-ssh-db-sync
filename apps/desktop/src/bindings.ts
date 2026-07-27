@@ -569,19 +569,23 @@ export type DestinationView = {
  *  for how these values are written to SQLite and to JSON manifests. Do not
  *  hand-write match arms mapping these to strings — use `Display`/`FromStr`.
  */
-export type Engine = "mysql" | "postgres";
+export type Engine = "mysql" | "postgres" | "mongo";
 
 export type EngineBackupOptions = {
 	engine: "mysql",
 } & MysqlBackupOptions | {
 	engine: "postgres",
-} & PostgresBackupOptions;
+} & PostgresBackupOptions | {
+	engine: "mongo",
+} & MongoBackupOptions;
 
 export type EngineRestoreOptions = {
 	engine: "mysql",
 } & MysqlRestoreOptions | {
 	engine: "postgres",
-} & PostgresRestoreOptions;
+} & PostgresRestoreOptions | {
+	engine: "mongo",
+} & MongoRestoreOptions;
 
 /**
  *  Environment classification for a connection profile.
@@ -758,6 +762,82 @@ export type MaskingPreview = {
 	checks: string[],
 	/**  Rules that would not run, with the reason. */
 	inert: InertRule[],
+};
+
+/**
+ *  Derived rather than written out, unlike the other two engines': every
+ *  default here really is the type's own. The reasoning that matters — why
+ *  `oplog` is off — belongs on the field, not in a hand-written `impl` that
+ *  restates `false`.
+ */
+export type MongoBackupOptions = {
+	/**
+	 *  Capture the oplog during the dump so the restore can replay to a single
+	 *  point in time.
+	 * 
+	 *  This is MongoDB's answer to `--single-transaction`, and the reason it is
+	 *  **off** by default is that it is not equivalent: `--oplog` requires a
+	 *  replica set and fails outright on a standalone server, which is what
+	 *  most development databases are. Defaulting it on would make the common
+	 *  case an error.
+	 * 
+	 *  Without it, a dump of a database being written to is consistent within
+	 *  each collection and not across them. That is a real caveat and the UI
+	 *  says so rather than burying it here.
+	 */
+	oplog: boolean,
+	/**
+	 *  Collections dumped at once. `None` leaves `mongodump` to its own
+	 *  default.
+	 */
+	parallel_collections: number | null,
+	/**
+	 *  Also dump the users and roles defined on this database.
+	 * 
+	 *  The counterpart of PostgreSQL's `include_globals`, and off for the same
+	 *  reason: restoring them into another server changes who can log in there.
+	 */
+	dump_users_and_roles: boolean,
+	extra_flags: string[],
+};
+
+export type MongoRestoreOptions = {
+	/**
+	 *  Drop each collection before restoring it.
+	 * 
+	 *  Distinct from [`TargetNaming::DropAndRecreate`], which drops the whole
+	 *  database: this is what makes `IntoExisting` replace rather than merge.
+	 *  Off by default, so the safe reading of "restore into this database" is
+	 *  the one that happens without asking.
+	 */
+	drop_collections: boolean,
+	/**
+	 *  Restore only these collections. Uses `--nsInclude`, so it needs the
+	 *  archive format — which every MongoDB artifact this app writes is.
+	 */
+	only_collections: string[],
+	/**  Collections restored at once, and insertion workers within each. */
+	parallel_collections: number | null,
+	insertion_workers: number | null,
+	/**
+	 *  Stop at the first failed document rather than carrying on.
+	 * 
+	 *  On by default, and the default is the point: `mongorestore` otherwise
+	 *  reports failures on stderr, exits 0, and leaves a database that is
+	 *  missing documents nobody was told about. A restore that half-worked has
+	 *  to be a failed restore, or the drill is checking a lie.
+	 */
+	stop_on_error: boolean,
+	/**  Rebuild indexes after the documents land. */
+	restore_indexes: boolean,
+	/**
+	 *  Skip the destination's schema validators.
+	 * 
+	 *  Off by default: a validator rejecting a document is information, not an
+	 *  obstacle. It matters most after masking, where a masked value can stop
+	 *  matching a pattern the source enforced.
+	 */
+	bypass_document_validation: boolean,
 };
 
 export type MysqlBackupOptions = {
@@ -1538,6 +1618,9 @@ export type ToolOverrides = {
 	pg_dumpall: string | null,
 	pg_restore: string | null,
 	psql: string | null,
+	/**  Defaulted so profiles stored before MongoDB support still deserialise. */
+	mongodump?: string | null,
+	mongorestore?: string | null,
 };
 
 /**

@@ -83,6 +83,10 @@ fn params(engine: Engine, database: Option<&str>) -> ConnectParams {
     let (port, user, password) = match engine {
         Engine::Mysql => (MYSQL_PORT, "root", "testroot"),
         Engine::Postgres => (PG_PORT, "dbsync", "testpass"),
+        // This suite drives the relational fixtures with raw DDL. MongoDB
+        // masking is covered end to end in tests/mongo.rs, against a real
+        // mongod, because none of the statements here have an analogue.
+        Engine::Mongo => unreachable!("the SQL masking suite does not cover MongoDB"),
     };
     ConnectParams {
         engine,
@@ -121,6 +125,10 @@ async fn scratch(engine: Engine, ns: &str) -> ConnectParams {
                 .expect("create scratch schema");
             p
         }
+        // This suite drives the relational fixtures with raw DDL. MongoDB
+        // masking is covered end to end in tests/mongo.rs, against a real
+        // mongod, because none of the statements here have an analogue.
+        Engine::Mongo => unreachable!("the SQL masking suite does not cover MongoDB"),
     }
 }
 
@@ -129,6 +137,10 @@ fn table_name(engine: Engine, ns: &str, table: &str) -> String {
     match engine {
         Engine::Mysql => table.to_string(),
         Engine::Postgres => format!("{ns}.{table}"),
+        // This suite drives the relational fixtures with raw DDL. MongoDB
+        // masking is covered end to end in tests/mongo.rs, against a real
+        // mongod, because none of the statements here have an analogue.
+        Engine::Mongo => unreachable!("the SQL masking suite does not cover MongoDB"),
     }
 }
 
@@ -148,6 +160,10 @@ async fn seed(engine: Engine, ns: &str, p: &ConnectParams) {
             ),
             format!("CREATE TABLE {ns}.orders (id INT PRIMARY KEY, buyer_email TEXT)"),
         ],
+        // This suite drives the relational fixtures with raw DDL. MongoDB
+        // masking is covered end to end in tests/mongo.rs, against a real
+        // mongod, because none of the statements here have an analogue.
+        Engine::Mongo => unreachable!("the SQL masking suite does not cover MongoDB"),
     };
     for statement in ddl {
         execute_raw(p, &statement)
@@ -167,6 +183,10 @@ async fn seed(engine: Engine, ns: &str, p: &ConnectParams) {
              (2, 'bob@example.com', '+441234567891', 'Bell', '444-55-6666', 'none'), \
              (3, NULL, NULL, 'Carr', '777-88-9999', NULL)"
         ),
+        // This suite drives the relational fixtures with raw DDL. MongoDB
+        // masking is covered end to end in tests/mongo.rs, against a real
+        // mongod, because none of the statements here have an analogue.
+        Engine::Mongo => unreachable!("the SQL masking suite does not cover MongoDB"),
     };
     execute_raw(p, &users).await.expect("seed users");
 
@@ -182,6 +202,10 @@ async fn seed(engine: Engine, ns: &str, p: &ConnectParams) {
             "INSERT INTO {ns}.orders VALUES (1, 'alice@example.com'), \
              (2, 'carol@example.com')"
         ),
+        // This suite drives the relational fixtures with raw DDL. MongoDB
+        // masking is covered end to end in tests/mongo.rs, against a real
+        // mongod, because none of the statements here have an analogue.
+        Engine::Mongo => unreachable!("the SQL masking suite does not cover MongoDB"),
     };
     execute_raw(p, &orders).await.expect("seed orders");
 }
@@ -202,6 +226,10 @@ async fn cleanup(engine: Engine, ns: &str) {
             )
             .await;
         }
+        // This suite drives the relational fixtures with raw DDL. MongoDB
+        // masking is covered end to end in tests/mongo.rs, against a real
+        // mongod, because none of the statements here have an analogue.
+        Engine::Mongo => unreachable!("the SQL masking suite does not cover MongoDB"),
     }
 }
 
@@ -210,6 +238,10 @@ async fn read_column(engine: Engine, ns: &str, table: &str, column: &str) -> Vec
     let qualified = match engine {
         Engine::Mysql => table.to_string(),
         Engine::Postgres => format!("{ns}.{table}"),
+        // This suite drives the relational fixtures with raw DDL. MongoDB
+        // masking is covered end to end in tests/mongo.rs, against a real
+        // mongod, because none of the statements here have an analogue.
+        Engine::Mongo => unreachable!("the SQL masking suite does not cover MongoDB"),
     };
     let sql = format!("SELECT {column} FROM {qualified} ORDER BY id");
 
@@ -236,6 +268,10 @@ async fn read_column(engine: Engine, ns: &str, table: &str, column: &str) -> Vec
             pool.close().await;
             out
         }
+        // This suite drives the relational fixtures with raw DDL. MongoDB
+        // masking is covered end to end in tests/mongo.rs, against a real
+        // mongod, because none of the statements here have an analogue.
+        Engine::Mongo => unreachable!("the SQL masking suite does not cover MongoDB"),
     }
 }
 
@@ -515,6 +551,10 @@ async fn an_impossible_transform_is_an_error(engine: Engine, ns: &str) {
         Engine::Postgres => {
             format!("CREATE TABLE {ns}.required (id INT PRIMARY KEY, ssn TEXT NOT NULL)")
         }
+        // This suite drives the relational fixtures with raw DDL. MongoDB
+        // masking is covered end to end in tests/mongo.rs, against a real
+        // mongod, because none of the statements here have an analogue.
+        Engine::Mongo => unreachable!("the SQL masking suite does not cover MongoDB"),
     };
     execute_raw(&p, &ddl).await.expect("create table");
 
@@ -523,6 +563,10 @@ async fn an_impossible_transform_is_an_error(engine: Engine, ns: &str) {
         Engine::Postgres => {
             format!("INSERT INTO {ns}.required VALUES (1, '111-22-3333')")
         }
+        // This suite drives the relational fixtures with raw DDL. MongoDB
+        // masking is covered end to end in tests/mongo.rs, against a real
+        // mongod, because none of the statements here have an analogue.
+        Engine::Mongo => unreachable!("the SQL masking suite does not cover MongoDB"),
     };
     execute_raw(&p, &insert).await.expect("seed");
 

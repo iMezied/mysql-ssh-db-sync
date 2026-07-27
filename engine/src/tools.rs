@@ -23,9 +23,26 @@ pub enum Tool {
     PgDumpall,
     PgRestore,
     Psql,
+    Mongodump,
+    Mongorestore,
 }
 
 impl Tool {
+    /// Every tool, so discovery and the settings page cannot drift from the
+    /// enum by forgetting to list one.
+    pub const ALL: [Tool; 10] = [
+        Tool::Mysqldump,
+        Tool::Mysql,
+        Tool::Mydumper,
+        Tool::Myloader,
+        Tool::PgDump,
+        Tool::PgDumpall,
+        Tool::PgRestore,
+        Tool::Psql,
+        Tool::Mongodump,
+        Tool::Mongorestore,
+    ];
+
     pub const fn binary_name(self) -> &'static str {
         match self {
             Tool::Mysqldump => "mysqldump",
@@ -36,6 +53,8 @@ impl Tool {
             Tool::PgDumpall => "pg_dumpall",
             Tool::PgRestore => "pg_restore",
             Tool::Psql => "psql",
+            Tool::Mongodump => "mongodump",
+            Tool::Mongorestore => "mongorestore",
         }
     }
 
@@ -43,6 +62,7 @@ impl Tool {
         match self {
             Tool::Mysqldump | Tool::Mysql | Tool::Mydumper | Tool::Myloader => Engine::Mysql,
             Tool::PgDump | Tool::PgDumpall | Tool::PgRestore | Tool::Psql => Engine::Postgres,
+            Tool::Mongodump | Tool::Mongorestore => Engine::Mongo,
         }
     }
 
@@ -50,7 +70,13 @@ impl Tool {
     pub const fn is_required(self) -> bool {
         matches!(
             self,
-            Tool::Mysqldump | Tool::Mysql | Tool::PgDump | Tool::PgRestore | Tool::Psql
+            Tool::Mysqldump
+                | Tool::Mysql
+                | Tool::PgDump
+                | Tool::PgRestore
+                | Tool::Psql
+                | Tool::Mongodump
+                | Tool::Mongorestore
         )
     }
 }
@@ -165,6 +191,35 @@ pub fn mysql_needs_column_statistics_flag(client: Version, server: Version) -> b
     client.major >= 8 && server.major < 8
 }
 
+/// Check `mongodump` against the server it will read.
+///
+/// The interesting thing here is what this deliberately does **not** do.
+///
+/// `mongodump` ships in the MongoDB Database Tools, which are versioned in
+/// their own `100.x` series, unrelated to the server's. A client reporting
+/// `100.9.4` against a `7.0.5` server is the *normal* case, not a client 93
+/// majors ahead — so the comparison [`check_pg_dump_compatibility`] makes is
+/// meaningless here, and making it would block every correctly-installed
+/// MongoDB setup on this planet.
+///
+/// What is worth saying is the reverse: a `mongodump` whose major version is
+/// *not* in the 100 series is one of the old server-bundled builds that were
+/// retired at MongoDB 4.4, and those really do fail against a modern server.
+/// That gets a warning rather than a block, because a user pointing an
+/// override at a deliberately old binary for a deliberately old server is
+/// making a choice this app has no business overruling.
+pub fn check_mongodump_compatibility(client: Version, server: Version) -> CompatibilityVerdict {
+    if client.major < 100 {
+        return CompatibilityVerdict::Warn(format!(
+            "mongodump {client} predates the MongoDB Database Tools, which were split out \
+             at server 4.4 and are versioned separately from the server ({server}). \
+             Install the Database Tools (a 100.x mongodump) unless this old binary is \
+             deliberate."
+        ));
+    }
+    CompatibilityVerdict::Ok
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,23 +293,53 @@ mod tests {
     }
 
     #[test]
-    fn required_tools_cover_both_engines() {
-        let required: Vec<Tool> = [
-            Tool::Mysqldump,
-            Tool::Mysql,
-            Tool::Mydumper,
-            Tool::Myloader,
-            Tool::PgDump,
-            Tool::PgDumpall,
-            Tool::PgRestore,
-            Tool::Psql,
-        ]
-        .into_iter()
-        .filter(|t| t.is_required())
-        .collect();
+    fn every_engine_has_the_required_tools_to_dump_and_restore() {
+        let required: Vec<Tool> = Tool::ALL.into_iter().filter(|t| t.is_required()).collect();
 
-        assert!(required.iter().any(|t| t.engine() == Engine::Mysql));
-        assert!(required.iter().any(|t| t.engine() == Engine::Postgres));
+        for engine in Engine::ALL {
+            assert!(
+                required.iter().any(|t| t.engine() == engine),
+                "{engine} has no required tool, so nothing would be discovered for it"
+            );
+        }
         assert!(!Tool::Mydumper.is_required(), "parallel mode is optional");
+    }
+
+    #[test]
+    fn tool_binary_names_are_unique() {
+        let mut names: Vec<&str> = Tool::ALL.iter().map(|t| t.binary_name()).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(before, names.len(), "two tools resolve to one binary");
+    }
+
+    #[test]
+    fn parses_mongodump_version_banner() {
+        let v = Version::parse_first("mongodump version: 100.9.4").unwrap();
+        assert_eq!(v, Version::new(100, 9, 4));
+    }
+
+    #[test]
+    fn mongodump_is_not_version_matched_against_the_server() {
+        // The Database Tools are versioned 100.x independently of the server.
+        // Applying pg_dump's rule here would block every correct install: a
+        // 100.9.4 client against a 7.0.5 server is normal, not 93 majors ahead.
+        let verdict =
+            check_mongodump_compatibility(Version::new(100, 9, 4), Version::new(7, 0, 5));
+        assert!(verdict.is_ok(), "got: {verdict:?}");
+
+        // And the same pairing under pg_dump's rule would be refused — which is
+        // exactly why the two checks cannot share an implementation.
+        assert!(matches!(
+            check_pg_dump_compatibility(Version::new(100, 9, 4), Version::new(7, 0, 5)),
+            CompatibilityVerdict::Warn(_)
+        ));
+    }
+
+    #[test]
+    fn a_pre_database_tools_mongodump_is_flagged() {
+        let verdict = check_mongodump_compatibility(Version::new(4, 2, 3), Version::new(7, 0, 5));
+        assert!(matches!(verdict, CompatibilityVerdict::Warn(_)));
     }
 }

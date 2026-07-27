@@ -1,6 +1,6 @@
 # DBSync Studio documentation
 
-Backup, restore and cross-server sync for MySQL and PostgreSQL, as a desktop
+Backup, restore and cross-server sync for MySQL, PostgreSQL and MongoDB, as a desktop
 app and a headless CLI that share one engine and one database.
 
 **New here?** Read [Overview](overview.md) first — it is written for anyone,

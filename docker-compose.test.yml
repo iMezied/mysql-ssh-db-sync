@@ -52,6 +52,30 @@ services:
       retries: 30
       start_period: 10s
 
+  # Deliberately a standalone, not a replica set.
+  #
+  # It is what most development databases are, and it is the configuration
+  # `--oplog` cannot run against — so leaving oplog capture off by default is
+  # exercised here rather than assumed. A replica set would hide that.
+  mongo:
+    image: mongo:7
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: testroot
+      MONGO_INITDB_DATABASE: fixture
+    ports:
+      - "27018:27017"
+    volumes:
+      - ./tests/fixtures/mongo:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # `ping` is one of the few commands a server with authentication enabled
+      # answers before a login, so this needs no credentials.
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
   # S3-compatible object storage for the off-site destination tests.
   #
   # MinIO speaks the same protocol as S3, R2, B2 and Wasabi, so it exercises

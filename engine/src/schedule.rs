@@ -276,6 +276,9 @@ fn default_restore_options(engine: crate::types::Engine) -> EngineRestoreOptions
         crate::types::Engine::Postgres => {
             EngineRestoreOptions::Postgres(crate::restore::PostgresRestoreOptions::default())
         }
+        crate::types::Engine::Mongo => {
+            EngineRestoreOptions::Mongo(crate::restore::MongoRestoreOptions::default())
+        }
     }
 }
 

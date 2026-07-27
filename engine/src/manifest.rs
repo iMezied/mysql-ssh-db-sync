@@ -28,12 +28,29 @@ pub enum ArtifactFormat {
     PgDirectory,
     /// `mydumper` output directory.
     MydumperDir,
+    /// `mongodump --archive --gzip`. A single self-describing stream holding
+    /// every selected collection, which is what makes MongoDB fit the artifact
+    /// model the rest of this application is built on: one file the client
+    /// produced, whose checksum it controls.
+    ///
+    /// `--gzip` compresses *inside* the archive rather than wrapping it, so
+    /// [`crate::backup::CommonBackupOptions::compress`] is honoured by the tool
+    /// and no second gzip layer is added.
+    MongoArchive,
 }
 
 impl ArtifactFormat {
-    /// Whether `pg_restore`-style per-table selection is possible.
+    /// Whether per-collection or per-table selection at *restore* time is
+    /// possible.
+    ///
+    /// `mongorestore --nsInclude` filters an archive by namespace, which is the
+    /// same capability `pg_restore -t` provides: choose part of the artifact
+    /// without re-running the dump.
     pub const fn supports_selective_restore(self) -> bool {
-        matches!(self, ArtifactFormat::PgCustom | ArtifactFormat::PgDirectory)
+        matches!(
+            self,
+            ArtifactFormat::PgCustom | ArtifactFormat::PgDirectory | ArtifactFormat::MongoArchive
+        )
     }
 
     /// Whether the artifact is a directory rather than a single file.
@@ -290,9 +307,20 @@ mod tests {
     }
 
     #[test]
-    fn only_pg_archive_formats_support_selective_restore() {
+    fn only_archive_formats_support_selective_restore() {
         assert!(ArtifactFormat::PgCustom.supports_selective_restore());
         assert!(ArtifactFormat::PgDirectory.supports_selective_restore());
+        // mongorestore --nsInclude filters an archive by namespace.
+        assert!(ArtifactFormat::MongoArchive.supports_selective_restore());
+        // A flat SQL stream has to be replayed start to finish.
         assert!(!ArtifactFormat::SqlGz.supports_selective_restore());
+    }
+
+    #[test]
+    fn a_mongo_archive_is_a_single_file() {
+        // The whole reason MongoDB fits this application's artifact model: one
+        // file the client produced, whose checksum it controls. If this ever
+        // becomes a directory, encryption and off-site upload both break.
+        assert!(!ArtifactFormat::MongoArchive.is_directory());
     }
 }

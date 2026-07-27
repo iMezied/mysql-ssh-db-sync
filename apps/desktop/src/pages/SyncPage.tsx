@@ -12,6 +12,7 @@ import type {
   SyncRequest,
   TableInfo,
 } from "@/bindings";
+import { defaultBackupOptions, defaultRestoreOptions } from "@/lib/engineDefaults";
 
 type TableMode = "schema_and_data" | "schema_only" | "exclude";
 
@@ -68,55 +69,10 @@ export default function SyncPage() {
   );
 
   const engineBackupOptions = (): EngineBackupOptions =>
-    source?.engine === "postgres"
-      ? {
-          engine: "postgres",
-          format: "custom",
-          no_owner: true,
-          no_privileges: true,
-          blobs: true,
-          schemas: [],
-          serializable_deferrable: false,
-          parallel_jobs: null,
-          include_globals: false,
-          extra_flags: [],
-        }
-      : {
-          engine: "mysql",
-          single_transaction: true,
-          hex_blob: true,
-          set_gtid_purged_off: true,
-          add_drop_table: true,
-          extended_insert: true,
-          routines: true,
-          triggers: true,
-          events: true,
-          default_character_set: "utf8mb4",
-          disable_column_statistics: false,
-          strip_definer: true,
-          parallel_threads: null,
-          extra_flags: [],
-        };
+    defaultBackupOptions(source?.engine ?? "mysql");
 
   const engineRestoreOptions = (): EngineRestoreOptions =>
-    source?.engine === "postgres"
-      ? {
-          engine: "postgres",
-          no_owner: true,
-          no_privileges: true,
-          parallel_jobs: null,
-          only_tables: [],
-          clean: false,
-        }
-      : {
-          engine: "mysql",
-          foreign_key_checks_off: true,
-          unique_checks_off: true,
-          autocommit_off: true,
-          disable_binlog: false,
-          charset: "utf8mb4",
-          collation: "utf8mb4_unicode_ci",
-        };
+    defaultRestoreOptions(source?.engine ?? "mysql");
 
   const start = useMutation({
     mutationFn: () => {

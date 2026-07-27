@@ -158,6 +158,7 @@ async fn profile(
     let (host, port, database) = match engine {
         Engine::Mysql => ("mysql", 3306, "fixture"),
         Engine::Postgres => ("postgres", 5432, "fixture"),
+        Engine::Mongo => ("mongo", 27017, "fixture"),
     };
 
     let profile = store

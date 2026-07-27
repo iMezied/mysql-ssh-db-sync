@@ -61,7 +61,7 @@ Written alongside every artifact. It is what makes a restore checkable.
 | `manifest_version` | Format version |
 | `id` | This backup's id |
 | `source_profile_id` / `source_profile_name` | Where it came from |
-| `engine` / `server_version` | MySQL or PostgreSQL, and the server's version |
+| `engine` / `server_version` | `mysql`, `postgres` or `mongo`, and the server's version |
 | `dump_tool` / `dump_tool_version` | Which binary produced it |
 | `database` | Source database |
 | `created_at` | UTC |

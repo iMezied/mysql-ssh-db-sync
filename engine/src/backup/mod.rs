@@ -1,10 +1,10 @@
 //! Backup options and orchestration.
 //!
 //! Options are split into a common part and a per-engine part. A single flat
-//! struct cannot represent both engines honestly: `--hex-blob` is meaningless
-//! to `pg_dump`, and `--format=custom` is meaningless to `mysqldump`. Modelling
-//! that as an enum makes the invalid combinations unrepresentable rather than
-//! silently ignored.
+//! struct cannot represent every engine honestly: `--hex-blob` is meaningless
+//! to `pg_dump`, `--format=custom` is meaningless to `mysqldump`, and `--oplog`
+//! is meaningless to both. Modelling that as an enum makes the invalid
+//! combinations unrepresentable rather than silently ignored.
 
 use std::path::PathBuf;
 
@@ -15,9 +15,11 @@ use crate::manifest::ArtifactFormat;
 use crate::profile::ConnectionProfile;
 use crate::types::Engine;
 
+pub mod mongo;
 pub mod mysql;
 pub mod postgres;
 
+pub use mongo::run_mongo_backup;
 pub use mysql::run_mysql_backup;
 pub use postgres::run_postgres_backup;
 
@@ -219,11 +221,42 @@ impl Default for PostgresBackupOptions {
     }
 }
 
+/// Derived rather than written out, unlike the other two engines': every
+/// default here really is the type's own. The reasoning that matters — why
+/// `oplog` is off — belongs on the field, not in a hand-written `impl` that
+/// restates `false`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct MongoBackupOptions {
+    /// Capture the oplog during the dump so the restore can replay to a single
+    /// point in time.
+    ///
+    /// This is MongoDB's answer to `--single-transaction`, and the reason it is
+    /// **off** by default is that it is not equivalent: `--oplog` requires a
+    /// replica set and fails outright on a standalone server, which is what
+    /// most development databases are. Defaulting it on would make the common
+    /// case an error.
+    ///
+    /// Without it, a dump of a database being written to is consistent within
+    /// each collection and not across them. That is a real caveat and the UI
+    /// says so rather than burying it here.
+    pub oplog: bool,
+    /// Collections dumped at once. `None` leaves `mongodump` to its own
+    /// default.
+    pub parallel_collections: Option<u16>,
+    /// Also dump the users and roles defined on this database.
+    ///
+    /// The counterpart of PostgreSQL's `include_globals`, and off for the same
+    /// reason: restoring them into another server changes who can log in there.
+    pub dump_users_and_roles: bool,
+    pub extra_flags: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "snake_case", tag = "engine")]
 pub enum EngineBackupOptions {
     Mysql(MysqlBackupOptions),
     Postgres(PostgresBackupOptions),
+    Mongo(MongoBackupOptions),
 }
 
 impl EngineBackupOptions {
@@ -231,6 +264,7 @@ impl EngineBackupOptions {
         match self {
             EngineBackupOptions::Mysql(_) => Engine::Mysql,
             EngineBackupOptions::Postgres(_) => Engine::Postgres,
+            EngineBackupOptions::Mongo(_) => Engine::Mongo,
         }
     }
 
@@ -244,6 +278,7 @@ impl EngineBackupOptions {
                 }
             }
             EngineBackupOptions::Postgres(o) => o.format.artifact_format(),
+            EngineBackupOptions::Mongo(_) => ArtifactFormat::MongoArchive,
         }
     }
 }
@@ -357,6 +392,50 @@ impl BackupRequest {
             if s.where_filter.is_some() && s.mode != TableMode::SchemaAndData {
                 return Err(BackupError::Invalid(format!(
                     "table {:?} has a row filter but is not set to schema+data",
+                    s.name
+                )));
+            }
+        }
+
+        // ── What MongoDB cannot express, refused rather than approximated ──
+        //
+        // Both of these follow the rule this project settled in M11: a
+        // silently-ignored option that makes the manifest describe an artifact
+        // it did not produce is worse than a missing feature, because the
+        // restore path and the drill both believe the manifest.
+        if matches!(self.engine, EngineBackupOptions::Mongo(_)) {
+            // A "schema-only collection" would be a collection with its indexes
+            // and no documents. `mongodump` writes one archive in one pass and
+            // has no per-collection document filter within it, so the choice is
+            // the whole collection or none of it. Approximating either way puts
+            // a name in the manifest's `tables` that the drill then looks for
+            // and cannot find, or leaves one out that is really there.
+            if let Some(s) = self
+                .common
+                .selections
+                .iter()
+                .find(|s| s.mode == TableMode::SchemaOnly)
+            {
+                return Err(BackupError::Invalid(format!(
+                    "collection {:?} is set to structure-only, which mongodump cannot do in a \
+                     single archive. Set it to include documents, or exclude it.",
+                    s.name
+                )));
+            }
+
+            // `mongodump --query` exists, but it applies to one collection and
+            // demands `--collection`, which is incompatible with dumping a
+            // whole database into one archive.
+            if let Some(s) = self
+                .common
+                .selections
+                .iter()
+                .find(|s| s.where_filter.is_some())
+            {
+                return Err(BackupError::Invalid(format!(
+                    "collection {:?} has a row filter, which mongodump cannot apply while \
+                     dumping a whole database into one archive — its --query takes a single \
+                     --collection. Remove the filter, or exclude the collection.",
                     s.name
                 )));
             }

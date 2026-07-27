@@ -39,6 +39,11 @@ pub struct ToolOverrides {
     pub pg_dumpall: Option<String>,
     pub pg_restore: Option<String>,
     pub psql: Option<String>,
+    /// Defaulted so profiles stored before MongoDB support still deserialise.
+    #[serde(default)]
+    pub mongodump: Option<String>,
+    #[serde(default)]
+    pub mongorestore: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]

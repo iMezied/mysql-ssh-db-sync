@@ -9,9 +9,11 @@ use crate::manifest::{ArtifactFormat, BackupManifest};
 use crate::profile::ConnectionProfile;
 use crate::types::{Engine, EnvironmentTag};
 
+pub mod mongo;
 pub mod mysql;
 pub mod postgres;
 
+pub use mongo::run_mongo_restore;
 pub use mysql::run_mysql_restore;
 pub use postgres::run_postgres_restore;
 
@@ -93,10 +95,57 @@ impl Default for PostgresRestoreOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct MongoRestoreOptions {
+    /// Drop each collection before restoring it.
+    ///
+    /// Distinct from [`TargetNaming::DropAndRecreate`], which drops the whole
+    /// database: this is what makes `IntoExisting` replace rather than merge.
+    /// Off by default, so the safe reading of "restore into this database" is
+    /// the one that happens without asking.
+    pub drop_collections: bool,
+    /// Restore only these collections. Uses `--nsInclude`, so it needs the
+    /// archive format — which every MongoDB artifact this app writes is.
+    pub only_collections: Vec<String>,
+    /// Collections restored at once, and insertion workers within each.
+    pub parallel_collections: Option<u16>,
+    pub insertion_workers: Option<u16>,
+    /// Stop at the first failed document rather than carrying on.
+    ///
+    /// On by default, and the default is the point: `mongorestore` otherwise
+    /// reports failures on stderr, exits 0, and leaves a database that is
+    /// missing documents nobody was told about. A restore that half-worked has
+    /// to be a failed restore, or the drill is checking a lie.
+    pub stop_on_error: bool,
+    /// Rebuild indexes after the documents land.
+    pub restore_indexes: bool,
+    /// Skip the destination's schema validators.
+    ///
+    /// Off by default: a validator rejecting a document is information, not an
+    /// obstacle. It matters most after masking, where a masked value can stop
+    /// matching a pattern the source enforced.
+    pub bypass_document_validation: bool,
+}
+
+impl Default for MongoRestoreOptions {
+    fn default() -> Self {
+        Self {
+            drop_collections: false,
+            only_collections: Vec::new(),
+            parallel_collections: None,
+            insertion_workers: None,
+            stop_on_error: true,
+            restore_indexes: true,
+            bypass_document_validation: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "snake_case", tag = "engine")]
 pub enum EngineRestoreOptions {
     Mysql(MysqlRestoreOptions),
     Postgres(PostgresRestoreOptions),
+    Mongo(MongoRestoreOptions),
 }
 
 impl EngineRestoreOptions {
@@ -104,6 +153,7 @@ impl EngineRestoreOptions {
         match self {
             EngineRestoreOptions::Mysql(_) => Engine::Mysql,
             EngineRestoreOptions::Postgres(_) => Engine::Postgres,
+            EngineRestoreOptions::Mongo(_) => Engine::Mongo,
         }
     }
 }
@@ -210,6 +260,34 @@ impl RestoreRequest {
                 {
                     return Err(RestoreError::ParallelRestoreUnsupported(f));
                 }
+            }
+        }
+
+        if let EngineRestoreOptions::Mongo(o) = &self.engine {
+            if let Some(jobs) = o.parallel_collections
+                && jobs == 0
+            {
+                return Err(RestoreError::Invalid(
+                    "parallel_collections must be at least 1".into(),
+                ));
+            }
+            if let Some(workers) = o.insertion_workers
+                && workers == 0
+            {
+                return Err(RestoreError::Invalid(
+                    "insertion_workers must be at least 1".into(),
+                ));
+            }
+
+            // A namespace filter is matched against the archive's contents, so
+            // a pattern is fine but an empty string would match nothing and
+            // restore an empty database while reporting success.
+            if o.only_collections.iter().any(|c| c.trim().is_empty()) {
+                return Err(RestoreError::Invalid(
+                    "a blank collection name in only_collections would match nothing and \
+                     restore an empty database"
+                        .into(),
+                ));
             }
         }
 
