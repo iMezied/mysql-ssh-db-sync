@@ -20,7 +20,7 @@ use crate::plan::{SyncPlan, SyncPlanCreate};
 use crate::profile::{
     ConnectionProfile, DbConfig, ProfileCreate, ProfileUpdate, SshConfig, ToolOverrides,
 };
-use crate::schedule::{NotifyPolicy, Schedule, ScheduleCreate, ScheduleUpdate};
+use crate::schedule::{NotifyPolicy, Schedule, ScheduleCreate, ScheduleKind, ScheduleUpdate};
 use crate::settings;
 use crate::types::{Engine, EnvironmentTag};
 
@@ -822,7 +822,7 @@ impl Store {
 
 /// Every column the row mapper needs, in one place, so the four queries below
 /// cannot drift apart from each other or from [`row_to_schedule`].
-const SCHEDULE_COLUMNS: &str = "id, name, sync_plan_id, dest_profile_id, cron_expression, \
+const SCHEDULE_COLUMNS: &str = "id, name, kind, sync_plan_id, dest_profile_id, cron_expression, \
      timezone, enabled, action_json, webhook_url, notify, catch_up, last_run_at, last_outcome, \
      last_job_id, created_at, updated_at";
 
@@ -866,6 +866,7 @@ impl Store {
         let schedule = Schedule {
             id: Uuid::new_v4(),
             name: input.name,
+            kind: input.kind,
             plan_id: input.plan_id,
             dest_profile_id: input.dest_profile_id,
             cron: input.cron,
@@ -883,13 +884,15 @@ impl Store {
         };
 
         sqlx::query(
-            "INSERT INTO schedules (id, name, sync_plan_id, dest_profile_id, cron_expression, \
-             timezone, enabled, action_json, webhook_url, notify, catch_up, created_at, \
-             updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO schedules (id, name, kind, sync_plan_id, dest_profile_id, \
+             cron_expression, timezone, enabled, action_json, webhook_url, notify, catch_up, \
+             created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         )
         .bind(schedule.id.to_string())
         .bind(&schedule.name)
-        .bind(schedule.plan_id.to_string())
+        .bind(schedule.kind.as_str())
+        .bind(schedule.plan_id.map(|u| u.to_string()))
         .bind(schedule.dest_profile_id.map(|u| u.to_string()))
         .bind(schedule.cron.as_str())
         .bind(schedule.timezone.as_str())
@@ -1013,6 +1016,8 @@ fn row_to_schedule(row: sqlx::sqlite::SqliteRow) -> Result<Schedule> {
     let cron_raw: String = row.get("cron_expression");
     let tz_raw: String = row.get("timezone");
     let notify_raw: String = row.get("notify");
+    let kind_raw: String = row.get("kind");
+    let plan_raw: Option<String> = row.get("sync_plan_id");
     let dest_raw: Option<String> = row.get("dest_profile_id");
     let last_run_raw: Option<String> = row.get("last_run_at");
     let last_outcome_raw: Option<String> = row.get("last_outcome");
@@ -1021,7 +1026,18 @@ fn row_to_schedule(row: sqlx::sqlite::SqliteRow) -> Result<Schedule> {
     Ok(Schedule {
         id: parse_uuid(&row.get::<String, _>("id"), "id")?,
         name: row.get("name"),
-        plan_id: parse_uuid(&row.get::<String, _>("sync_plan_id"), "sync_plan_id")?,
+        // An unrecognised kind is corruption, not "probably a sync". Guessing
+        // would run a drill's row through the sync path, which reads its
+        // missing plan id as a deleted plan and reports the wrong failure.
+        kind: ScheduleKind::parse(&kind_raw).ok_or_else(|| {
+            corrupt(
+                "kind",
+                anyhow::anyhow!("unknown schedule kind {kind_raw:?}"),
+            )
+        })?,
+        plan_id: plan_raw
+            .map(|s| parse_uuid(&s, "sync_plan_id"))
+            .transpose()?,
         dest_profile_id: dest_raw
             .map(|s| parse_uuid(&s, "dest_profile_id"))
             .transpose()?,

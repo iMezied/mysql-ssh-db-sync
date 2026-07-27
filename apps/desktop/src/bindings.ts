@@ -811,10 +811,21 @@ export type S3Destination = {
 export type Schedule = {
 	id: string,
 	name: string,
-	/**  The plan supplies the source profile, database and table selection. */
-	plan_id: string,
 	/**
-	 *  `None` makes this a backup-only schedule.
+	 *  Defaulted, so every schedule written before drills existed reads as the
+	 *  sync it has always been.
+	 */
+	kind?: ScheduleKind,
+	/**
+	 *  The plan supplies the source profile, database and table selection.
+	 * 
+	 *  Required for a sync and always absent for a drill, which restores
+	 *  whatever artifact is newest rather than selecting anything.
+	 */
+	plan_id: string | null,
+	/**
+	 *  For a sync, `None` makes this a backup-only schedule. For a drill this
+	 *  is the connection being drilled, and it is required.
 	 * 
 	 *  Deliberately not a foreign key. If the destination profile is deleted,
 	 *  the schedule must fail loudly at its next run rather than have the
@@ -858,11 +869,19 @@ export type ScheduleAction = {
 	 */
 	deep_verify?: boolean,
 	retention: RetentionPolicy | null,
+	/**
+	 *  Drills only: leave the scratch database behind when the drill fails, so
+	 *  the wreckage can be inspected in the morning.
+	 * 
+	 *  A drill that *passes* always cleans up, whatever this says.
+	 */
+	keep_on_failure?: boolean,
 };
 
 export type ScheduleCreate = {
 	name: string,
-	plan_id: string,
+	kind?: ScheduleKind,
+	plan_id: string | null,
 	dest_profile_id: string | null,
 	cron: string,
 	timezone?: ScheduleTimezone,
@@ -872,6 +891,25 @@ export type ScheduleCreate = {
 	catch_up?: boolean,
 	enabled?: boolean,
 };
+
+/**
+ *  What a schedule does when it fires.
+ * 
+ *  The two kinds answer different questions. A sync asks "is today's data
+ *  somewhere else"; a drill asks "does the thing we have actually restore".
+ *  Only the second one can tell you your backups are worth having, and it is
+ *  the one nobody remembers to run by hand — which is the whole argument for
+ *  it being schedulable.
+ */
+export type ScheduleKind = 
+/**
+ *  Back up a plan's tables, and optionally restore them to a destination.
+ * 
+ *  The default, and what every schedule written before drills existed is.
+ */
+"sync" | 
+/**  Restore the newest artifact into a scratch database, check it, drop it. */
+"drill";
 
 /**  The restore half of a scheduled sync. */
 export type ScheduleRestore = {

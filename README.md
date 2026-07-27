@@ -239,7 +239,8 @@ dbsync restore staging backup.sql.gz --replace dev_app --confirm dev_app
 dbsync key generate                 # create the backup encryption key
 dbsync key export > key.txt         # required before any encrypted backup
 dbsync key recipients age1... age1... # let teammates decrypt future backups
-dbsync drill staging                # prove the newest backup restores
+dbsync drill staging                # prove the newest backup restores, once
+dbsync schedule add-drill "nightly drill" staging "0 4 * * *"   # every night
 dbsync schedule list                # what exists, and when it next runs
 dbsync schedule show nightly        # id or a unique name prefix
 dbsync schedule run nightly         # once, now; non-zero exit if it failed
@@ -644,8 +645,8 @@ a schedule that comes due, moves data, verifies it, and enforces retention.
 | **M12** | Slack and Teams webhook rendering | **Partly** — library analytics outstanding |
 
 Outstanding: team features (M13), MongoDB and SQL Server (M14), and library
-size/growth analytics. Restore drills have no scheduled kind — they run from
-cron or the CLI.
+size/growth analytics. Drill schedules can be created from the CLI
+(`dbsync schedule add-drill`) but not yet from the app's schedules page.
 
 Not in scope for v1: incremental/binlog/WAL sync, multi-user access control.
 Trait seams are left where they would attach.

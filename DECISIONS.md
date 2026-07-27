@@ -1349,3 +1349,61 @@ to fail, so an unreadable list logs a warning and carries on.
 
 This was found by running the CLI twice in a row against a real PostgreSQL
 container, not by reading the code.
+
+## M8 — Drills are schedulable, and the drill was reading its own evidence wrong
+
+A backup is a belief until it has been restored, and a check nobody remembers
+to run is a check that stops happening — usually months before anyone finds
+out. M8 built the drill and left it reachable only from cron or the CLI, which
+is the half that requires someone to remember.
+
+Making it schedulable needed `schedules.sync_plan_id` to become nullable,
+because a drill has no plan: it restores whatever artifact is newest, and the
+artifact already fixes what it contains. SQLite cannot drop a NOT NULL
+constraint, so 0006 rebuilds the table. The two alternatives were worse — a
+sentinel plan id is a row pointing at something that does not exist, and a
+separate `drill_schedules` table would duplicate cron, timezone, catch-up,
+notify, the webhook and the last-run high-water mark, plus the due-check
+itself. `engine/tests/migrations.rs` runs the migration files by hand against a
+*populated* database, because a rebuild that dropped before copying would
+silently delete every schedule a user had.
+
+`Schedule::validate` is where the two shapes are kept apart: a drill with a
+plan, without a profile, or carrying restore target options is refused. The
+last one is load-bearing — `ops::drill` only drops databases matching the name
+it generated itself, and a naming strategy from a schedule would be the one way
+to aim an unattended drill at a real database.
+
+### The drill was failing on good backups
+
+Running one through the CLI immediately failed with four problems on a backup
+that was completely fine. The cause: `manifest.tables_with_data` records which
+tables were *selected* to be dumped with their rows, and the drill read it as
+which tables *had* rows. Every legitimately empty table was reported as a
+row-count mismatch.
+
+The old comment even stated the premise it got wrong — "every table the manifest
+says carried data must exist and be non-empty" — while the manifest says nothing
+of the kind.
+
+A missing table is still a failure; that is unambiguous. An empty one is now
+recorded as *not compared*, with the reason, because nothing in the artifact
+distinguishes "empty at the source" from "lost in transit". That is a weaker
+claim, and it is the strongest honest one available: an alarm that cries wolf
+gets muted, and then the night it is right nobody looks. Restoring the stronger
+check needs the manifest to record what the source actually held at dump time,
+which is a change to the backup path rather than the drill.
+
+Both directions are pinned by tests against real servers: a backup containing an
+empty selected table passes, and a manifest naming a table the restore does not
+produce fails.
+
+### Two drills in the same second
+
+Surfaced by the same run. `TargetNaming::NewTimestamped` has one-second
+resolution, so two drills starting together ask for the same scratch database —
+not hypothetical, since two nightly drills for two databases on one server both
+fire at 04:00. Generated names now carry six hex characters as well as the
+timestamp. `is_drill_database` still recognises the original shape, so a scratch
+database left behind by an older version stays droppable rather than becoming
+litter nothing will clean up.

@@ -17,8 +17,8 @@ use db_sync_engine::profile::{DbConfig, ProfileCreate, ToolOverrides};
 use db_sync_engine::restore::{EngineRestoreOptions, MysqlRestoreOptions, TargetNaming};
 use db_sync_engine::retention::RetentionPolicy;
 use db_sync_engine::schedule::{
-    DEFAULT_GRACE, NotifyPolicy, ScheduleAction, ScheduleCreate, ScheduleError, ScheduleRestore,
-    ScheduleUpdate,
+    DEFAULT_GRACE, NotifyPolicy, ScheduleAction, ScheduleCreate, ScheduleError, ScheduleKind,
+    ScheduleRestore, ScheduleUpdate,
 };
 use db_sync_engine::store::{Store, StoreError};
 use db_sync_engine::types::{Engine, EnvironmentTag};
@@ -98,6 +98,7 @@ fn action(restore: Option<ScheduleRestore>) -> ScheduleAction {
             keep_last: Some(7),
             max_age_days: Some(30),
         }),
+        keep_on_failure: false,
     }
 }
 
@@ -113,7 +114,8 @@ fn safe_restore() -> ScheduleRestore {
 fn backup_only(plan_id: Uuid, cron: &str) -> ScheduleCreate {
     ScheduleCreate {
         name: "nightly backup".into(),
-        plan_id,
+        kind: ScheduleKind::Sync,
+        plan_id: Some(plan_id),
         dest_profile_id: None,
         cron: cron.parse().unwrap(),
         timezone: ScheduleTimezone::Local,
@@ -161,8 +163,9 @@ async fn a_schedule_survives_a_round_trip_intact() {
 
     let created = store
         .create_schedule(ScheduleCreate {
+            kind: ScheduleKind::Sync,
             name: "staging refresh".into(),
-            plan_id,
+            plan_id: Some(plan_id),
             dest_profile_id: Some(dest_id),
             cron: "30 2 * * 1-5".parse().unwrap(),
             timezone: ScheduleTimezone::Utc,
@@ -235,8 +238,9 @@ async fn a_destructive_schedule_cannot_be_created() {
 
     let result = store
         .create_schedule(ScheduleCreate {
+            kind: ScheduleKind::Sync,
             name: "dangerous".into(),
-            plan_id,
+            plan_id: Some(plan_id),
             dest_profile_id: Some(dest_id),
             cron: "0 3 * * *".parse().unwrap(),
             timezone: ScheduleTimezone::Local,
@@ -274,8 +278,9 @@ async fn a_schedule_cannot_be_edited_into_a_destructive_one() {
 
     let created = store
         .create_schedule(ScheduleCreate {
+            kind: ScheduleKind::Sync,
             name: "staging refresh".into(),
-            plan_id,
+            plan_id: Some(plan_id),
             dest_profile_id: Some(dest_id),
             cron: "0 3 * * *".parse().unwrap(),
             timezone: ScheduleTimezone::Local,
@@ -578,8 +583,9 @@ async fn deleting_a_destination_profile_leaves_the_schedule_in_place() {
 
     let created = store
         .create_schedule(ScheduleCreate {
+            kind: ScheduleKind::Sync,
             name: "staging refresh".into(),
-            plan_id,
+            plan_id: Some(plan_id),
             dest_profile_id: Some(dest_id),
             cron: "0 3 * * *".parse().unwrap(),
             timezone: ScheduleTimezone::Local,

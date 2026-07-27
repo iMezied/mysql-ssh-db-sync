@@ -255,7 +255,12 @@ impl Scheduler {
             schedule_id: schedule.id,
             schedule_name: &schedule.name,
             job_id,
-            kind: if schedule.is_sync() {
+            // Must agree with what `perform_*` writes into job history. A
+            // drill that notified as a Backup would tell an operator their
+            // nightly backup succeeded on a night when no backup was taken.
+            kind: if schedule.is_drill() {
+                JobKind::Restore
+            } else if schedule.is_sync() {
                 JobKind::Sync
             } else {
                 JobKind::Backup
@@ -332,12 +337,23 @@ impl Scheduler {
         )
         .await;
 
+        // A drill has no plan and no table selection: it restores whatever
+        // artifact is newest and checks it against its own manifest. Routed
+        // before the plan lookup below, which would otherwise report a drill's
+        // deliberately-absent plan as a deleted one.
+        if schedule.is_drill() {
+            return self.perform_drill(schedule, ctx, job_id).await;
+        }
+
         // Every one of these lookups can fail because something the schedule
         // points at was deleted. Each gets its own message naming what is
         // missing — "not found" alone would send the user hunting.
+        let plan_id = schedule
+            .plan_id
+            .ok_or("this sync schedule has no plan; it cannot run")?;
         let plan = self
             .store
-            .get_sync_plan(schedule.plan_id)
+            .get_sync_plan(plan_id)
             .await
             .map_err(|e| format!("could not read the sync plan: {e}"))?
             .ok_or_else(|| {
@@ -535,12 +551,115 @@ impl Scheduler {
         .inspect(|_| tracing::debug!("scheduled job {job_id} finished"))
     }
 
+    /// A scheduled restore drill.
+    ///
+    /// # Why this is worth scheduling
+    ///
+    /// A backup is a belief until it has been restored. Checksums prove the
+    /// bytes are the bytes that were written; they say nothing about whether
+    /// the dump was coherent or whether the destination can accept it. Only a
+    /// restore answers that — and a drill nobody remembers to run is a drill
+    /// that stops happening, usually months before anyone finds out.
+    ///
+    /// Unattended safety comes from `ops::drill` itself: it generates the
+    /// scratch database name and refuses to drop anything that does not match
+    /// the pattern it generated, so a schedule cannot aim one at a real
+    /// database. `Schedule::validate` refuses restore target options for the
+    /// same reason.
+    async fn perform_drill(
+        &self,
+        schedule: &Schedule,
+        ctx: &JobContext,
+        job_id: Uuid,
+    ) -> Result<RunResult, String> {
+        let dest_id = schedule
+            .dest_profile_id
+            .ok_or("this drill has no connection to restore into")?;
+
+        let dest = self
+            .store
+            .get_profile(dest_id)
+            .await
+            .map_err(|e| format!("could not read the profile to drill: {e}"))?
+            .ok_or_else(|| {
+                format!(
+                    "the connection drill {:?} restores into has been deleted; nothing was checked",
+                    schedule.name
+                )
+            })?;
+
+        let request = schedule
+            .drill_request()
+            .ok_or("this schedule is not a drill")?;
+
+        ops::record_start(
+            &self.store,
+            ctx,
+            // Recorded as a Restore: that is what it does, and a drill showing
+            // up as a Backup in history would make the backup count wrong.
+            JobKind::Restore,
+            dest.id,
+            Some(dest.id),
+            serde_json::to_string(&request).unwrap_or_else(|_| "{}".into()),
+        )
+        .await
+        .map_err(|e| format!("could not record the job: {e}"))?;
+
+        let _ = job_id;
+
+        let outcome = ops::drill(&dest, &request, &self.store, ctx)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // The drill ran; whether it *passed* is a separate question, and the
+        // one the schedule exists to answer.
+        if !outcome.report.passed() {
+            ctx.emit_error(
+                JobPhase::Done,
+                format!(
+                    "DRILL FAILED: {} did not restore cleanly ({} problem(s)). The backups in                      this folder cannot be relied on until this is understood",
+                    outcome.artifact, outcome.report.failures
+                ),
+            )
+            .await;
+        }
+
+        Ok(RunResult {
+            outcome: if outcome.report.passed() {
+                JobOutcome::Success
+            } else {
+                JobOutcome::Failed
+            },
+            // The artifact that was drilled, so a failure names the file.
+            artifact: Some(outcome.artifact.clone().into()),
+            target_database: Some(outcome.scratch_database.clone()),
+            verification: Some(outcome.report.clone()),
+            removed_artifacts: 0,
+            error: (!outcome.report.passed()).then(|| {
+                format!(
+                    "{} did not restore cleanly ({} problem(s))",
+                    outcome.artifact, outcome.report.failures
+                )
+            }),
+        })
+    }
+
     // Names for the report. A missing profile is not an error here — the run
     // has already failed for that reason and been reported; this is only the
     // label on the notification.
 
     async fn source_name(&self, schedule: &Schedule) -> String {
-        let Ok(Some(plan)) = self.store.get_sync_plan(schedule.plan_id).await else {
+        // A drill reads from the backup folder, not from a server. Naming the
+        // profile it restores *into* would read as "this is where the data
+        // came from", which is the opposite of what a drill does.
+        let Some(plan_id) = schedule.plan_id else {
+            return if schedule.is_drill() {
+                "(the backup folder)".into()
+            } else {
+                "(no plan)".into()
+            };
+        };
+        let Ok(Some(plan)) = self.store.get_sync_plan(plan_id).await else {
             return "(deleted plan)".into();
         };
         match self.store.get_profile(plan.profile_id).await {
@@ -558,7 +677,16 @@ impl Scheduler {
     }
 
     async fn database_name(&self, schedule: &Schedule) -> String {
-        match self.store.get_sync_plan(schedule.plan_id).await {
+        let Some(plan_id) = schedule.plan_id else {
+            // A drill's database is the scratch one it invents and drops, so
+            // there is no stable name to report before the run.
+            return if schedule.is_drill() {
+                "(scratch)".into()
+            } else {
+                "(unknown)".into()
+            };
+        };
+        match self.store.get_sync_plan(plan_id).await {
             Ok(Some(plan)) => plan.database,
             _ => "(unknown)".into(),
         }

@@ -639,8 +639,9 @@ db_test! {
 
         let schedule = store
             .create_schedule(db_sync_engine::schedule::ScheduleCreate {
+                kind: db_sync_engine::schedule::ScheduleKind::Sync,
                 name: "nightly staging refresh".into(),
-                plan_id: plan.id,
+                plan_id: Some(plan.id),
                 dest_profile_id: Some(dest.id),
                 // Every minute, with catch-up on, so a single tick a little
                 // later is guaranteed to find an occurrence.
@@ -660,6 +661,7 @@ db_test! {
                     verify: true,
                     deep_verify: false,
                     retention: None,
+                    keep_on_failure: false,
                 },
                 webhook_url: None,
                 notify: db_sync_engine::schedule::NotifyPolicy::Always,
@@ -795,8 +797,9 @@ db_test! {
 
         let schedule = store
             .create_schedule(db_sync_engine::schedule::ScheduleCreate {
+                kind: db_sync_engine::schedule::ScheduleKind::Sync,
                 name: "hourly backup".into(),
-                plan_id: plan.id,
+                plan_id: Some(plan.id),
                 dest_profile_id: None,
                 cron: "@hourly".parse().unwrap(),
                 timezone: db_sync_engine::cron::ScheduleTimezone::Utc,
@@ -814,6 +817,7 @@ db_test! {
                         keep_last: Some(1),
                         max_age_days: None,
                     }),
+                    keep_on_failure: false,
                 },
                 webhook_url: None,
                 notify: db_sync_engine::schedule::NotifyPolicy::Never,
@@ -1326,5 +1330,256 @@ db_test! {
                 let _ = query_scalar("mysql", &format!("DROP DATABASE IF EXISTS `{target}`;")).await;
             }
         }
+    }
+}
+
+db_test! {
+    #[ignore = "requires an unlocked OS keychain"]
+    async fn a_scheduled_drill_restores_the_newest_backup_and_reports_the_verdict() {
+        // The whole argument for scheduling drills: a backup is a belief until
+        // it has been restored, and a check nobody remembers to run is a check
+        // that stops happening. This proves the scheduler runs one unattended,
+        // end to end, against real servers.
+        require_containers!();
+        let (store, _dir) = temp_store().await;
+        let out = tempfile::tempdir().unwrap();
+
+        let source = profile(&store, "drill-source", "root", "testroot").await;
+        let dest = profile(&store, "drill-dest", "dbsync", "testpass").await;
+        let _cleanup = Cleanup(vec![source.id, dest.id]);
+
+        // Something for the drill to find.
+        let ctx = JobContext::new(Uuid::new_v4());
+        ops::backup(&source, &backup_request(out.path().to_path_buf()), &store, &ctx)
+            .await
+            .expect("a backup for the drill to check");
+
+        let schedule = store
+            .create_schedule(db_sync_engine::schedule::ScheduleCreate {
+                kind: db_sync_engine::schedule::ScheduleKind::Drill,
+                name: "nightly drill".into(),
+                // A drill has no plan: the artifact fixes what it contains.
+                plan_id: None,
+                dest_profile_id: Some(dest.id),
+                cron: "* * * * *".parse().unwrap(),
+                timezone: db_sync_engine::cron::ScheduleTimezone::Utc,
+                action: db_sync_engine::schedule::ScheduleAction {
+                    output_dir: out.path().to_path_buf(),
+                    compress: true,
+                    encrypt: false,
+                    backup: EngineBackupOptions::Mysql(MysqlBackupOptions::default()),
+                    restore: None,
+                    verify: true,
+                    deep_verify: false,
+                    retention: None,
+                    keep_on_failure: false,
+                },
+                webhook_url: None,
+                notify: db_sync_engine::schedule::NotifyPolicy::Always,
+                catch_up: true,
+                enabled: true,
+            })
+            .await
+            .expect("a drill schedule is storable");
+
+        assert!(schedule.is_drill());
+        assert!(!schedule.is_sync(), "a drill copies nothing between servers");
+
+        let reports = Arc::new(Reports::default());
+        let (tx, _rx) = db_sync_engine::events::create_event_channel(
+            db_sync_engine::events::EVENT_CHANNEL_CAPACITY,
+        );
+        let scheduler = db_sync_engine::scheduler::Scheduler::new(
+            store.clone(),
+            db_sync_engine::job::JobRegistry::new(),
+            tx,
+        )
+        .with_hooks(Arc::new(Recorder(reports.clone())));
+
+        scheduler
+            .tick_once(schedule.created_at + chrono::Duration::minutes(2))
+            .await;
+        assert_eq!(scheduler.in_flight_ids().await.len(), 1);
+        settle(&scheduler).await;
+
+        let reports = reports.0.lock().await;
+        assert_eq!(reports.len(), 1);
+        let report = &reports[0];
+        assert_eq!(
+            report.outcome,
+            JobOutcome::Success,
+            "the drill should have passed: {:?}",
+            report.error
+        );
+        assert_eq!(
+            report.kind,
+            JobKind::Restore,
+            "a drill restores; recording it as a backup would make the backup \
+             count in history wrong"
+        );
+        assert!(
+            report.verification.as_ref().is_some_and(|v| v.passed),
+            "a drill's whole output is the verdict: {report:?}"
+        );
+
+        // The scratch database is gone: a passing drill always cleans up, and
+        // one left behind would accumulate nightly until a server filled.
+        let scratch = report
+            .target_database
+            .as_deref()
+            .expect("the drill names the database it used");
+        assert!(
+            db_sync_engine::ops::is_drill_database(scratch),
+            "{scratch} must be a generated drill name"
+        );
+        let remaining = query_scalar(
+            "mysql",
+            &format!(
+                "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = '{scratch}'"
+            ),
+        )
+        .await;
+        assert_eq!(remaining, "0", "{scratch} should have been dropped");
+
+        // And the schedule's own record was updated, so the UI and the next
+        // due-check both see that it ran.
+        let after = store.require_schedule(schedule.id).await.unwrap();
+        assert!(after.last_run_at.is_some());
+        assert_eq!(after.last_outcome, Some(db_sync_engine::job::JobOutcome::Success));
+    }
+}
+
+db_test! {
+    #[ignore = "requires an unlocked OS keychain"]
+    async fn a_drill_still_fails_when_a_table_is_actually_missing() {
+        // The counterpart to the empty-table relaxation. An empty table can no
+        // longer fail a drill, because the manifest cannot tell "empty at the
+        // source" from "lost in transit". A table that is *absent* is
+        // unambiguous, and must still fail — otherwise the relaxation would
+        // have removed the signal the drill exists for.
+        require_containers!();
+        let (store, _dir) = temp_store().await;
+        let out = tempfile::tempdir().unwrap();
+
+        let source = profile(&store, "miss-source", "root", "testroot").await;
+        let dest = profile(&store, "miss-dest", "dbsync", "testpass").await;
+        let _cleanup = Cleanup(vec![source.id, dest.id]);
+
+        let ctx = JobContext::new(Uuid::new_v4());
+        let artifact = ops::backup(&source, &backup_request(out.path().to_path_buf()), &store, &ctx)
+            .await
+            .expect("backup");
+
+        // Claim a table the dump never contained. The checksum covers the
+        // artifact, not the manifest, so this is exactly the shape of "the
+        // backup should have had this and does not".
+        let manifest_path = db_sync_engine::manifest::BackupManifest::path_for(&artifact);
+        let mut manifest = db_sync_engine::manifest::BackupManifest::read(&artifact).unwrap();
+        manifest.tables.push("a_table_that_never_existed".into());
+        manifest.tables_with_data.push("a_table_that_never_existed".into());
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let outcome = ops::drill(
+            &dest,
+            &ops::DrillRequest {
+                artifact_dir: out.path().to_path_buf(),
+                restore: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
+                deep_verify: false,
+                keep_on_failure: false,
+            },
+            &store,
+            &ctx,
+        )
+        .await
+        .expect("the drill itself runs; it is the verdict that fails");
+
+        assert!(
+            !outcome.report.passed(),
+            "a table named in the manifest and absent from the restore must fail: {:?}",
+            outcome.report
+        );
+        assert!(
+            outcome.report.tables.iter().any(|t| {
+                t.table == "a_table_that_never_existed"
+                    && matches!(
+                        t.verdict,
+                        db_sync_engine::verify::TableVerdict::MissingAtDestination
+                    )
+            }),
+            "and it must name the table: {:?}",
+            outcome.report
+        );
+
+        // Even a failed drill cleans up unless asked not to.
+        assert!(outcome.dropped);
+    }
+}
+
+db_test! {
+    #[ignore = "requires an unlocked OS keychain"]
+    async fn a_drill_passes_a_backup_containing_an_empty_table() {
+        // The regression this whole correction is about. The fixture has
+        // several legitimately empty tables; a headless backup selects every
+        // table with its data, so the manifest lists them as data tables. The
+        // drill used to read that as "these had rows" and fail on a backup
+        // that was completely fine — an alarm that cries wolf gets muted, and
+        // then the night it is right nobody looks.
+        require_containers!();
+        let (store, _dir) = temp_store().await;
+        let out = tempfile::tempdir().unwrap();
+
+        let source = profile(&store, "empty-source", "root", "testroot").await;
+        let dest = profile(&store, "empty-dest", "dbsync", "testpass").await;
+        let _cleanup = Cleanup(vec![source.id, dest.id]);
+
+        // The shared fixture request marks `sessions` schema-only precisely
+        // because it holds no rows. Promoting it to a data table is the case
+        // that used to fail: selected for data, legitimately empty.
+        let mut request = backup_request(out.path().to_path_buf());
+        for selection in &mut request.common.selections {
+            if selection.name == "sessions" {
+                selection.mode = db_sync_engine::backup::TableMode::SchemaAndData;
+            }
+        }
+        assert!(
+            request
+                .common
+                .tables_with_data()
+                .iter()
+                .any(|t| t.name == "sessions"),
+            "this test depends on an empty table being selected for data"
+        );
+
+        let ctx = JobContext::new(Uuid::new_v4());
+        ops::backup(&source, &request, &store, &ctx).await.expect("backup");
+
+        let outcome = ops::drill(
+            &dest,
+            &ops::DrillRequest {
+                artifact_dir: out.path().to_path_buf(),
+                restore: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
+                deep_verify: false,
+                keep_on_failure: false,
+            },
+            &store,
+            &ctx,
+        )
+        .await
+        .expect("drill");
+
+        assert!(
+            outcome.report.passed(),
+            "an empty table is not a broken backup: {:?}",
+            outcome.report
+        );
+        assert!(
+            outcome.report.skipped >= 1,
+            "and the empty one is reported as not-compared rather than passed: {:?}",
+            outcome.report
+        );
     }
 }

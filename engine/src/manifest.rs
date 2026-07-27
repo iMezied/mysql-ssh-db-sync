@@ -60,7 +60,13 @@ pub struct BackupManifest {
     pub format: ArtifactFormat,
     /// Every table present in the artifact, including schema-only ones.
     pub tables: Vec<String>,
-    /// Subset of `tables` that carries rows.
+    /// Subset of `tables` that was dumped **with its rows**.
+    ///
+    /// This records what the job was asked to include, not what turned out to
+    /// be there. A table selected for data that happens to hold zero rows
+    /// appears here, and nothing in the artifact distinguishes it from one that
+    /// should have had rows and did not — see
+    /// [`crate::ops::drill`], which is careful about exactly that.
     pub tables_with_data: Vec<String>,
     /// Options the job ran with, kept opaque so shapes can evolve freely.
     pub options: serde_json::Value,

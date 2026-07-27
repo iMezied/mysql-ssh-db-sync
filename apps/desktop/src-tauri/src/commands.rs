@@ -857,7 +857,13 @@ impl From<db_sync_engine::schedule::ScheduleError> for CommandError {
         let kind = match &e {
             E::DestructiveTarget(_) => "destructive_schedule",
             E::BadWebhook(..) => "bad_webhook",
-            E::NameRequired | E::RestoreMismatch | E::EngineMismatch { .. } => "invalid",
+            E::NameRequired
+            | E::RestoreMismatch
+            | E::PlanRequired
+            | E::DrillTakesNoPlan
+            | E::DrillNeedsProfile
+            | E::DrillTakesNoTarget
+            | E::EngineMismatch { .. } => "invalid",
         };
         Self::new(kind, e.to_string())
     }

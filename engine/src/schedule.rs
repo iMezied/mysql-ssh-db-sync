@@ -70,6 +70,42 @@ impl NotifyPolicy {
     }
 }
 
+/// What a schedule does when it fires.
+///
+/// The two kinds answer different questions. A sync asks "is today's data
+/// somewhere else"; a drill asks "does the thing we have actually restore".
+/// Only the second one can tell you your backups are worth having, and it is
+/// the one nobody remembers to run by hand — which is the whole argument for
+/// it being schedulable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleKind {
+    /// Back up a plan's tables, and optionally restore them to a destination.
+    ///
+    /// The default, and what every schedule written before drills existed is.
+    #[default]
+    Sync,
+    /// Restore the newest artifact into a scratch database, check it, drop it.
+    Drill,
+}
+
+impl ScheduleKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ScheduleKind::Sync => "sync",
+            ScheduleKind::Drill => "drill",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "sync" => Some(ScheduleKind::Sync),
+            "drill" => Some(ScheduleKind::Drill),
+            _ => None,
+        }
+    }
+}
+
 /// The restore half of a scheduled sync.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct ScheduleRestore {
@@ -95,6 +131,12 @@ pub struct ScheduleAction {
     #[serde(default)]
     pub deep_verify: bool,
     pub retention: Option<RetentionPolicy>,
+    /// Drills only: leave the scratch database behind when the drill fails, so
+    /// the wreckage can be inspected in the morning.
+    ///
+    /// A drill that *passes* always cleans up, whatever this says.
+    #[serde(default)]
+    pub keep_on_failure: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -108,6 +150,20 @@ pub enum ScheduleError {
     DestructiveTarget(String),
     #[error("a schedule with a destination must say how to restore, and one without must not")]
     RestoreMismatch,
+    #[error("a sync schedule needs a plan; it is where the tables to back up come from")]
+    PlanRequired,
+    #[error(
+        "a drill has no sync plan: it restores whatever artifact is newest, and the artifact \
+         already fixes what it contains"
+    )]
+    DrillTakesNoPlan,
+    #[error("a drill needs a connection to restore into")]
+    DrillNeedsProfile,
+    #[error(
+        "a drill chooses its own scratch database name and drops it afterwards, so it cannot be \
+         given restore target options"
+    )]
+    DrillTakesNoTarget,
     #[error("the plan is for a {plan_engine:?} source but the restore options are {options:?}")]
     EngineMismatch {
         plan_engine: crate::types::Engine,
@@ -122,9 +178,17 @@ pub enum ScheduleError {
 pub struct Schedule {
     pub id: Uuid,
     pub name: String,
+    /// Defaulted, so every schedule written before drills existed reads as the
+    /// sync it has always been.
+    #[serde(default)]
+    pub kind: ScheduleKind,
     /// The plan supplies the source profile, database and table selection.
-    pub plan_id: Uuid,
-    /// `None` makes this a backup-only schedule.
+    ///
+    /// Required for a sync and always absent for a drill, which restores
+    /// whatever artifact is newest rather than selecting anything.
+    pub plan_id: Option<Uuid>,
+    /// For a sync, `None` makes this a backup-only schedule. For a drill this
+    /// is the connection being drilled, and it is required.
     ///
     /// Deliberately not a foreign key. If the destination profile is deleted,
     /// the schedule must fail loudly at its next run rather than have the
@@ -151,7 +215,9 @@ pub struct Schedule {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct ScheduleCreate {
     pub name: String,
-    pub plan_id: Uuid,
+    #[serde(default)]
+    pub kind: ScheduleKind,
+    pub plan_id: Option<Uuid>,
     pub dest_profile_id: Option<Uuid>,
     #[specta(type = String)]
     pub cron: CronExpression,
@@ -191,6 +257,22 @@ pub struct ScheduleUpdate {
     pub dest_profile_id: Option<Option<Uuid>>,
 }
 
+/// Conservative restore options for a drill.
+///
+/// A drill restores into a database it just created, so the destructive
+/// options that exist for real restores have nothing to act on and are left
+/// off rather than defaulted on.
+fn default_restore_options(engine: crate::types::Engine) -> EngineRestoreOptions {
+    match engine {
+        crate::types::Engine::Mysql => {
+            EngineRestoreOptions::Mysql(crate::restore::MysqlRestoreOptions::default())
+        }
+        crate::types::Engine::Postgres => {
+            EngineRestoreOptions::Postgres(crate::restore::PostgresRestoreOptions::default())
+        }
+    }
+}
+
 /// How long after its nominal time an occurrence may still start.
 ///
 /// Sized so a scheduler ticking every 30 seconds always catches the minute it
@@ -203,6 +285,8 @@ impl Schedule {
     pub fn validate(&self) -> Result<(), ScheduleError> {
         validate_parts(
             &self.name,
+            self.kind,
+            self.plan_id,
             self.dest_profile_id,
             &self.action,
             self.webhook_url.as_deref(),
@@ -246,8 +330,39 @@ impl Schedule {
             .flatten()
     }
 
+    /// Whether this run also restores to a destination.
+    ///
+    /// A drill has a `dest_profile_id` too — it has to restore *somewhere* —
+    /// so this deliberately checks the kind as well. Without that, every drill
+    /// would report itself as a cross-server sync in job history and in
+    /// notifications.
     pub const fn is_sync(&self) -> bool {
-        self.dest_profile_id.is_some()
+        matches!(self.kind, ScheduleKind::Sync) && self.dest_profile_id.is_some()
+    }
+
+    pub const fn is_drill(&self) -> bool {
+        matches!(self.kind, ScheduleKind::Drill)
+    }
+
+    /// What a drill run needs, or `None` when this is not a drill.
+    pub fn drill_request(&self) -> Option<crate::ops::DrillRequest> {
+        if !self.is_drill() {
+            return None;
+        }
+        Some(crate::ops::DrillRequest {
+            // The same directory backups are written to: a drill's job is to
+            // check what the backups actually produced.
+            artifact_dir: self.action.output_dir.clone(),
+            restore: match &self.action.restore {
+                // Refused by `validate`, so this is unreachable in a stored
+                // schedule; deriving from the backup engine keeps it correct
+                // rather than relying on that.
+                Some(r) => r.options.clone(),
+                None => default_restore_options(self.action.backup.engine()),
+            },
+            deep_verify: self.action.deep_verify,
+            keep_on_failure: self.action.keep_on_failure,
+        })
     }
 
     /// The backup half, built from the plan's table selection.
@@ -290,6 +405,8 @@ impl ScheduleCreate {
     pub fn validate(&self) -> Result<(), ScheduleError> {
         validate_parts(
             &self.name,
+            self.kind,
+            self.plan_id,
             self.dest_profile_id,
             &self.action,
             self.webhook_url.as_deref(),
@@ -299,12 +416,45 @@ impl ScheduleCreate {
 
 fn validate_parts(
     name: &str,
+    kind: ScheduleKind,
+    plan: Option<Uuid>,
     dest: Option<Uuid>,
     action: &ScheduleAction,
     webhook: Option<&str>,
 ) -> Result<(), ScheduleError> {
     if name.trim().is_empty() {
         return Err(ScheduleError::NameRequired);
+    }
+
+    if let Some(url) = webhook {
+        validate_webhook(url)?;
+    }
+
+    // ── Drills ──────────────────────────────────────────────────────────
+    //
+    // A drill's shape is the inverse of a sync's, and the mismatches are all
+    // ways of describing a run that cannot happen. Refusing here means the
+    // scheduler never has to decide what a half-specified schedule meant.
+    if kind == ScheduleKind::Drill {
+        if plan.is_some() {
+            return Err(ScheduleError::DrillTakesNoPlan);
+        }
+        if dest.is_none() {
+            return Err(ScheduleError::DrillNeedsProfile);
+        }
+        // `ops::drill` generates its own scratch name and refuses to drop
+        // anything else. Accepting a naming strategy here would either be
+        // ignored — silently, which is the failure this project keeps
+        // removing — or would let a schedule aim a drill at a real database.
+        if action.restore.is_some() {
+            return Err(ScheduleError::DrillTakesNoTarget);
+        }
+        return Ok(());
+    }
+
+    // ── Syncs ───────────────────────────────────────────────────────────
+    if plan.is_none() {
+        return Err(ScheduleError::PlanRequired);
     }
 
     // A destination without restore options, or restore options without a
@@ -327,10 +477,6 @@ fn validate_parts(
                 options: restore.options.engine(),
             });
         }
-    }
-
-    if let Some(url) = webhook {
-        validate_webhook(url)?;
     }
 
     Ok(())
@@ -377,6 +523,7 @@ mod tests {
             verify: true,
             deep_verify: false,
             retention: None,
+            keep_on_failure: false,
         }
     }
 
@@ -393,7 +540,8 @@ mod tests {
         Schedule {
             id: Uuid::new_v4(),
             name: "nightly".into(),
-            plan_id: Uuid::new_v4(),
+            kind: ScheduleKind::Sync,
+            plan_id: Some(Uuid::new_v4()),
             dest_profile_id: None,
             cron: cron.parse().unwrap(),
             timezone: ScheduleTimezone::Utc,
@@ -428,7 +576,15 @@ mod tests {
         }));
         a.verify = true;
 
-        let err = validate_parts("nightly", Some(Uuid::new_v4()), &a, None).unwrap_err();
+        let err = validate_parts(
+            "nightly",
+            ScheduleKind::Sync,
+            Some(Uuid::new_v4()),
+            Some(Uuid::new_v4()),
+            &a,
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, ScheduleError::DestructiveTarget(_)));
     }
 
@@ -457,19 +613,43 @@ mod tests {
     #[test]
     fn a_non_destructive_target_is_accepted() {
         let a = action(Some(safe_restore()));
-        assert!(validate_parts("nightly", Some(Uuid::new_v4()), &a, None).is_ok());
+        assert!(
+            validate_parts(
+                "nightly",
+                ScheduleKind::Sync,
+                Some(Uuid::new_v4()),
+                Some(Uuid::new_v4()),
+                &a,
+                None
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn destination_and_restore_options_must_agree() {
         // Destination without restore options.
         assert!(matches!(
-            validate_parts("n", Some(Uuid::new_v4()), &action(None), None),
+            validate_parts(
+                "n",
+                ScheduleKind::Sync,
+                Some(Uuid::new_v4()),
+                Some(Uuid::new_v4()),
+                &action(None),
+                None
+            ),
             Err(ScheduleError::RestoreMismatch)
         ));
         // Restore options without a destination.
         assert!(matches!(
-            validate_parts("n", None, &action(Some(safe_restore())), None),
+            validate_parts(
+                "n",
+                ScheduleKind::Sync,
+                Some(Uuid::new_v4()),
+                None,
+                &action(Some(safe_restore())),
+                None
+            ),
             Err(ScheduleError::RestoreMismatch)
         ));
     }
@@ -481,7 +661,14 @@ mod tests {
             options: EngineRestoreOptions::Postgres(Default::default()),
         }));
         assert!(matches!(
-            validate_parts("n", Some(Uuid::new_v4()), &a, None),
+            validate_parts(
+                "n",
+                ScheduleKind::Sync,
+                Some(Uuid::new_v4()),
+                Some(Uuid::new_v4()),
+                &a,
+                None
+            ),
             Err(ScheduleError::EngineMismatch { .. })
         ));
     }
@@ -489,7 +676,14 @@ mod tests {
     #[test]
     fn a_schedule_needs_a_name() {
         assert!(matches!(
-            validate_parts("   ", None, &action(None), None),
+            validate_parts(
+                "   ",
+                ScheduleKind::Sync,
+                Some(Uuid::new_v4()),
+                None,
+                &action(None),
+                None
+            ),
             Err(ScheduleError::NameRequired)
         ));
     }
@@ -607,7 +801,7 @@ mod tests {
 
     fn plan_for(s: &Schedule) -> SyncPlan {
         SyncPlan {
-            id: s.plan_id,
+            id: s.plan_id.expect("a sync schedule always has a plan"),
             profile_id: Uuid::new_v4(),
             name: "nightly".into(),
             database: "app".into(),
@@ -707,5 +901,111 @@ mod tests {
             assert!(!NotifyPolicy::Never.wants(outcome));
             assert!(NotifyPolicy::Always.wants(outcome));
         }
+    }
+
+    // ── Drill schedules ─────────────────────────────────────────────────
+
+    fn drill_schedule() -> Schedule {
+        let mut s = schedule("0 4 * * *", Utc::now());
+        s.kind = ScheduleKind::Drill;
+        s.plan_id = None;
+        s.dest_profile_id = Some(Uuid::new_v4());
+        s
+    }
+
+    #[test]
+    fn a_well_formed_drill_validates() {
+        assert!(drill_schedule().validate().is_ok());
+    }
+
+    #[test]
+    fn a_drill_needs_somewhere_to_restore_into() {
+        let mut s = drill_schedule();
+        s.dest_profile_id = None;
+        assert!(matches!(
+            s.validate(),
+            Err(ScheduleError::DrillNeedsProfile)
+        ));
+    }
+
+    #[test]
+    fn a_drill_refuses_a_sync_plan() {
+        // A drill restores whatever artifact is newest. A plan would either be
+        // ignored — silently, which is the failure mode this project keeps
+        // removing — or would imply a table selection the artifact overrides.
+        let mut s = drill_schedule();
+        s.plan_id = Some(Uuid::new_v4());
+        assert!(matches!(s.validate(), Err(ScheduleError::DrillTakesNoPlan)));
+    }
+
+    #[test]
+    fn a_drill_refuses_restore_target_options() {
+        // The load-bearing one. `ops::drill` only drops databases matching the
+        // name it generated itself; letting a schedule supply a naming
+        // strategy would be the one way to aim an unattended drill at a real
+        // database.
+        let mut s = drill_schedule();
+        s.action.restore = Some(safe_restore());
+        assert!(matches!(
+            s.validate(),
+            Err(ScheduleError::DrillTakesNoTarget)
+        ));
+    }
+
+    #[test]
+    fn a_sync_still_needs_a_plan() {
+        let mut s = schedule("0 3 * * *", Utc::now());
+        s.plan_id = None;
+        assert!(matches!(s.validate(), Err(ScheduleError::PlanRequired)));
+    }
+
+    #[test]
+    fn a_drill_is_not_reported_as_a_sync() {
+        // A drill has a destination profile too, so a predicate based only on
+        // that would label every drill a cross-server sync in job history and
+        // in notifications.
+        let s = drill_schedule();
+        assert!(s.is_drill());
+        assert!(!s.is_sync(), "a drill copies nothing between servers");
+    }
+
+    #[test]
+    fn a_drill_request_carries_the_backup_folder_and_the_flags() {
+        let mut s = drill_schedule();
+        s.action.deep_verify = true;
+        s.action.keep_on_failure = true;
+
+        let request = s.drill_request().expect("a drill builds a request");
+        assert_eq!(request.artifact_dir, PathBuf::from("/backups"));
+        assert!(request.deep_verify);
+        assert!(request.keep_on_failure);
+    }
+
+    #[test]
+    fn a_sync_schedule_builds_no_drill_request() {
+        assert!(schedule("0 3 * * *", Utc::now()).drill_request().is_none());
+    }
+
+    #[test]
+    fn a_schedule_written_before_drills_existed_reads_as_a_sync() {
+        // Every schedule already stored. Built by serialising a current one and
+        // deleting the new key, so this stays honest as the shape changes.
+        let current = schedule("0 3 * * *", Utc::now());
+        let mut json = serde_json::to_value(&current).unwrap();
+        json.as_object_mut().unwrap().remove("kind").unwrap();
+
+        let parsed: Schedule = serde_json::from_value(json).expect("an old schedule must load");
+        assert_eq!(parsed.kind, ScheduleKind::Sync);
+        assert!(parsed.validate().is_ok());
+    }
+
+    #[test]
+    fn the_kind_round_trips_through_its_stored_string() {
+        for kind in [ScheduleKind::Sync, ScheduleKind::Drill] {
+            assert_eq!(ScheduleKind::parse(kind.as_str()), Some(kind));
+        }
+        // An unknown value must not silently become a sync: that would run a
+        // drill's row down the sync path and report its absent plan as deleted.
+        assert_eq!(ScheduleKind::parse("backup"), None);
     }
 }

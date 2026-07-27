@@ -21,7 +21,9 @@ use db_sync_engine::notify::RunReport;
 use db_sync_engine::plan::SyncPlanCreate;
 use db_sync_engine::profile::{DbConfig, ProfileCreate, ToolOverrides};
 use db_sync_engine::restore::{EngineRestoreOptions, MysqlRestoreOptions, TargetNaming};
-use db_sync_engine::schedule::{NotifyPolicy, ScheduleAction, ScheduleCreate, ScheduleRestore};
+use db_sync_engine::schedule::{
+    NotifyPolicy, ScheduleAction, ScheduleCreate, ScheduleKind, ScheduleRestore,
+};
 use db_sync_engine::scheduler::{Scheduler, SchedulerHooks};
 use db_sync_engine::store::Store;
 use db_sync_engine::types::{Engine, EnvironmentTag};
@@ -144,6 +146,7 @@ fn action(restore: Option<ScheduleRestore>, output_dir: PathBuf) -> ScheduleActi
         verify: true,
         deep_verify: false,
         retention: None,
+        keep_on_failure: false,
     }
 }
 
@@ -172,8 +175,9 @@ async fn a_deleted_destination_profile_fails_the_run_loudly() {
     let schedule = h
         .store
         .create_schedule(ScheduleCreate {
+            kind: ScheduleKind::Sync,
             name: "staging refresh".into(),
-            plan_id,
+            plan_id: Some(plan_id),
             dest_profile_id: Some(dest),
             cron: "0 3 * * *".parse().unwrap(),
             timezone: ScheduleTimezone::Utc,
@@ -235,8 +239,9 @@ async fn an_unrunnable_plan_fails_before_opening_any_connection() {
     let schedule = h
         .store
         .create_schedule(ScheduleCreate {
+            kind: ScheduleKind::Sync,
             name: "empty".into(),
-            plan_id,
+            plan_id: Some(plan_id),
             dest_profile_id: None,
             cron: "0 3 * * *".parse().unwrap(),
             timezone: ScheduleTimezone::Utc,
@@ -289,8 +294,9 @@ async fn a_schedule_already_running_is_not_started_again() {
     let schedule = h
         .store
         .create_schedule(ScheduleCreate {
+            kind: ScheduleKind::Sync,
             name: "slow".into(),
-            plan_id,
+            plan_id: Some(plan_id),
             dest_profile_id: None,
             cron: "0 3 * * *".parse().unwrap(),
             timezone: ScheduleTimezone::Utc,
@@ -332,8 +338,9 @@ async fn the_default_policy_stays_quiet_about_success_but_not_failure() {
     let schedule = h
         .store
         .create_schedule(ScheduleCreate {
+            kind: ScheduleKind::Sync,
             name: "quiet".into(),
-            plan_id,
+            plan_id: Some(plan_id),
             dest_profile_id: Some(dest),
             cron: "0 3 * * *".parse().unwrap(),
             timezone: ScheduleTimezone::Utc,
@@ -368,8 +375,9 @@ async fn a_never_policy_reports_nothing_at_all() {
     let schedule = h
         .store
         .create_schedule(ScheduleCreate {
+            kind: ScheduleKind::Sync,
             name: "silent".into(),
-            plan_id,
+            plan_id: Some(plan_id),
             dest_profile_id: Some(dest),
             cron: "0 3 * * *".parse().unwrap(),
             timezone: ScheduleTimezone::Utc,
@@ -408,8 +416,9 @@ async fn a_manual_run_does_not_consume_the_next_scheduled_occurrence() {
     let schedule = h
         .store
         .create_schedule(ScheduleCreate {
+            kind: ScheduleKind::Sync,
             name: "nightly".into(),
-            plan_id,
+            plan_id: Some(plan_id),
             dest_profile_id: Some(dest),
             cron: "0 3 * * *".parse().unwrap(),
             timezone: ScheduleTimezone::Utc,
@@ -448,8 +457,9 @@ async fn a_tick_ignores_disabled_schedules() {
     let plan_id = plan(&h.store, source, vec![TableSelection::with_data("orders")]).await;
 
     let mut input = ScheduleCreate {
+        kind: ScheduleKind::Sync,
         name: "off".into(),
-        plan_id,
+        plan_id: Some(plan_id),
         dest_profile_id: None,
         // Due every minute, so it would certainly fire if it were enabled.
         cron: "* * * * *".parse().unwrap(),
@@ -482,8 +492,9 @@ async fn a_tick_starts_a_schedule_that_has_come_due() {
     let schedule = h
         .store
         .create_schedule(ScheduleCreate {
+            kind: ScheduleKind::Sync,
             name: "hourly".into(),
-            plan_id,
+            plan_id: Some(plan_id),
             dest_profile_id: Some(dest),
             cron: "0 * * * *".parse().unwrap(),
             timezone: ScheduleTimezone::Utc,
@@ -524,8 +535,9 @@ async fn a_tick_does_not_rerun_an_occurrence_it_already_ran() {
     let schedule = h
         .store
         .create_schedule(ScheduleCreate {
+            kind: ScheduleKind::Sync,
             name: "hourly".into(),
-            plan_id,
+            plan_id: Some(plan_id),
             dest_profile_id: Some(dest),
             cron: "0 * * * *".parse().unwrap(),
             timezone: ScheduleTimezone::Utc,
