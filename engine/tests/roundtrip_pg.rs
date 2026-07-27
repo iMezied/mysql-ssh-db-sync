@@ -167,6 +167,7 @@ fn backup_request(output_dir: PathBuf, format: PgDumpFormat) -> BackupRequest {
             output_dir,
             compress: true,
             encrypt: false,
+            record_row_counts: false,
         },
         engine: EngineBackupOptions::Postgres(PostgresBackupOptions {
             format,

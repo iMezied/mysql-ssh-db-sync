@@ -131,6 +131,12 @@ pub struct ScheduleAction {
     #[serde(default)]
     pub deep_verify: bool,
     pub retention: Option<RetentionPolicy>,
+    /// Count rows before dumping, so a drill can compare exactly.
+    ///
+    /// See [`crate::backup::CommonBackupOptions::record_row_counts`]. Defaulted
+    /// off so an existing schedule does not silently acquire the scan.
+    #[serde(default)]
+    pub record_row_counts: bool,
     /// Drills only: leave the scratch database behind when the drill fails, so
     /// the wreckage can be inspected in the morning.
     ///
@@ -374,6 +380,10 @@ impl Schedule {
                 output_dir: self.action.output_dir.clone(),
                 compress: self.action.compress,
                 encrypt: self.action.encrypt,
+                // Scheduled backups are the ones a drill checks, so the
+                // numbers that let it check exactly are worth the scan here
+                // more than anywhere else.
+                record_row_counts: self.action.record_row_counts,
             },
             engine: self.action.backup.clone(),
         }
@@ -523,6 +533,7 @@ mod tests {
             verify: true,
             deep_verify: false,
             retention: None,
+            record_row_counts: false,
             keep_on_failure: false,
         }
     }

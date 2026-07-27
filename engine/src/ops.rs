@@ -165,13 +165,56 @@ pub async fn backup(
         Vec::new()
     };
 
+    // Counted before the dump, so the numbers describe the same snapshot the
+    // dump is about to take rather than whatever the table holds afterwards.
+    let row_counts = if request.common.record_row_counts {
+        let wanted: Vec<String> = request
+            .common
+            .tables_with_data()
+            .into_iter()
+            .map(|s| s.name.clone())
+            .collect();
+        ctx.emit(
+            JobPhase::Introspect,
+            format!("counting rows in {} table(s)", wanted.len()),
+        )
+        .await;
+        count_tables(
+            profile,
+            &reachable.endpoint,
+            &request.common.database,
+            &wanted,
+        )
+        .await?
+    } else {
+        BTreeMap::new()
+    };
+
     let endpoint = reachable.endpoint.clone();
     let artifact = match profile.engine {
         Engine::Mysql => {
-            run_mysql_backup(profile, request, endpoint, version, &recipients, ctx).await?
+            run_mysql_backup(
+                profile,
+                request,
+                endpoint,
+                version,
+                &recipients,
+                &row_counts,
+                ctx,
+            )
+            .await?
         }
         Engine::Postgres => {
-            run_postgres_backup(profile, request, endpoint, version, &recipients, ctx).await?
+            run_postgres_backup(
+                profile,
+                request,
+                endpoint,
+                version,
+                &recipients,
+                &row_counts,
+                ctx,
+            )
+            .await?
         }
     };
 
@@ -1600,46 +1643,55 @@ async fn check_against_manifest(
         .cloned()
         .collect();
 
-    // What the manifest can and cannot support.
+    // How strong a claim the manifest supports.
     //
     // `tables_with_data` records which tables were *selected* to be dumped with
-    // their rows — not which ones turned out to have any. An earlier version of
-    // this function treated an empty table as a failure, on the reading that
-    // the manifest said it "carried data". It does not say that, and the
-    // consequence was a drill that failed on a perfectly good backup of a
-    // database with any legitimately empty table in it. A restore check that
-    // cries wolf is worse than none: it gets muted, and then the night it is
-    // right nobody looks.
+    // their rows — not which ones turned out to have any. Reading it as the
+    // latter is what once made this fail on a perfectly good backup of a
+    // database containing any empty table, and a restore check that cries wolf
+    // is worse than none: it gets muted, and then the night it is right nobody
+    // looks.
     //
-    // So a missing table is still a failure — that is unambiguous — and an
-    // empty one is recorded as not-compared, with the reason. Making the
-    // stronger claim needs the manifest to record what the source actually
-    // held at dump time, which it does not yet.
+    // `source_row_counts` is the stronger evidence, present when the backup was
+    // asked for it. With it a drill compares exact numbers and a dump that lost
+    // rows is caught. Without it, a missing table is still a failure — that is
+    // unambiguous — and an empty one is recorded as not compared.
     let mut expected = BTreeMap::new();
     let mut tables = Vec::new();
     for name in &manifest.tables_with_data {
-        match counts.get(name) {
-            None => tables.push(crate::verify::TableVerification {
-                table: name.clone(),
-                verdict: crate::verify::TableVerdict::MissingAtDestination,
-            }),
-            Some(0) => tables.push(crate::verify::TableVerification {
-                table: name.clone(),
-                verdict: crate::verify::TableVerdict::Skipped {
-                    reason: "restored empty, and the manifest records which tables were selected \
-                             for data rather than which held rows — so this cannot be told apart \
-                             from a table that was empty at the source"
-                        .into(),
-                },
-            }),
-            Some(n) => {
-                expected.insert(name.clone(), *n);
-                tables.push(crate::verify::TableVerification {
-                    table: name.clone(),
-                    verdict: crate::verify::TableVerdict::Match,
-                });
+        let recorded = manifest.source_row_counts.get(name).copied();
+        let verdict = match (counts.get(name), recorded) {
+            (None, _) => crate::verify::TableVerdict::MissingAtDestination,
+
+            // The exact comparison, when the manifest carries the numbers.
+            (Some(actual), Some(source)) if *actual != source => {
+                crate::verify::TableVerdict::RowCountMismatch {
+                    source,
+                    destination: *actual,
+                }
             }
-        }
+            (Some(actual), Some(_)) => {
+                expected.insert(name.clone(), *actual);
+                crate::verify::TableVerdict::Match
+            }
+
+            // No recorded count. An empty table cannot be told apart from one
+            // that was empty at the source.
+            (Some(0), None) => crate::verify::TableVerdict::Skipped {
+                reason: "restored empty, and this backup did not record source row counts — so \
+                         an empty table cannot be told apart from one that lost its rows. Turn \
+                         on row counts for the backup to compare exactly"
+                    .into(),
+            },
+            (Some(actual), None) => {
+                expected.insert(name.clone(), *actual);
+                crate::verify::TableVerdict::Match
+            }
+        };
+        tables.push(crate::verify::TableVerification {
+            table: name.clone(),
+            verdict,
+        });
     }
 
     for name in &schema_only {
@@ -1942,6 +1994,7 @@ mod masking_tests {
                     output_dir: PathBuf::from("/backups"),
                     compress: true,
                     encrypt: false,
+                    record_row_counts: false,
                 },
                 engine: EngineBackupOptions::Mysql(MysqlBackupOptions::default()),
             },

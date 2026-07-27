@@ -103,6 +103,13 @@ enum Command {
         /// Write the dump uncompressed.
         #[arg(long)]
         no_compress: bool,
+        /// Count rows before dumping and record them in the manifest.
+        ///
+        /// Lets a later `dbsync drill` compare exact numbers instead of only
+        /// checking that each table arrived. Costs a full scan per data table,
+        /// on top of the scan the dump itself does.
+        #[arg(long)]
+        count_rows: bool,
     },
     /// Restore an artifact into a database.
     ///
@@ -526,17 +533,21 @@ async fn main() -> Result<()> {
             exclude,
             encrypt,
             no_compress,
+            count_rows,
         } => {
             let store = Store::open(&store_path).await?;
             let result = run_backup(
                 &store,
-                &profile,
-                database,
-                dir,
-                schema_only,
-                exclude,
-                encrypt,
-                !no_compress,
+                BackupArgs {
+                    profile: &profile,
+                    database,
+                    dir,
+                    schema_only,
+                    exclude,
+                    encrypt,
+                    compress: !no_compress,
+                    count_rows,
+                },
                 cli.json,
             )
             .await;
@@ -727,21 +738,32 @@ fn backup_selections(
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_backup(
-    store: &Store,
-    needle: &str,
+/// Grouped so the call site is not nine positional arguments.
+struct BackupArgs<'a> {
+    profile: &'a str,
     database: Option<String>,
     dir: Option<PathBuf>,
     schema_only: Vec<String>,
     exclude: Vec<String>,
     encrypt: bool,
     compress: bool,
-    json: bool,
-) -> Result<()> {
+    count_rows: bool,
+}
+
+async fn run_backup(store: &Store, args: BackupArgs<'_>, json: bool) -> Result<()> {
     use db_sync_engine::backup::{BackupRequest, CommonBackupOptions};
 
-    let profile = resolve_profile(store, needle).await?;
+    let BackupArgs {
+        database,
+        dir,
+        schema_only,
+        exclude,
+        encrypt,
+        compress,
+        count_rows,
+        ..
+    } = args;
+    let profile = resolve_profile(store, args.profile).await?;
 
     let database = database
         .or_else(|| profile.db.database.clone())
@@ -781,6 +803,7 @@ async fn run_backup(
             output_dir,
             compress,
             encrypt,
+            record_row_counts: count_rows,
         },
         engine: default_backup_options(profile.engine),
     };
@@ -1881,6 +1904,8 @@ async fn run_schedule_command(cmd: ScheduleCommand, store: &Store, json: bool) -
                         verify: true,
                         deep_verify: deep,
                         retention: None,
+                        // A drill dumps nothing, so there is nothing to count.
+                        record_row_counts: false,
                         keep_on_failure,
                     },
                     webhook_url: webhook,

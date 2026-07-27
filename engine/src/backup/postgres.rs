@@ -63,6 +63,9 @@ pub async fn run_postgres_backup(
     server_version: String,
     // Public keys to encrypt the artifact to. Empty means no encryption.
     recipients: &[String],
+    // Exact source row counts, when the request asked for them. Empty
+    // otherwise — see `CommonBackupOptions::record_row_counts`.
+    source_row_counts: &std::collections::BTreeMap<String, u64>,
     ctx: &JobContext,
 ) -> Result<PathBuf, BackupError> {
     request.validate(profile)?;
@@ -261,6 +264,7 @@ pub async fn run_postgres_backup(
             .into_iter()
             .map(|s| s.name.clone())
             .collect(),
+        source_row_counts: source_row_counts.clone(),
         options: serde_json::to_value(&request.engine).unwrap_or(serde_json::Value::Null),
         artifact_filename: filename,
         size_bytes: total_bytes,

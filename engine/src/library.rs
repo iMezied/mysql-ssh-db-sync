@@ -165,6 +165,7 @@ mod tests {
                 format: ArtifactFormat::SqlGz,
                 tables: vec!["users".into(), "orders".into()],
                 tables_with_data: vec!["orders".into()],
+                source_row_counts: Default::default(),
                 options: serde_json::json!({}),
                 artifact_filename: name.into(),
                 size_bytes: body.len() as u64,

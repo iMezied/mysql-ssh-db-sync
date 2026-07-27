@@ -98,6 +98,7 @@ fn action(restore: Option<ScheduleRestore>) -> ScheduleAction {
             keep_last: Some(7),
             max_age_days: Some(30),
         }),
+        record_row_counts: false,
         keep_on_failure: false,
     }
 }

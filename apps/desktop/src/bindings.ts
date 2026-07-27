@@ -296,6 +296,29 @@ export type CommonBackupOptions = {
 	 *  already records the flag.
 	 */
 	encrypt: boolean,
+	/**
+	 *  Count the rows of each data table before dumping, and record the
+	 *  numbers in the manifest.
+	 * 
+	 *  # What it buys and what it costs
+	 * 
+	 *  A restore drill checks an artifact against its own manifest. Without
+	 *  these numbers the manifest only says which tables were *selected* for
+	 *  data, so a table that comes back empty cannot be told apart from one
+	 *  that was empty at the source, and the drill has to record it as
+	 *  not compared. With them the drill compares exactly, and a dump that
+	 *  lost rows is caught.
+	 * 
+	 *  The cost is an exact `COUNT(*)` per data table — a full scan, on top of
+	 *  the scan the dump itself does. That is why it is a choice.
+	 *  [`crate::db::TableInfo::estimated_rows`] is not usable here: the planner
+	 *  estimate reads zero for tables that plainly have rows, which is the
+	 *  exact failure this project replaced in the Bash tool.
+	 * 
+	 *  Defaulted to off on deserialise so a schedule stored before this
+	 *  existed does not silently acquire the cost, matching `deep_verify`.
+	 */
+	record_row_counts?: boolean,
 };
 
 export type ConnectionProfile = {
@@ -869,6 +892,13 @@ export type ScheduleAction = {
 	 */
 	deep_verify?: boolean,
 	retention: RetentionPolicy | null,
+	/**
+	 *  Count rows before dumping, so a drill can compare exactly.
+	 * 
+	 *  See [`crate::backup::CommonBackupOptions::record_row_counts`]. Defaulted
+	 *  off so an existing schedule does not silently acquire the scan.
+	 */
+	record_row_counts?: boolean,
 	/**
 	 *  Drills only: leave the scratch database behind when the drill fails, so
 	 *  the wreckage can be inspected in the morning.

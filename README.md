@@ -234,6 +234,7 @@ path the app does:
 ```bash
 dbsync backup prod                  # dump everything, honouring destinations
 dbsync backup prod --schema-only audit_log --exclude sessions
+dbsync backup prod --count-rows      # so a later drill can compare exactly
 dbsync restore staging backup.sql.gz          # into a new timestamped database
 dbsync restore staging backup.sql.gz --replace dev_app --confirm dev_app
 dbsync key generate                 # create the backup encryption key
@@ -646,6 +647,12 @@ a schedule that comes due, moves data, verifies it, and enforces retention.
 
 Outstanding: team features (M13), MongoDB and SQL Server (M14), and library
 size/growth analytics.
+
+A drill compares exact row counts only when the backup recorded them
+(`--count-rows`, or the toggle on the Backup and Schedules pages). Without
+them it still catches a table that is missing, and reports one that restored
+empty as *not compared* — because the manifest alone cannot tell that apart
+from a table that was empty at the source.
 
 Not in scope for v1: incremental/binlog/WAL sync, multi-user access control.
 Trait seams are left where they would attach.

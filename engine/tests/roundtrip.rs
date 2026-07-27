@@ -223,6 +223,7 @@ fn backup_request(output_dir: PathBuf) -> BackupRequest {
             output_dir,
             compress: true,
             encrypt: false,
+            record_row_counts: false,
         },
         engine: EngineBackupOptions::Mysql(MysqlBackupOptions::default()),
     }
@@ -661,6 +662,7 @@ db_test! {
                     verify: true,
                     deep_verify: false,
                     retention: None,
+                    record_row_counts: false,
                     keep_on_failure: false,
                 },
                 webhook_url: None,
@@ -817,6 +819,7 @@ db_test! {
                         keep_last: Some(1),
                         max_age_days: None,
                     }),
+                    record_row_counts: false,
                     keep_on_failure: false,
                 },
                 webhook_url: None,
@@ -1372,6 +1375,7 @@ db_test! {
                     verify: true,
                     deep_verify: false,
                     retention: None,
+                    record_row_counts: false,
                     keep_on_failure: false,
                 },
                 webhook_url: None,
@@ -1580,6 +1584,104 @@ db_test! {
             outcome.report.skipped >= 1,
             "and the empty one is reported as not-compared rather than passed: {:?}",
             outcome.report
+        );
+    }
+}
+
+db_test! {
+    #[ignore = "requires an unlocked OS keychain"]
+    async fn recorded_row_counts_let_a_drill_catch_a_table_that_lost_rows() {
+        // The check the empty-table correction had to give up, restored by
+        // evidence rather than by assumption. With counts in the manifest the
+        // drill compares exact numbers, so a table that arrives with fewer
+        // rows than the source held is caught — which is what a drill is for.
+        require_containers!();
+        let (store, _dir) = temp_store().await;
+        let out = tempfile::tempdir().unwrap();
+
+        let source = profile(&store, "cnt-source", "root", "testroot").await;
+        let dest = profile(&store, "cnt-dest", "dbsync", "testpass").await;
+        let _cleanup = Cleanup(vec![source.id, dest.id]);
+
+        let mut request = backup_request(out.path().to_path_buf());
+        request.common.record_row_counts = true;
+
+        let ctx = JobContext::new(Uuid::new_v4());
+        let artifact = ops::backup(&source, &request, &store, &ctx)
+            .await
+            .expect("backup");
+
+        // The counts are real, and they are exact — not the planner estimate,
+        // which reads zero for tables that plainly have rows.
+        let manifest_path = db_sync_engine::manifest::BackupManifest::path_for(&artifact);
+        let mut manifest = db_sync_engine::manifest::BackupManifest::read(&artifact).unwrap();
+        assert_eq!(
+            manifest.source_row_counts.get("users").copied(),
+            Some(query_scalar("fixture", "SELECT COUNT(*) FROM users")
+                .await
+                .parse::<u64>()
+                .unwrap()),
+            "the manifest should record what the source actually held"
+        );
+
+        // A clean drill passes.
+        let good = ops::drill(
+            &dest,
+            &ops::DrillRequest {
+                artifact_dir: out.path().to_path_buf(),
+                restore: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
+                deep_verify: false,
+                keep_on_failure: false,
+            },
+            &store,
+            &ctx,
+        )
+        .await
+        .expect("drill");
+        assert!(good.report.passed(), "{:?}", good.report);
+        assert_eq!(
+            good.report.skipped, 0,
+            "with counts recorded nothing needs to be left uncompared: {:?}",
+            good.report
+        );
+
+        // Now claim the source had more rows than it did — the shape of a dump
+        // that lost some. The checksum covers the artifact, not the manifest.
+        let users = manifest.source_row_counts.get("users").copied().unwrap();
+        manifest
+            .source_row_counts
+            .insert("users".into(), users + 100);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let bad = ops::drill(
+            &dest,
+            &ops::DrillRequest {
+                artifact_dir: out.path().to_path_buf(),
+                restore: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
+                deep_verify: false,
+                keep_on_failure: false,
+            },
+            &store,
+            &ctx,
+        )
+        .await
+        .expect("the drill runs; the verdict is what fails");
+
+        assert!(!bad.report.passed(), "{:?}", bad.report);
+        assert!(
+            bad.report.tables.iter().any(|t| {
+                t.table == "users"
+                    && matches!(
+                        t.verdict,
+                        db_sync_engine::verify::TableVerdict::RowCountMismatch { .. }
+                    )
+            }),
+            "and it must name the table and both numbers: {:?}",
+            bad.report
         );
     }
 }

@@ -309,6 +309,7 @@ function ScheduleForm({ onClose }: { onClose: () => void }) {
   const [notify, setNotify] = useState<NotifyPolicy>("on_failure");
   const [webhook, setWebhook] = useState("");
   const [prefix, setPrefix] = useState("scheduled");
+  const [countRows, setCountRows] = useState(false);
   // Drill-only.
   const [drillProfileId, setDrillProfileId] = useState("");
   const [drillDeep, setDrillDeep] = useState(false);
@@ -453,6 +454,8 @@ function ScheduleForm({ onClose }: { onClose: () => void }) {
               verify: true,
               deep_verify: drillDeep,
               retention: null,
+              // A drill dumps nothing, so there is nothing to count.
+              record_row_counts: false,
               keep_on_failure: drillKeepOnFailure,
             },
             webhook_url: webhook.trim() === "" ? null : webhook.trim(),
@@ -483,6 +486,8 @@ function ScheduleForm({ onClose }: { onClose: () => void }) {
             : null,
           verify: destId ? verify : false,
           retention: keepLast ? { keep_last: keepLast, max_age_days: null } : null,
+          record_row_counts: countRows,
+          keep_on_failure: false,
         },
         webhook_url: webhook.trim() === "" ? null : webhook.trim(),
         notify,
@@ -763,6 +768,10 @@ function ScheduleForm({ onClose }: { onClose: () => void }) {
           <>
             <Checkbox checked={catchUp} onChange={setCatchUp}>
               Catch up a run missed while the machine was asleep
+            </Checkbox>
+
+            <Checkbox checked={countRows} onChange={setCountRows}>
+              Record row counts, so a drill can compare exact numbers
             </Checkbox>
 
             <label className="flex items-center gap-2 text-xs text-slate-300">

@@ -1407,3 +1407,37 @@ fire at 04:00. Generated names now carry six hex characters as well as the
 timestamp. `is_drill_database` still recognises the original shape, so a scratch
 database left behind by an older version stays droppable rather than becoming
 litter nothing will clean up.
+
+## M8 — The drill's exact check is restored by evidence, not by assumption
+
+The previous commit weakened the drill: an empty table became *not compared*,
+because `manifest.tables_with_data` records which tables were **selected** for
+data, not which held rows. That was the strongest honest claim the manifest
+supported. This adds the evidence that supports a stronger one.
+
+`CommonBackupOptions::record_row_counts` makes a backup count each data table
+before dumping and record the numbers in the manifest. A drill then compares
+exact numbers, so a table that arrives with fewer rows than the source held is
+caught — better than the non-emptiness check that was there before M8's
+correction, which could only tell empty from non-empty.
+
+**It is an exact `COUNT(*)`, not the planner estimate.** `TableInfo::estimated_rows`
+is right there and free, and its own doc says never to use it to verify a
+restore: it reads zero for tables that plainly have rows. That is precisely the
+failure this project was built to replace — the Bash tool "verified" restores
+with `information_schema.TABLE_ROWS`.
+
+**It is off by default**, because the cost is a full scan per data table on top
+of the scan the dump already does. Turning it on silently for every existing
+schedule would be the thing `deep_verify` explicitly avoids: an unattended job
+must not acquire a new cost on upgrade. New backups and schedules can opt in
+from the CLI (`--count-rows`) or a toggle on the Backup and Schedules pages.
+
+The three states are distinct in the report, which is the point:
+
+- counts recorded, numbers match → **Match**
+- counts recorded, numbers differ → **RowCountMismatch**, naming both
+- no counts, table restored empty → **Skipped**, saying that the backup did not
+  record counts and how to change that
+
+A missing table is a failure in all three.

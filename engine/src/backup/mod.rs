@@ -69,6 +69,28 @@ pub struct CommonBackupOptions {
     /// Encrypt at rest with age. Wired in a later milestone; the manifest
     /// already records the flag.
     pub encrypt: bool,
+    /// Count the rows of each data table before dumping, and record the
+    /// numbers in the manifest.
+    ///
+    /// # What it buys and what it costs
+    ///
+    /// A restore drill checks an artifact against its own manifest. Without
+    /// these numbers the manifest only says which tables were *selected* for
+    /// data, so a table that comes back empty cannot be told apart from one
+    /// that was empty at the source, and the drill has to record it as
+    /// not compared. With them the drill compares exactly, and a dump that
+    /// lost rows is caught.
+    ///
+    /// The cost is an exact `COUNT(*)` per data table — a full scan, on top of
+    /// the scan the dump itself does. That is why it is a choice.
+    /// [`crate::db::TableInfo::estimated_rows`] is not usable here: the planner
+    /// estimate reads zero for tables that plainly have rows, which is the
+    /// exact failure this project replaced in the Bash tool.
+    ///
+    /// Defaulted to off on deserialise so a schedule stored before this
+    /// existed does not silently acquire the cost, matching `deep_verify`.
+    #[serde(default)]
+    pub record_row_counts: bool,
 }
 
 impl CommonBackupOptions {
@@ -381,6 +403,7 @@ mod tests {
             output_dir: PathBuf::from("/tmp"),
             compress: true,
             encrypt: false,
+            record_row_counts: false,
         }
     }
 

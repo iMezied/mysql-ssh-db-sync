@@ -159,6 +159,7 @@ fn artifact(dir: &Path, name: &str, body: &[u8]) -> PathBuf {
         format: ArtifactFormat::SqlGz,
         tables: vec!["users".into()],
         tables_with_data: vec!["users".into()],
+        source_row_counts: Default::default(),
         options: serde_json::json!({}),
         artifact_filename: name.into(),
         size_bytes: body.len() as u64,

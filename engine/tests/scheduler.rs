@@ -146,6 +146,7 @@ fn action(restore: Option<ScheduleRestore>, output_dir: PathBuf) -> ScheduleActi
         verify: true,
         deep_verify: false,
         retention: None,
+        record_row_counts: false,
         keep_on_failure: false,
     }
 }

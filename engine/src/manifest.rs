@@ -68,6 +68,19 @@ pub struct BackupManifest {
     /// should have had rows and did not — see
     /// [`crate::ops::drill`], which is careful about exactly that.
     pub tables_with_data: Vec<String>,
+    /// Exact row count of each data table, as the source held it at dump time.
+    ///
+    /// Empty when the backup did not ask for counts — see
+    /// [`crate::backup::CommonBackupOptions::record_row_counts`], which is off
+    /// by default because counting is a full scan.
+    ///
+    /// This is what lets a restore drill compare exactly rather than only
+    /// checking that a table arrived. It is an exact `COUNT(*)`, never a
+    /// planner estimate: the estimate reads zero for tables that plainly have
+    /// rows, which is precisely the failure this project replaced.
+    #[serde(default)]
+    #[specta(type = std::collections::BTreeMap<String, f64>)]
+    pub source_row_counts: std::collections::BTreeMap<String, u64>,
     /// Options the job ran with, kept opaque so shapes can evolve freely.
     pub options: serde_json::Value,
     pub artifact_filename: String,
@@ -188,6 +201,7 @@ mod tests {
             format: ArtifactFormat::SqlGz,
             tables: vec!["users".into(), "orders".into()],
             tables_with_data: vec!["orders".into()],
+            source_row_counts: Default::default(),
             options: serde_json::json!({"single_transaction": true}),
             artifact_filename: "app_20260101_000000.sql.gz".into(),
             size_bytes: 3,

@@ -176,6 +176,7 @@ fn backup_request(output_dir: PathBuf) -> BackupRequest {
             output_dir,
             compress: true,
             encrypt: false,
+            record_row_counts: false,
         },
         engine: EngineBackupOptions::Mysql(MysqlBackupOptions::default()),
     }

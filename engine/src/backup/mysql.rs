@@ -84,6 +84,9 @@ pub async fn run_mysql_backup(
     server_version: String,
     // Public keys to encrypt the artifact to. Empty means no encryption.
     recipients: &[String],
+    // Exact source row counts, when the request asked for them. Empty
+    // otherwise — see `CommonBackupOptions::record_row_counts`.
+    source_row_counts: &std::collections::BTreeMap<String, u64>,
     ctx: &JobContext,
 ) -> Result<PathBuf, BackupError> {
     request.validate(profile)?;
@@ -248,6 +251,7 @@ pub async fn run_mysql_backup(
         format: ArtifactFormat::SqlGz,
         tables: schema_tables,
         tables_with_data: data_tables.iter().map(|t| t.name.clone()).collect(),
+        source_row_counts: source_row_counts.clone(),
         options: serde_json::to_value(&request.engine).unwrap_or(serde_json::Value::Null),
         artifact_filename: filename,
         size_bytes: total_bytes,
@@ -756,6 +760,7 @@ mod tests {
             output_dir: PathBuf::from("/tmp"),
             compress: true,
             encrypt: false,
+            record_row_counts: false,
         };
 
         // Excluded tables appear in neither set.

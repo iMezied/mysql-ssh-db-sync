@@ -43,6 +43,7 @@ export default function BackupPage() {
   const [modes, setModes] = useState<Record<string, TableMode>>({});
   const [started, setStarted] = useState<string | null>(null);
   const [pgFormat, setPgFormat] = useState<PgDumpFormat>("custom");
+  const [countRows, setCountRows] = useState(false);
 
   const profiles = useQuery({ queryKey: ["profiles"], queryFn: api.listProfiles });
   const backupDir = useQuery({
@@ -140,6 +141,7 @@ export default function BackupPage() {
           output_dir: backupDir.data ?? "",
           compress: true,
           encrypt: false,
+          record_row_counts: countRows,
         },
         engine: engineOptions(),
       };
@@ -340,6 +342,24 @@ export default function BackupPage() {
                   </select>
                 </label>
               )}
+
+              <label className="flex items-start gap-2 text-xs text-slate-400">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={countRows}
+                  onChange={(e) => setCountRows(e.target.checked)}
+                />
+                <span>
+                  Record row counts
+                  <span className="text-slate-600">
+                    {" "}
+                    — lets a restore drill compare exact numbers instead of
+                    only checking each table arrived. Costs a full scan per
+                    table, on top of the dump.
+                  </span>
+                </span>
+              </label>
 
               {backupDir.data && (
                 <span className="font-mono text-xs text-slate-600">

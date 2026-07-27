@@ -268,6 +268,7 @@ mod tests {
             format,
             tables: vec![],
             tables_with_data: vec![],
+            source_row_counts: Default::default(),
             options: serde_json::json!({}),
             artifact_filename: "a".into(),
             size_bytes: 0,
