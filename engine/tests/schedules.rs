@@ -39,7 +39,7 @@ async fn plan_and_profiles(store: &Store) -> (Uuid, Uuid) {
             name: "prod".into(),
             engine: Engine::Mysql,
             environment: EnvironmentTag::Prod,
-            ssh: None,
+            ssh_connection_id: None,
             db: DbConfig {
                 host: "10.0.0.1".into(),
                 port: 3306,
@@ -56,7 +56,7 @@ async fn plan_and_profiles(store: &Store) -> (Uuid, Uuid) {
             name: "staging".into(),
             engine: Engine::Mysql,
             environment: EnvironmentTag::Staging,
-            ssh: None,
+            ssh_connection_id: None,
             db: DbConfig {
                 host: "10.0.0.2".into(),
                 port: 3306,

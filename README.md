@@ -18,6 +18,7 @@ desktop app for DBAs, plus a headless CLI that does exactly the same things.
 - [Architecture](#architecture)
 - [How a backup job flows through the system](#how-a-backup-job-flows-through-the-system)
 - [Development setup](#development-setup)
+- [SSH servers](#ssh-servers)
 - [Scheduling](#scheduling)
 - [Masking](#masking)
 - [Off-site destinations](#off-site-destinations)
@@ -70,7 +71,8 @@ Reasoning for the non-obvious choices is in [DECISIONS.md](DECISIONS.md).
                  ├───────────────────────┤
                  │ store    profile      │
                  │ secrets  job/events   │
-                 │ ssh      db  tools    │
+                 │ ssh      sshconn      │
+                 │ db       tools        │
                  │ backup   restore      │
                  │ verify   retention    │
                  │ manifest definer      │
@@ -180,6 +182,35 @@ changing any `#[tauri::command]`:
 ```bash
 cargo test -p db-sync-desktop --lib export_typescript_bindings
 ```
+
+## SSH servers
+
+An SSH server is a saved record of its own, not a field on the connection that
+uses it. One bastion commonly fronts a dozen databases; when its address, user
+or key rotates, editing it in one place moves every connection that tunnels
+through it.
+
+Servers are managed on the **SSH servers** page in the app, and a connection
+picks one from a dropdown. Any server may name another as its jump host —
+chained jumps are not supported, and a route that would need one is refused when
+it is saved rather than when it next runs.
+
+```bash
+dbsync ssh          # what is saved, and what tunnels through each one
+```
+
+The CLI lists them and does not create them: adding a server means verifying an
+unrecognised host key, which is a prompt no cron job can answer.
+
+Deleting a server that something still points at is refused, and the error names
+every connection and jump host holding it. Cascading instead would turn a
+tunnelled connection into a direct one without saying so.
+
+**Upgrading from an earlier version needs no action.** Tunnels configured on
+individual connections are adopted into saved servers the first time the app or
+the CLI opens the store, matched by endpoint so the same server configured three
+times becomes one record — and the key passphrase moves with it, from the
+connection's keychain entry to the server's.
 
 ## Scheduling
 
@@ -655,6 +686,10 @@ a schedule that comes due, moves data, verifies it, and enforces retention.
   keychain; the `destinations` table holds only an endpoint, bucket, region and
   access key id. Plaintext `http://` endpoints are refused for anything but
   loopback. See [Off-site destinations](#off-site-destinations).
+- **A saved SSH server holds no key material.** The `ssh_connections` table
+  holds a host, port, user and — for key-file auth — a *path*. The key stays on
+  disk and its passphrase is in the keychain, keyed by the server's id. See
+  [SSH servers](#ssh-servers).
 
 ## Roadmap
 
@@ -673,8 +708,8 @@ a schedule that comes due, moves data, verifies it, and enforces retention.
 | **M9** | Column-level masking on the destination, with a verified read-back | **Done** |
 | **M10** | Off-site destinations: S3-compatible upload, credentials, off-site retention, CLI and GUI | **Done** |
 | **M12** | Slack and Teams webhook rendering, library size and growth analytics | **Done** |
-
 | **M13** | Shareable configuration export/import carrying no credentials, audit trail | **Done** |
+| **M15** | Saved SSH servers, shared by reference and adopted from existing configurations | **Done** |
 
 **M14 (MongoDB, SQL Server) is not started**, and deliberately so — a stub
 would put an engine in the connection dropdown that fails behind every path.

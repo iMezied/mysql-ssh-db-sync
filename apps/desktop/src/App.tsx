@@ -3,6 +3,7 @@ import { Navigate, Route, Routes, useNavigate } from "react-router-dom";
 
 import Sidebar from "@/components/Sidebar";
 import ProfilesPage from "@/pages/ProfilesPage";
+import SshPage from "@/pages/SshPage";
 import JobsPage from "@/pages/JobsPage";
 import BackupPage from "@/pages/BackupPage";
 import RestorePage from "@/pages/RestorePage";
@@ -24,6 +25,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Navigate to="/profiles" replace />} />
           <Route path="/profiles" element={<ProfilesPage />} />
+          <Route path="/ssh" element={<SshPage />} />
           <Route path="/backup" element={<BackupPage />} />
           <Route path="/restore" element={<RestorePage />} />
           <Route path="/sync" element={<SyncPage />} />

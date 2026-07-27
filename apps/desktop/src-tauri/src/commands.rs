@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use db_sync_engine::audit::AuditAction;
 use db_sync_engine::backup::{BackupRequest, TableSelection};
 use db_sync_engine::backupkey::{self, KeyStatus};
-use db_sync_engine::connect::{self, ConnectionReport};
+use db_sync_engine::connect::{self, ConnectionReport, SshReport};
 use db_sync_engine::cron::{CronExpression, ScheduleTimezone};
 use db_sync_engine::db::{DatabaseInfo, TableInfo};
 use db_sync_engine::destination::{Destination, DestinationCreate, DestinationUpdate};
@@ -29,6 +29,7 @@ use db_sync_engine::profile::{ConnectionProfile, ProfileCreate, ProfileUpdate};
 use db_sync_engine::restore::RestoreRequest;
 use db_sync_engine::schedule::{Schedule, ScheduleCreate, ScheduleUpdate};
 use db_sync_engine::secrets::{self, SecretKind};
+use db_sync_engine::sshconn::{SshConnection, SshConnectionCreate, SshConnectionUpdate};
 use db_sync_engine::settings::{self, AppSettings};
 use db_sync_engine::store::StoreError;
 use secrecy::ExposeSecret;
@@ -70,7 +71,9 @@ impl From<StoreError> for CommandError {
             | StoreError::ScheduleNotFound(_)
             | StoreError::DestinationNotFound(_) => "not_found",
             StoreError::Corrupt { .. } => "corrupt",
-            StoreError::InvalidSchedule(_) | StoreError::InvalidDestination(_) => "invalid",
+            StoreError::InvalidSchedule(_)
+            | StoreError::InvalidDestination(_)
+            | StoreError::InvalidSshConnection(_) => "invalid",
             StoreError::Secrets(_) => "keychain",
             StoreError::Sqlx(_) | StoreError::Migrate(_) => "storage",
         };
@@ -90,7 +93,17 @@ type CmdResult<T> = Result<T, CommandError>;
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct SecretStatus {
     pub has_db_password: bool,
-    pub has_ssh_passphrase: bool,
+}
+
+/// An SSH connection plus the two things the UI cannot derive from the record:
+/// whether its passphrase is stored, and what would break if it were deleted.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SshConnectionStatus {
+    pub has_passphrase: bool,
+    /// Names of the profiles tunnelling through it.
+    pub used_by_profiles: Vec<String>,
+    /// Names of the SSH connections jumping through it.
+    pub used_by_jump: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -241,7 +254,8 @@ pub async fn set_profile_secret(
 
     let kind = match kind.as_str() {
         "db_password" => SecretKind::DbPassword,
-        "ssh_passphrase" => SecretKind::SshKeyPassphrase,
+        // Deliberately no "ssh_passphrase": it belongs to the SSH connection,
+        // not the profile. See `set_ssh_connection_passphrase`.
         other => {
             return Err(CommandError::new(
                 "invalid",
@@ -282,8 +296,193 @@ pub async fn profile_secret_status(
     state.store.require_profile(id).await?;
     Ok(SecretStatus {
         has_db_password: secrets::has_secret(id, SecretKind::DbPassword)?,
-        has_ssh_passphrase: secrets::has_secret(id, SecretKind::SshKeyPassphrase)?,
     })
+}
+
+// ── SSH connections ─────────────────────────────────────────────────────
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_ssh_connections(state: State<'_, AppState>) -> CmdResult<Vec<SshConnection>> {
+    Ok(state.store.list_ssh_connections().await?)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn create_ssh_connection(
+    state: State<'_, AppState>,
+    input: SshConnectionCreate,
+    passphrase: Option<String>,
+) -> CmdResult<SshConnection> {
+    let connection = state.store.create_ssh_connection(input).await?;
+
+    if let Some(passphrase) = passphrase
+        && !passphrase.is_empty()
+    {
+        // Rolled back on a keychain failure for the same reason a profile is:
+        // a record that exists without the credential it needs looks configured
+        // and is not.
+        if let Err(e) = secrets::set_secret(
+            connection.id,
+            SecretKind::SshKeyPassphrase,
+            &passphrase,
+        ) {
+            let _ = state.store.delete_ssh_connection(connection.id).await;
+            return Err(e.into());
+        }
+    }
+
+    state
+        .store
+        .audit(
+            AuditAction::SshConnectionCreated,
+            &connection.name,
+            connection.describe(),
+        )
+        .await;
+    Ok(connection)
+}
+
+/// Edit a connection. Every profile tunnelling through it follows.
+#[tauri::command]
+#[specta::specta]
+pub async fn update_ssh_connection(
+    state: State<'_, AppState>,
+    id: Uuid,
+    patch: SshConnectionUpdate,
+) -> CmdResult<SshConnection> {
+    let before = state.store.get_ssh_connection(id).await?;
+    let after = state.store.update_ssh_connection(id, patch).await?;
+
+    if let Some(before) = before {
+        let mut changes = Vec::new();
+        if before.endpoint != after.endpoint {
+            changes.push(format!("{} -> {}", before.describe(), after.describe()));
+        }
+        if before.jump_host_id != after.jump_host_id {
+            changes.push("jump host changed".to_string());
+        }
+        if before.name != after.name {
+            changes.push(format!("renamed from {}", before.name));
+        }
+        if !changes.is_empty() {
+            // Named individually because this is the record whose blast radius
+            // is not visible from the thing being edited.
+            let affected = state.store.profiles_using_ssh_connection(id).await?;
+            let detail = if affected.is_empty() {
+                changes.join(", ")
+            } else {
+                format!(
+                    "{} (affects {})",
+                    changes.join(", "),
+                    affected
+                        .iter()
+                        .map(|p| p.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            state
+                .store
+                .audit(AuditAction::SshConnectionUpdated, &after.name, detail)
+                .await;
+        }
+    }
+
+    Ok(after)
+}
+
+/// Delete a connection and its stored passphrase.
+///
+/// Refused while any profile or jump host still points at it — the error names
+/// them, so the answer to "why not" does not need a second look.
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_ssh_connection(state: State<'_, AppState>, id: Uuid) -> CmdResult<bool> {
+    let name = state
+        .store
+        .get_ssh_connection(id)
+        .await?
+        .map(|c| c.name)
+        .unwrap_or_else(|| id.to_string());
+
+    let removed = ops::forget_ssh_connection(&state.store, id)
+        .await
+        .map_err(|e| CommandError::new("invalid", e.to_string()))?;
+
+    if removed {
+        state
+            .store
+            .audit(
+                AuditAction::SshConnectionDeleted,
+                name,
+                "nothing can tunnel through it any more",
+            )
+            .await;
+    }
+    Ok(removed)
+}
+
+/// Store or clear the passphrase protecting an SSH connection's key.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_ssh_connection_passphrase(
+    state: State<'_, AppState>,
+    id: Uuid,
+    value: String,
+) -> CmdResult<()> {
+    let connection = state.store.require_ssh_connection(id).await?;
+    secrets::set_secret(id, SecretKind::SshKeyPassphrase, &value)?;
+
+    state
+        .store
+        .audit(
+            AuditAction::SecretSet,
+            &connection.name,
+            if value.is_empty() {
+                "SSH key passphrase cleared"
+            } else {
+                "SSH key passphrase stored"
+            },
+        )
+        .await;
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn ssh_connection_status(
+    state: State<'_, AppState>,
+    id: Uuid,
+) -> CmdResult<SshConnectionStatus> {
+    state.store.require_ssh_connection(id).await?;
+    Ok(SshConnectionStatus {
+        has_passphrase: secrets::has_secret(id, SecretKind::SshKeyPassphrase)?,
+        used_by_profiles: state
+            .store
+            .profiles_using_ssh_connection(id)
+            .await?
+            .into_iter()
+            .map(|p| p.name)
+            .collect(),
+        used_by_jump: state
+            .store
+            .ssh_connections_jumping_through(id)
+            .await?
+            .into_iter()
+            .map(|c| c.name)
+            .collect(),
+    })
+}
+
+/// Connect and authenticate an SSH connection on its own, without a database.
+///
+/// Never returns `Err` for an unreachable server, for the same reason
+/// [`test_connection`] does not: a failed connection is a successful test.
+#[tauri::command]
+#[specta::specta]
+pub async fn test_ssh_connection(state: State<'_, AppState>, id: Uuid) -> CmdResult<SshReport> {
+    Ok(connect::test_ssh_connection(id, &state.store).await)
 }
 
 /// Test a profile, reporting each step separately.

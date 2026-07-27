@@ -44,6 +44,11 @@ pub enum AuditAction {
     ProfileCreated,
     ProfileUpdated,
     ProfileDeleted,
+    SshConnectionCreated,
+    /// One record, many databases: an edit here re-points every profile that
+    /// tunnels through it, which is exactly what makes it worth recording.
+    SshConnectionUpdated,
+    SshConnectionDeleted,
     /// A password or passphrase was stored. Never what it was.
     SecretSet,
     MaskingChanged,
@@ -69,6 +74,9 @@ impl AuditAction {
             AuditAction::ProfileCreated => "profile.created",
             AuditAction::ProfileUpdated => "profile.updated",
             AuditAction::ProfileDeleted => "profile.deleted",
+            AuditAction::SshConnectionCreated => "ssh_connection.created",
+            AuditAction::SshConnectionUpdated => "ssh_connection.updated",
+            AuditAction::SshConnectionDeleted => "ssh_connection.deleted",
             AuditAction::SecretSet => "secret.set",
             AuditAction::MaskingChanged => "masking.changed",
             AuditAction::DestinationCreated => "destination.created",
@@ -88,6 +96,10 @@ impl AuditAction {
         match self {
             AuditAction::ProfileUpdated => "a connection now points somewhere else than it did",
             AuditAction::ProfileDeleted => "backups for it stop happening",
+            AuditAction::SshConnectionUpdated => {
+                "every connection tunnelling through it now reaches somewhere else"
+            }
+            AuditAction::SshConnectionDeleted => "nothing can tunnel through it any more",
             AuditAction::MaskingChanged => "a column that was being masked may no longer be",
             AuditAction::BackupKeyExported => {
                 "the key now exists somewhere this application does not control"
@@ -152,6 +164,7 @@ mod tests {
             AuditAction::MaskingChanged,
             AuditAction::ConfigImported,
             AuditAction::ProfileDeleted,
+            AuditAction::SshConnectionUpdated,
         ] {
             assert!(
                 !action.why().is_empty(),

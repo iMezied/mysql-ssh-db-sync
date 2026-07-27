@@ -5,7 +5,7 @@
 //! only works inside the desktop app is a bug in the layering.
 //!
 //! Layering:
-//!   * [`types`], [`profile`] — shared vocabulary.
+//!   * [`types`], [`profile`], [`sshconn`] — shared vocabulary.
 //!   * [`store`] — SQLite persistence, shared by GUI and CLI.
 //!   * [`secrets`] — OS keychain. Never crosses into the webview.
 //!   * [`events`], [`job`] — progress reporting and cancellation.
@@ -41,6 +41,7 @@ pub mod secrets;
 pub mod settings;
 pub mod share;
 pub mod ssh;
+pub mod sshconn;
 pub mod store;
 pub mod tools;
 pub mod types;

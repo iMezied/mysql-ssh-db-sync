@@ -1462,6 +1462,21 @@ pub async fn forget_destination(store: &Store, id: uuid::Uuid) -> Result<bool, O
     Ok(store.delete_destination(id).await?)
 }
 
+/// Delete a saved SSH connection and the key passphrase belonging to it.
+///
+/// The order is the opposite of [`forget_destination`], and deliberately:
+/// [`Store::delete_ssh_connection`] *refuses* while a profile still tunnels
+/// through it, so purging the passphrase first would strip the credential from
+/// a connection that then survives — every database behind it failing to
+/// authenticate on the next run.
+pub async fn forget_ssh_connection(store: &Store, id: uuid::Uuid) -> Result<bool, OpError> {
+    let removed = store.delete_ssh_connection(id).await?;
+    if removed {
+        secrets::set_secret(id, SecretKind::SshKeyPassphrase, "").map_err(ConnectError::Secrets)?;
+    }
+    Ok(removed)
+}
+
 /// Check that a destination is usable, without sending anything.
 ///
 /// What "usable" means here is deliberately narrow and stated in full: the

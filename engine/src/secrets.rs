@@ -18,6 +18,12 @@ pub enum SecretKind {
     /// The database user's password.
     DbPassword,
     /// Passphrase protecting the SSH private key file.
+    ///
+    /// Keyed by the *SSH connection's* id rather than a profile's: the key
+    /// belongs to the server, and several profiles reach a database through
+    /// the same one. Keying it by profile would put a copy of the same
+    /// passphrase in the keychain for every database behind a bastion, and
+    /// changing the key would mean re-entering it once per database.
     SshKeyPassphrase,
     /// The installation's age identity for encrypting backup artifacts.
     ///
@@ -136,7 +142,13 @@ pub fn has_secret(profile_id: Uuid, kind: SecretKind) -> Result<bool, SecretErro
 /// decrypts every artifact ever taken. It also does not touch
 /// [`SecretKind::ObjectStoreSecret`], which belongs to a destination — several
 /// profiles ship to the same bucket, so deleting one must not lock the others
-/// out of it.
+/// out of it, nor [`SecretKind::SshKeyPassphrase`], which belongs to a saved
+/// SSH connection for the same reason: deleting one database must not strip
+/// the key from a bastion the others still reach.
+///
+/// [`SecretKind::SshKeyPassphrase`] is still cleared under the profile's own
+/// id, because versions before saved SSH connections filed it there and an
+/// upgrade that could not reach the keychain will have left it behind.
 pub fn delete_all_for_profile(profile_id: Uuid) -> Result<(), SecretError> {
     for kind in [SecretKind::DbPassword, SecretKind::SshKeyPassphrase] {
         let entry = keyring::Entry::new(KEYRING_SERVICE, &account(profile_id, kind))?;

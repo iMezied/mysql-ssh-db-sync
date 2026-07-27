@@ -17,11 +17,13 @@ use crate::destination::{Destination, DestinationCreate, DestinationUpdate};
 use crate::events::JobKind;
 use crate::job::{JobOutcome, JobRecord};
 use crate::plan::{SyncPlan, SyncPlanCreate};
-use crate::profile::{
-    ConnectionProfile, DbConfig, ProfileCreate, ProfileUpdate, SshConfig, ToolOverrides,
-};
+use crate::profile::{ConnectionProfile, DbConfig, ProfileCreate, ProfileUpdate, ToolOverrides};
 use crate::schedule::{NotifyPolicy, Schedule, ScheduleCreate, ScheduleKind, ScheduleUpdate};
 use crate::settings;
+use crate::sshconn::{
+    ResolvedSsh, SshConfig, SshConnection, SshConnectionCreate, SshConnectionError,
+    SshConnectionUpdate, SshEndpoint,
+};
 use crate::types::{Engine, EnvironmentTag};
 
 #[derive(Debug, thiserror::Error)]
@@ -50,6 +52,8 @@ pub enum StoreError {
     InvalidSchedule(crate::schedule::ScheduleError),
     #[error(transparent)]
     InvalidDestination(crate::destination::DestinationError),
+    #[error(transparent)]
+    InvalidSshConnection(#[from] SshConnectionError),
     #[error(transparent)]
     Secrets(crate::secrets::SecretError),
 }
@@ -109,26 +113,40 @@ impl Store {
     // ── Profiles ────────────────────────────────────────────────────────
 
     pub async fn list_profiles(&self) -> Result<Vec<ConnectionProfile>> {
-        let rows = sqlx::query(
-            "SELECT id, name, engine, environment, ssh_config, db_config, tool_overrides, \
-             created_at, updated_at FROM profiles ORDER BY name",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query(&format!("SELECT {PROFILE_COLUMNS} FROM profiles ORDER BY name"))
+            .fetch_all(&self.pool)
+            .await?;
 
         rows.into_iter().map(row_to_profile).collect()
     }
 
     pub async fn get_profile(&self, id: Uuid) -> Result<Option<ConnectionProfile>> {
-        let row = sqlx::query(
-            "SELECT id, name, engine, environment, ssh_config, db_config, tool_overrides, \
-             created_at, updated_at FROM profiles WHERE id = ?1",
-        )
+        let row = sqlx::query(&format!(
+            "SELECT {PROFILE_COLUMNS} FROM profiles WHERE id = ?1"
+        ))
         .bind(id.to_string())
         .fetch_optional(&self.pool)
         .await?;
 
         row.map(row_to_profile).transpose()
+    }
+
+    /// Every profile that tunnels through a given SSH connection.
+    ///
+    /// What makes "you cannot delete this, three databases go through it"
+    /// answerable by name rather than by count.
+    pub async fn profiles_using_ssh_connection(
+        &self,
+        ssh_connection_id: Uuid,
+    ) -> Result<Vec<ConnectionProfile>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {PROFILE_COLUMNS} FROM profiles WHERE ssh_connection_id = ?1 ORDER BY name"
+        ))
+        .bind(ssh_connection_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(row_to_profile).collect()
     }
 
     /// Like [`get_profile`] but errors when absent, for callers that require one.
@@ -139,13 +157,19 @@ impl Store {
     }
 
     pub async fn create_profile(&self, input: ProfileCreate) -> Result<ConnectionProfile> {
+        // Checked here rather than left to the foreign key, so a bad reference
+        // reads as "no SSH connection with id …" instead of a constraint error.
+        if let Some(id) = input.ssh_connection_id {
+            self.require_ssh_connection(id).await?;
+        }
+
         let now = Utc::now();
         let profile = ConnectionProfile {
             id: Uuid::new_v4(),
             name: input.name,
             engine: input.engine,
             environment: input.environment,
-            ssh: input.ssh,
+            ssh_connection_id: input.ssh_connection_id,
             db: input.db,
             tool_overrides: input.tool_overrides,
             created_at: now,
@@ -158,7 +182,7 @@ impl Store {
 
     async fn insert_profile(&self, p: &ConnectionProfile) -> Result<()> {
         let result = sqlx::query(
-            "INSERT INTO profiles (id, name, engine, environment, ssh_config, db_config, \
+            "INSERT INTO profiles (id, name, engine, environment, ssh_connection_id, db_config, \
              tool_overrides, created_at, updated_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )
@@ -166,13 +190,7 @@ impl Store {
         .bind(&p.name)
         .bind(p.engine.as_str())
         .bind(p.environment.as_str())
-        .bind(
-            p.ssh
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|e| corrupt("ssh_config", e))?,
-        )
+        .bind(p.ssh_connection_id.map(|u| u.to_string()))
         .bind(serde_json::to_string(&p.db).map_err(|e| corrupt("db_config", e))?)
         .bind(serde_json::to_string(&p.tool_overrides).map_err(|e| corrupt("tool_overrides", e))?)
         .bind(p.created_at.to_rfc3339())
@@ -203,9 +221,12 @@ impl Store {
         if let Some(v) = patch.environment {
             p.environment = v;
         }
-        // Doubly-optional: Some(None) clears, None leaves alone.
-        if let Some(v) = patch.ssh {
-            p.ssh = v;
+        // Doubly-optional: Some(None) detaches the tunnel, None leaves alone.
+        if let Some(v) = patch.ssh_connection_id {
+            if let Some(id) = v {
+                self.require_ssh_connection(id).await?;
+            }
+            p.ssh_connection_id = v;
         }
         if let Some(v) = patch.db {
             p.db = v;
@@ -216,20 +237,15 @@ impl Store {
         p.updated_at = Utc::now();
 
         let result = sqlx::query(
-            "UPDATE profiles SET name = ?2, engine = ?3, environment = ?4, ssh_config = ?5, \
-             db_config = ?6, tool_overrides = ?7, updated_at = ?8 WHERE id = ?1",
+            "UPDATE profiles SET name = ?2, engine = ?3, environment = ?4, \
+             ssh_connection_id = ?5, db_config = ?6, tool_overrides = ?7, updated_at = ?8 \
+             WHERE id = ?1",
         )
         .bind(p.id.to_string())
         .bind(&p.name)
         .bind(p.engine.as_str())
         .bind(p.environment.as_str())
-        .bind(
-            p.ssh
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|e| corrupt("ssh_config", e))?,
-        )
+        .bind(p.ssh_connection_id.map(|u| u.to_string()))
         .bind(serde_json::to_string(&p.db).map_err(|e| corrupt("db_config", e))?)
         .bind(serde_json::to_string(&p.tool_overrides).map_err(|e| corrupt("tool_overrides", e))?)
         .bind(p.updated_at.to_rfc3339())
@@ -424,8 +440,13 @@ fn parse_ts(s: &str, field: &'static str) -> Result<DateTime<Utc>> {
         .map_err(|e| corrupt(field, e))
 }
 
+/// Every column [`row_to_profile`] reads, in one place so the queries above
+/// cannot drift apart from it.
+const PROFILE_COLUMNS: &str = "id, name, engine, environment, ssh_connection_id, db_config, \
+     tool_overrides, created_at, updated_at";
+
 fn row_to_profile(row: sqlx::sqlite::SqliteRow) -> Result<ConnectionProfile> {
-    let ssh_raw: Option<String> = row.get("ssh_config");
+    let ssh_raw: Option<String> = row.get("ssh_connection_id");
     let tools_raw: String = row.get("tool_overrides");
     let db_raw: String = row.get("db_config");
 
@@ -436,12 +457,11 @@ fn row_to_profile(row: sqlx::sqlite::SqliteRow) -> Result<ConnectionProfile> {
             .map_err(|e| corrupt("engine", e))?,
         environment: EnvironmentTag::from_str(&row.get::<String, _>("environment"))
             .map_err(|e| corrupt("environment", e))?,
-        // A malformed ssh_config is corruption, not "no SSH" — surfacing it
+        // An unreadable reference is corruption, not "no SSH" — surfacing it
         // beats silently turning a tunnelled profile into a direct connection.
-        ssh: ssh_raw
-            .map(|s| serde_json::from_str::<SshConfig>(&s))
-            .transpose()
-            .map_err(|e| corrupt("ssh_config", e))?,
+        ssh_connection_id: ssh_raw
+            .map(|s| parse_uuid(&s, "ssh_connection_id"))
+            .transpose()?,
         db: serde_json::from_str::<DbConfig>(&db_raw).map_err(|e| corrupt("db_config", e))?,
         tool_overrides: serde_json::from_str::<ToolOverrides>(&tools_raw)
             .map_err(|e| corrupt("tool_overrides", e))?,
@@ -816,6 +836,305 @@ fn row_to_destination(row: sqlx::sqlite::SqliteRow) -> Result<Destination> {
         // is a different policy than the one the user set and would be silent.
         retention: serde_json::from_str(&row.get::<String, _>("retention"))
             .map_err(|e| corrupt("retention", e))?,
+        created_at: parse_ts(&row.get::<String, _>("created_at"), "created_at")?,
+        updated_at: parse_ts(&row.get::<String, _>("updated_at"), "updated_at")?,
+    })
+}
+
+// ── SSH connections ─────────────────────────────────────────────────────
+
+const SSH_COLUMNS: &str = "id, name, endpoint, jump_host_id, created_at, updated_at";
+
+impl Store {
+    pub async fn list_ssh_connections(&self) -> Result<Vec<SshConnection>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {SSH_COLUMNS} FROM ssh_connections ORDER BY name"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(row_to_ssh_connection).collect()
+    }
+
+    pub async fn get_ssh_connection(&self, id: Uuid) -> Result<Option<SshConnection>> {
+        let row = sqlx::query(&format!(
+            "SELECT {SSH_COLUMNS} FROM ssh_connections WHERE id = ?1"
+        ))
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(row_to_ssh_connection).transpose()
+    }
+
+    pub async fn require_ssh_connection(&self, id: Uuid) -> Result<SshConnection> {
+        self.get_ssh_connection(id)
+            .await?
+            .ok_or(StoreError::InvalidSshConnection(
+                SshConnectionError::NotFound(id),
+            ))
+    }
+
+    /// Other connections that route through this one.
+    pub async fn ssh_connections_jumping_through(&self, id: Uuid) -> Result<Vec<SshConnection>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {SSH_COLUMNS} FROM ssh_connections WHERE jump_host_id = ?1 ORDER BY name"
+        ))
+        .bind(id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(row_to_ssh_connection).collect()
+    }
+
+    pub async fn create_ssh_connection(
+        &self,
+        input: SshConnectionCreate,
+    ) -> Result<SshConnection> {
+        input.validate().map_err(StoreError::InvalidSshConnection)?;
+
+        let now = Utc::now();
+        let connection = SshConnection {
+            id: Uuid::new_v4(),
+            name: input.name.trim().to_string(),
+            endpoint: input.endpoint,
+            jump_host_id: input.jump_host_id,
+            created_at: now,
+            updated_at: now,
+        };
+        self.check_jump_host(&connection).await?;
+
+        let result = sqlx::query(
+            "INSERT INTO ssh_connections (id, name, endpoint, jump_host_id, created_at, \
+             updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(connection.id.to_string())
+        .bind(&connection.name)
+        .bind(serde_json::to_string(&connection.endpoint).map_err(|e| corrupt("endpoint", e))?)
+        .bind(connection.jump_host_id.map(|u| u.to_string()))
+        .bind(connection.created_at.to_rfc3339())
+        .bind(connection.updated_at.to_rfc3339())
+        .execute(&self.pool)
+        .await;
+
+        match result {
+            Ok(_) => Ok(connection),
+            Err(e) if is_unique_violation(&e) => Err(StoreError::DuplicateName(connection.name)),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Edit a connection in place.
+    ///
+    /// Every profile pointing at it follows immediately, which is the reason
+    /// this record exists — so the validation below runs on the *result* of the
+    /// patch, not on the patch itself.
+    pub async fn update_ssh_connection(
+        &self,
+        id: Uuid,
+        patch: SshConnectionUpdate,
+    ) -> Result<SshConnection> {
+        let mut c = self.require_ssh_connection(id).await?;
+
+        if let Some(v) = patch.name {
+            if v.trim().is_empty() {
+                return Err(StoreError::InvalidSshConnection(SshConnectionError::NoName));
+            }
+            c.name = v.trim().to_string();
+        }
+        if let Some(v) = patch.endpoint {
+            v.validate().map_err(StoreError::InvalidSshConnection)?;
+            c.endpoint = v;
+        }
+        // Doubly-optional: Some(None) detaches the bastion, None leaves alone.
+        if let Some(v) = patch.jump_host_id {
+            c.jump_host_id = v;
+        }
+        c.updated_at = Utc::now();
+        self.check_jump_host(&c).await?;
+
+        let result = sqlx::query(
+            "UPDATE ssh_connections SET name = ?2, endpoint = ?3, jump_host_id = ?4, \
+             updated_at = ?5 WHERE id = ?1",
+        )
+        .bind(c.id.to_string())
+        .bind(&c.name)
+        .bind(serde_json::to_string(&c.endpoint).map_err(|e| corrupt("endpoint", e))?)
+        .bind(c.jump_host_id.map(|u| u.to_string()))
+        .bind(c.updated_at.to_rfc3339())
+        .execute(&self.pool)
+        .await;
+
+        match result {
+            Ok(_) => Ok(c),
+            Err(e) if is_unique_violation(&e) => Err(StoreError::DuplicateName(c.name)),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Enforce the single-hop rule from both directions.
+    ///
+    /// The foreign key alone would allow a chain, and a chain would be accepted
+    /// at save time and fail at connect time — on a schedule, in the middle of
+    /// the night, with the user's last memory being that it saved fine.
+    async fn check_jump_host(&self, connection: &SshConnection) -> Result<()> {
+        let Some(jump_id) = connection.jump_host_id else {
+            return Ok(());
+        };
+
+        if jump_id == connection.id {
+            return Err(StoreError::InvalidSshConnection(
+                SshConnectionError::JumpsToItself,
+            ));
+        }
+
+        let jump = self.require_ssh_connection(jump_id).await?;
+        if jump.jump_host_id.is_some() {
+            return Err(StoreError::InvalidSshConnection(
+                SshConnectionError::ChainedJump { name: jump.name },
+            ));
+        }
+
+        // The other direction: this connection is somebody else's bastion, so
+        // giving it one of its own would make that route two hops.
+        let dependents = self.ssh_connections_jumping_through(connection.id).await?;
+        if !dependents.is_empty() {
+            return Err(StoreError::InvalidSshConnection(
+                SshConnectionError::WouldChainJump {
+                    name: connection.name.clone(),
+                    used_by: name_list(dependents.iter().map(|d| d.name.as_str())),
+                },
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Remove a connection, refusing while anything still routes through it.
+    ///
+    /// Deleting it out from under a profile would leave a tunnelled connection
+    /// silently connecting directly — to a host and port that were only ever
+    /// meaningful *from the SSH server*.
+    ///
+    /// The keychain entry is not touched here; [`crate::ops::forget_ssh_connection`]
+    /// does both in the right order, for the same reason destinations do.
+    pub async fn delete_ssh_connection(&self, id: Uuid) -> Result<bool> {
+        let Some(connection) = self.get_ssh_connection(id).await? else {
+            return Ok(false);
+        };
+
+        let profiles = self.profiles_using_ssh_connection(id).await?;
+        let dependents = self.ssh_connections_jumping_through(id).await?;
+        if !profiles.is_empty() || !dependents.is_empty() {
+            let used_by = name_list(
+                profiles
+                    .iter()
+                    .map(|p| p.name.as_str())
+                    .chain(dependents.iter().map(|d| d.name.as_str())),
+            );
+            return Err(StoreError::InvalidSshConnection(
+                SshConnectionError::InUse {
+                    name: connection.name,
+                    used_by,
+                },
+            ));
+        }
+
+        let res = sqlx::query("DELETE FROM ssh_connections WHERE id = ?1")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Look a connection up together with its bastion.
+    pub async fn resolve_ssh(&self, id: Uuid) -> Result<ResolvedSsh> {
+        let connection = self.require_ssh_connection(id).await?;
+
+        // One lookup deep, never a loop: the single-hop rule is enforced when
+        // the row is written, so this cannot recurse.
+        let jump_host = match connection.jump_host_id {
+            Some(jump_id) => Some(self.require_ssh_connection(jump_id).await?),
+            None => None,
+        };
+
+        Ok(ResolvedSsh {
+            config: SshConfig {
+                endpoint: connection.endpoint.clone(),
+                jump_host: jump_host.as_ref().map(|j| j.endpoint.clone()),
+            },
+            connection,
+            jump_host,
+        })
+    }
+
+    // ── Adopting pre-existing embedded configurations ───────────────────
+
+    /// Profiles still carrying an inline SSH config from before saved
+    /// connections existed. See [`crate::sshconn::adopt_legacy_configs`].
+    pub async fn legacy_ssh_configs(&self) -> Result<Vec<(Uuid, String, SshConfig)>> {
+        let rows = sqlx::query(
+            "SELECT id, name, ssh_config FROM profiles \
+             WHERE ssh_config IS NOT NULL AND ssh_connection_id IS NULL ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let raw: String = row.get("ssh_config");
+                Ok((
+                    parse_uuid(&row.get::<String, _>("id"), "id")?,
+                    row.get("name"),
+                    serde_json::from_str::<SshConfig>(&raw)
+                        .map_err(|e| corrupt("ssh_config", e))?,
+                ))
+            })
+            .collect()
+    }
+
+    /// Point a profile at a saved connection and retire its inline config.
+    ///
+    /// Both halves in one statement: a profile that ended up referencing a
+    /// connection *and* still holding the old blob would be adopted twice on
+    /// the next start.
+    pub async fn attach_ssh_connection(
+        &self,
+        profile_id: Uuid,
+        ssh_connection_id: Uuid,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE profiles SET ssh_connection_id = ?2, ssh_config = NULL, updated_at = ?3 \
+             WHERE id = ?1",
+        )
+        .bind(profile_id.to_string())
+        .bind(ssh_connection_id.to_string())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
+/// `"a", "b" and "c"` — a list a person can read in an error message.
+fn name_list<'a>(names: impl Iterator<Item = &'a str>) -> String {
+    let quoted: Vec<String> = names.map(|n| format!("{n:?}")).collect();
+    match quoted.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+fn row_to_ssh_connection(row: sqlx::sqlite::SqliteRow) -> Result<SshConnection> {
+    let endpoint_raw: String = row.get("endpoint");
+    let jump_raw: Option<String> = row.get("jump_host_id");
+
+    Ok(SshConnection {
+        id: parse_uuid(&row.get::<String, _>("id"), "id")?,
+        name: row.get("name"),
+        endpoint: serde_json::from_str::<SshEndpoint>(&endpoint_raw)
+            .map_err(|e| corrupt("endpoint", e))?,
+        jump_host_id: jump_raw
+            .map(|s| parse_uuid(&s, "jump_host_id"))
+            .transpose()?,
         created_at: parse_ts(&row.get::<String, _>("created_at"), "created_at")?,
         updated_at: parse_ts(&row.get::<String, _>("updated_at"), "updated_at")?,
     })

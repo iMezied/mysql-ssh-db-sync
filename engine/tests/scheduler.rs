@@ -103,7 +103,7 @@ async fn profile_at(store: &Store, name: &str, host: &str) -> Uuid {
             name: name.into(),
             engine: Engine::Mysql,
             environment: EnvironmentTag::Dev,
-            ssh: None,
+            ssh_connection_id: None,
             db: DbConfig {
                 host: host.into(),
                 port: 3306,

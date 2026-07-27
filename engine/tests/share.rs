@@ -29,7 +29,7 @@ async fn seed(store: &Store) {
             name: "prod-eu".into(),
             engine: Engine::Mysql,
             environment: EnvironmentTag::Prod,
-            ssh: None,
+            ssh_connection_id: None,
             db: DbConfig {
                 host: "db.internal".into(),
                 port: 3306,
@@ -196,7 +196,7 @@ async fn an_import_never_removes_what_the_bundle_omits() {
             name: "my-own-box".into(),
             engine: Engine::Postgres,
             environment: EnvironmentTag::Dev,
-            ssh: None,
+            ssh_connection_id: None,
             db: DbConfig {
                 host: "127.0.0.1".into(),
                 port: 5432,

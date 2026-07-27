@@ -7,9 +7,8 @@
 //!     docker compose -f docker-compose.test.yml up -d --wait
 
 use db_sync_engine::connect;
-use db_sync_engine::profile::{
-    DbConfig, ProfileCreate, SshAuth, SshConfig, SshEndpoint, ToolOverrides,
-};
+use db_sync_engine::profile::{DbConfig, ProfileCreate, ToolOverrides};
+use db_sync_engine::sshconn::{SshAuth, SshConfig, SshConnectionCreate, SshEndpoint};
 use db_sync_engine::secrets::{self, SecretKind};
 use db_sync_engine::ssh::{RusshTunnelProvider, SshCredentials, TunnelProvider};
 use db_sync_engine::store::Store;
@@ -82,31 +81,51 @@ async fn temp_store() -> (Store, tempfile::TempDir) {
     (store, dir)
 }
 
+fn ssh_endpoint() -> SshEndpoint {
+    SshEndpoint {
+        host: "127.0.0.1".into(),
+        port: SSH_PORT,
+        user: "tunnel".into(),
+        auth: SshAuth::KeyFile {
+            path: key_path(),
+            passphrase_in_keychain: false,
+        },
+    }
+}
+
+/// The same endpoint in the resolved shape, for driving the tunnel provider
+/// directly without going through a stored record.
 fn ssh_config() -> SshConfig {
     SshConfig {
-        endpoint: SshEndpoint {
-            host: "127.0.0.1".into(),
-            port: SSH_PORT,
-            user: "tunnel".into(),
-            auth: SshAuth::KeyFile {
-                path: key_path(),
-                passphrase_in_keychain: false,
-            },
-        },
+        endpoint: ssh_endpoint(),
         jump_host: None,
     }
+}
+
+/// Save the fixture SSH server as a connection, the way the UI does before a
+/// profile can reference it.
+async fn saved_ssh(store: &Store, name: &str) -> uuid::Uuid {
+    store
+        .create_ssh_connection(SshConnectionCreate {
+            name: name.into(),
+            endpoint: ssh_endpoint(),
+            jump_host_id: None,
+        })
+        .await
+        .expect("save the ssh connection")
+        .id
 }
 
 /// A profile pointing at the fixture MySQL, reached through the SSH container.
 ///
 /// `db.host` is `mysql` because it is resolved *from the SSH server*, via the
 /// compose network — which is exactly the semantic the UI has to explain.
-fn mysql_profile(name: &str) -> ProfileCreate {
+fn mysql_profile(name: &str, ssh_connection_id: uuid::Uuid) -> ProfileCreate {
     ProfileCreate {
         name: name.into(),
         engine: Engine::Mysql,
         environment: EnvironmentTag::Dev,
-        ssh: Some(ssh_config()),
+        ssh_connection_id: Some(ssh_connection_id),
         db: DbConfig {
             host: "mysql".into(),
             port: 3306,
@@ -139,7 +158,8 @@ db_test! {
     async fn test_connection_reports_an_unpinned_host_key() {
         require_containers!();
         let (store, _dir) = temp_store().await;
-        let profile = store.create_profile(mysql_profile("unpinned")).await.unwrap();
+        let profile = store
+            .create_profile(mysql_profile("unpinned", saved_ssh(&store, "fixture-ssh").await)).await.unwrap();
 
         let report = connect::test_connection(&profile, &store).await;
 
@@ -161,7 +181,8 @@ db_test! {
     async fn test_connection_reports_a_changed_host_key_distinctly() {
         require_containers!();
         let (store, _dir) = temp_store().await;
-        let profile = store.create_profile(mysql_profile("changed")).await.unwrap();
+        let profile = store
+            .create_profile(mysql_profile("changed", saved_ssh(&store, "fixture-ssh").await)).await.unwrap();
 
         // Pin a key that is not the server's.
         store
@@ -187,7 +208,8 @@ db_test! {
         require_containers!();
         let (store, _dir) = temp_store().await;
         pin_host_key(&store).await;
-        let profile = store.create_profile(mysql_profile("pinned")).await.unwrap();
+        let profile = store
+            .create_profile(mysql_profile("pinned", saved_ssh(&store, "fixture-ssh").await)).await.unwrap();
 
         let report = connect::test_connection(&profile, &store).await;
 
@@ -216,7 +238,7 @@ db_test! {
                 name: "direct".into(),
                 engine: Engine::Mysql,
                 environment: EnvironmentTag::Dev,
-                ssh: None,
+                ssh_connection_id: None,
                 db: DbConfig {
                     // Port 1 is reserved and will refuse instantly.
                     host: "127.0.0.1".into(),
@@ -255,7 +277,8 @@ db_test! {
         let (store, _dir) = temp_store().await;
         pin_host_key(&store).await;
 
-        let profile = store.create_profile(mysql_profile("full-path")).await.unwrap();
+        let profile = store
+            .create_profile(mysql_profile("full-path", saved_ssh(&store, "fixture-ssh").await)).await.unwrap();
         let _cleanup = Cleanup(profile.id);
         secrets::set_secret(profile.id, SecretKind::DbPassword, "testroot").unwrap();
 
@@ -301,7 +324,8 @@ db_test! {
     #[ignore = "requires an unlocked OS keychain"]
     async fn deleting_a_profile_purges_its_password() {
         let (store, _dir) = temp_store().await;
-        let profile = store.create_profile(mysql_profile("purge-me")).await.unwrap();
+        let profile = store
+            .create_profile(mysql_profile("purge-me", saved_ssh(&store, "fixture-ssh").await)).await.unwrap();
         let _cleanup = Cleanup(profile.id);
 
         secrets::set_secret(profile.id, SecretKind::DbPassword, "testroot").unwrap();

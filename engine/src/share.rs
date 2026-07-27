@@ -30,11 +30,16 @@ use specta::Type;
 use crate::backup::TableSelection;
 use crate::destination::DestinationKind;
 use crate::mask::MaskRule;
-use crate::profile::{DbConfig, SshConfig, ToolOverrides};
+use crate::profile::{DbConfig, ToolOverrides};
+use crate::sshconn::{SshConfig, SshEndpoint};
 use crate::types::{Engine, EnvironmentTag};
 
 /// Bumped when the bundle layout changes incompatibly.
-pub const BUNDLE_VERSION: u32 = 1;
+///
+/// 2 — SSH connections became shared records, so the tunnel moved out of each
+/// profile and into a list of its own. Version 1 bundles still import: their
+/// inline configs are adopted the same way an upgraded database's are.
+pub const BUNDLE_VERSION: u32 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ShareError {
@@ -60,10 +65,33 @@ pub struct SharedProfile {
     pub environment: EnvironmentTag,
     /// Host, port, user and database. No password — there is no field for one.
     pub db: DbConfig,
-    /// Endpoint and auth *method*. A key-file path is a path, not a key.
+    /// The SSH connection this tunnels through, named rather than copied — so
+    /// a bundle describing six databases behind one bastion says "bastion"
+    /// six times and describes it once.
+    #[serde(default)]
+    pub ssh_connection: Option<String>,
+    /// The inline tunnel a version 1 bundle carried.
+    ///
+    /// Read on import and never written: a bundle from an older DBSync must
+    /// not lose the tunnel it believed it was sharing. See [`import`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<SshConfig>,
     #[serde(default)]
     pub tool_overrides: ToolOverrides,
+}
+
+/// An SSH server, minus the ability to authenticate to it.
+///
+/// Endpoint and auth *method*. A key-file path is a path, not a key, and the
+/// passphrase protecting it is in the receiver's keychain or nowhere.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct SharedSshConnection {
+    pub name: String,
+    pub endpoint: SshEndpoint,
+    /// Another entry in the same list, by name — for the same reason profiles
+    /// are matched by name: ids differ between machines.
+    #[serde(default)]
+    pub jump_host: Option<String>,
 }
 
 /// A sync plan, keyed to its profile by name.
@@ -97,6 +125,9 @@ pub struct ConfigBundle {
     pub exported_at: DateTime<Utc>,
     /// The version of DBSync that wrote it, for a human reading a diff.
     pub engine_version: String,
+    /// Defaulted rather than required, so a version 1 bundle still parses.
+    #[serde(default)]
+    pub ssh_connections: Vec<SharedSshConnection>,
     pub profiles: Vec<SharedProfile>,
     pub plans: Vec<SharedPlan>,
     pub destinations: Vec<SharedDestination>,
@@ -122,25 +153,38 @@ impl ConfigBundle {
 /// What an import changed, and what it deliberately did not.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct ImportReport {
+    pub ssh_connections_created: Vec<String>,
+    pub ssh_connections_updated: Vec<String>,
     pub profiles_created: Vec<String>,
     pub profiles_updated: Vec<String>,
     pub plans_created: Vec<String>,
     pub plans_updated: Vec<String>,
     pub destinations_created: Vec<String>,
     pub destinations_updated: Vec<String>,
+    /// SSH connections whose key needs a passphrase that is not in this
+    /// machine's keychain. Named individually for the same reason connections
+    /// needing a password are: a count is not something anyone acts on.
+    pub ssh_needing_passphrase: Vec<String>,
     /// Connections that now exist but cannot connect until someone supplies a
     /// password. Named individually, because "some of these need credentials"
     /// is not something anyone acts on.
     pub needs_credentials: Vec<String>,
     /// Plans whose profile was not in the bundle and is not on this machine.
     pub orphaned_plans: Vec<String>,
+    /// Connections that named an SSH connection the bundle did not carry.
+    /// They are imported as direct connections and listed here, because a
+    /// tunnelled profile silently becoming a direct one is exactly the kind
+    /// of change that is only noticed when it fails.
+    pub orphaned_ssh_references: Vec<String>,
     /// Destinations that exist but have no stored access key.
     pub destinations_needing_keys: Vec<String>,
 }
 
 impl ImportReport {
     pub fn is_empty(&self) -> bool {
-        self.profiles_created.is_empty()
+        self.ssh_connections_created.is_empty()
+            && self.ssh_connections_updated.is_empty()
+            && self.profiles_created.is_empty()
             && self.profiles_updated.is_empty()
             && self.plans_created.is_empty()
             && self.plans_updated.is_empty()
@@ -157,6 +201,11 @@ impl ImportReport {
 /// the types above has a field for a secret.
 pub async fn export(store: &crate::Store) -> Result<ConfigBundle, ShareError> {
     let profiles = store.list_profiles().await?;
+    let ssh = store.list_ssh_connections().await?;
+
+    // Ids are meaningless on the receiving machine, so every reference in a
+    // bundle is by name. Resolved once here rather than at each use.
+    let ssh_name = |id: uuid::Uuid| ssh.iter().find(|c| c.id == id).map(|c| c.name.clone());
 
     let mut plans = Vec::new();
     for profile in &profiles {
@@ -175,6 +224,14 @@ pub async fn export(store: &crate::Store) -> Result<ConfigBundle, ShareError> {
         bundle_version: BUNDLE_VERSION,
         exported_at: Utc::now(),
         engine_version: crate::ENGINE_VERSION.to_string(),
+        ssh_connections: ssh
+            .iter()
+            .map(|c| SharedSshConnection {
+                name: c.name.clone(),
+                endpoint: c.endpoint.clone(),
+                jump_host: c.jump_host_id.and_then(ssh_name),
+            })
+            .collect(),
         profiles: profiles
             .into_iter()
             .map(|p| SharedProfile {
@@ -182,7 +239,10 @@ pub async fn export(store: &crate::Store) -> Result<ConfigBundle, ShareError> {
                 engine: p.engine,
                 environment: p.environment,
                 db: p.db,
-                ssh: p.ssh,
+                ssh_connection: p.ssh_connection_id.and_then(ssh_name),
+                // Never written: the shape exists only so older bundles can
+                // still be read.
+                ssh: None,
                 tool_overrides: p.tool_overrides,
             })
             .collect(),
@@ -200,6 +260,129 @@ pub async fn export(store: &crate::Store) -> Result<ConfigBundle, ShareError> {
     })
 }
 
+/// Create or update every SSH connection in a bundle, and return their ids by
+/// name so the profiles that follow can reference them.
+///
+/// Two passes, because a bundle's connections may reference each other: the
+/// first writes every record without its bastion, the second attaches them.
+/// One pass would depend on the order the exporter happened to list them in.
+async fn import_ssh_connections(
+    store: &crate::Store,
+    bundle: &ConfigBundle,
+    report: &mut ImportReport,
+) -> Result<std::collections::HashMap<String, uuid::Uuid>, ShareError> {
+    use crate::sshconn::{SshConnectionCreate, SshConnectionUpdate};
+
+    let mut ids = std::collections::HashMap::new();
+
+    for incoming in &bundle.ssh_connections {
+        let existing = store
+            .list_ssh_connections()
+            .await?
+            .into_iter()
+            .find(|c| c.name == incoming.name);
+
+        let id = match existing {
+            Some(current) => {
+                store
+                    .update_ssh_connection(
+                        current.id,
+                        SshConnectionUpdate {
+                            endpoint: Some(incoming.endpoint.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                report.ssh_connections_updated.push(incoming.name.clone());
+                current.id
+            }
+            None => {
+                let created = store
+                    .create_ssh_connection(SshConnectionCreate {
+                        name: incoming.name.clone(),
+                        endpoint: incoming.endpoint.clone(),
+                        jump_host_id: None,
+                    })
+                    .await?;
+                report.ssh_connections_created.push(incoming.name.clone());
+                created.id
+            }
+        };
+
+        ids.insert(incoming.name.clone(), id);
+
+        // Checked, never supplied — the same rule as a database password. A
+        // key that needs a passphrase is unusable until the receiver enters
+        // theirs, and saying so by name is the difference between a bundle
+        // that works and one that fails on its first scheduled run.
+        if incoming.endpoint.needs_passphrase()
+            && !crate::secrets::has_secret(id, crate::secrets::SecretKind::SshKeyPassphrase)
+                .unwrap_or(false)
+        {
+            report.ssh_needing_passphrase.push(incoming.name.clone());
+        }
+    }
+
+    for incoming in &bundle.ssh_connections {
+        let Some(jump_name) = &incoming.jump_host else {
+            continue;
+        };
+        let (Some(id), Some(jump_id)) = (ids.get(&incoming.name), ids.get(jump_name)) else {
+            report.orphaned_ssh_references.push(format!(
+                "{} (needs jump host {jump_name:?})",
+                incoming.name
+            ));
+            continue;
+        };
+
+        store
+            .update_ssh_connection(
+                *id,
+                SshConnectionUpdate {
+                    jump_host_id: Some(Some(*jump_id)),
+                    ..Default::default()
+                },
+            )
+            .await?;
+    }
+
+    Ok(ids)
+}
+
+/// Adopt the inline tunnel a version 1 bundle carried into a saved connection.
+async fn adopt_inline_ssh(
+    store: &crate::Store,
+    legacy: &SshConfig,
+    report: &mut ImportReport,
+) -> Result<uuid::Uuid, ShareError> {
+    let mut existing = store.list_ssh_connections().await?;
+
+    let jump_host_id = match &legacy.jump_host {
+        Some(endpoint) => Some(
+            crate::sshconn::adopt_endpoint(store, &mut existing, endpoint, None)
+                .await?
+                .0,
+        ),
+        None => None,
+    };
+
+    let (id, created) =
+        crate::sshconn::adopt_endpoint(store, &mut existing, &legacy.endpoint, jump_host_id).await?;
+
+    if created && let Some(adopted) = existing.iter().find(|c| c.id == id) {
+        report.ssh_connections_created.push(adopted.name.clone());
+    }
+    if legacy.endpoint.needs_passphrase()
+        && !crate::secrets::has_secret(id, crate::secrets::SecretKind::SshKeyPassphrase)
+            .unwrap_or(false)
+        && let Some(adopted) = existing.iter().find(|c| c.id == id)
+    {
+        report.ssh_needing_passphrase.push(adopted.name.clone());
+    }
+
+    Ok(id)
+}
+
 /// Apply a bundle to this machine, matching existing records by name.
 ///
 /// Creates what is missing and updates what is there. It never writes a
@@ -214,8 +397,33 @@ pub async fn import(
 
     let mut report = ImportReport::default();
 
+    // ── SSH connections ─────────────────────────────────────────────────
+    //
+    // First, because a profile cannot reference one that does not exist yet.
+    let ssh_ids = import_ssh_connections(store, bundle, &mut report).await?;
+
     // ── Connections ─────────────────────────────────────────────────────
     for incoming in &bundle.profiles {
+        // A version 1 bundle carried the tunnel inside the profile. Adopting
+        // it here rather than refusing the bundle keeps the promise that an
+        // older export still means what its author intended — and it goes
+        // through the same deduplication as an upgraded database, so two
+        // profiles sharing a bastion still end up sharing one record.
+        let ssh_connection_id = match (&incoming.ssh_connection, &incoming.ssh) {
+            (Some(name), _) => match ssh_ids.get(name.as_str()) {
+                Some(id) => Some(*id),
+                None => {
+                    report.orphaned_ssh_references.push(format!(
+                        "{} (needs SSH connection {name:?})",
+                        incoming.name
+                    ));
+                    None
+                }
+            },
+            (None, Some(legacy)) => Some(adopt_inline_ssh(store, legacy, &mut report).await?),
+            (None, None) => None,
+        };
+
         let existing = store
             .list_profiles()
             .await?
@@ -231,7 +439,7 @@ pub async fn import(
                             engine: Some(incoming.engine),
                             environment: Some(incoming.environment),
                             db: Some(incoming.db.clone()),
-                            ssh: Some(incoming.ssh.clone()),
+                            ssh_connection_id: Some(ssh_connection_id),
                             tool_overrides: Some(incoming.tool_overrides.clone()),
                             ..Default::default()
                         },
@@ -246,7 +454,7 @@ pub async fn import(
                         name: incoming.name.clone(),
                         engine: incoming.engine,
                         environment: incoming.environment,
-                        ssh: incoming.ssh.clone(),
+                        ssh_connection_id,
                         db: incoming.db.clone(),
                         tool_overrides: incoming.tool_overrides.clone(),
                     })
@@ -380,7 +588,19 @@ pub async fn import(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::{SshAuth, SshEndpoint};
+    use crate::sshconn::SshAuth;
+
+    fn endpoint() -> SshEndpoint {
+        SshEndpoint {
+            host: "bastion.example.com".into(),
+            port: 22,
+            user: "ops".into(),
+            auth: SshAuth::KeyFile {
+                path: "~/.ssh/id_ed25519".into(),
+                passphrase_in_keychain: true,
+            },
+        }
+    }
 
     fn profile() -> SharedProfile {
         SharedProfile {
@@ -393,18 +613,8 @@ mod tests {
                 user: "backup".into(),
                 database: Some("app".into()),
             },
-            ssh: Some(SshConfig {
-                endpoint: SshEndpoint {
-                    host: "bastion.example.com".into(),
-                    port: 22,
-                    user: "ops".into(),
-                    auth: SshAuth::KeyFile {
-                        path: "~/.ssh/id_ed25519".into(),
-                        passphrase_in_keychain: true,
-                    },
-                },
-                jump_host: None,
-            }),
+            ssh_connection: Some("eu-bastion".into()),
+            ssh: None,
             tool_overrides: ToolOverrides::default(),
         }
     }
@@ -414,6 +624,11 @@ mod tests {
             bundle_version: BUNDLE_VERSION,
             exported_at: Utc::now(),
             engine_version: "0.1.0".into(),
+            ssh_connections: vec![SharedSshConnection {
+                name: "eu-bastion".into(),
+                endpoint: endpoint(),
+                jump_host: None,
+            }],
             profiles: vec![profile()],
             plans: vec![SharedPlan {
                 profile_name: "prod-eu".into(),
@@ -499,10 +714,106 @@ mod tests {
     }
 
     #[test]
+    fn a_version_1_bundle_keeps_its_inline_tunnel() {
+        // The shape a previous DBSync wrote: no `ssh_connections` list, and the
+        // tunnel inside the profile. Dropping it on the floor would silently
+        // turn a tunnelled connection into a direct one on the receiver's
+        // machine — pointing at a host that only resolves from the bastion.
+        let raw = serde_json::json!({
+            "bundle_version": 1,
+            "exported_at": Utc::now(),
+            "engine_version": "0.1.0",
+            "profiles": [{
+                "name": "prod-eu",
+                "engine": "mysql",
+                "environment": "prod",
+                "db": { "host": "db.internal", "port": 3306, "user": "backup",
+                        "database": "app" },
+                "ssh": {
+                    "host": "bastion.example.com", "port": 22, "user": "ops",
+                    "auth": { "kind": "agent" },
+                    "jump_host": null
+                }
+            }],
+            "plans": [],
+            "destinations": []
+        });
+
+        let parsed = ConfigBundle::from_json(&raw.to_string()).expect("must load");
+        assert!(parsed.ssh_connections.is_empty());
+
+        let profile = &parsed.profiles[0];
+        assert!(profile.ssh_connection.is_none());
+        assert_eq!(
+            profile.ssh.as_ref().expect("inline tunnel").endpoint.host,
+            "bastion.example.com",
+            "an older bundle's tunnel must survive parsing so import can adopt it"
+        );
+    }
+
+    #[test]
+    fn an_export_never_writes_the_legacy_inline_field() {
+        // Reading it is compatibility; writing it would mean two places a
+        // tunnel could live, and eventually two that disagree.
+        let json = bundle().to_json().unwrap();
+        assert!(
+            !json.contains("\"ssh\":"),
+            "the legacy inline field must not be exported: {json}"
+        );
+        assert!(json.contains("\"ssh_connection\": \"eu-bastion\""));
+    }
+
+    #[test]
+    fn a_shared_connection_is_described_once_however_many_use_it() {
+        // The reason the list exists. Six databases behind one bastion should
+        // produce one description of it, so changing it is one edit.
+        let mut b = bundle();
+        for name in ["prod-eu-2", "prod-eu-3"] {
+            let mut extra = profile();
+            extra.name = name.into();
+            b.profiles.push(extra);
+        }
+
+        let json = b.to_json().unwrap();
+        assert_eq!(
+            json.matches("bastion.example.com").count(),
+            1,
+            "the endpoint must appear once, not once per profile: {json}"
+        );
+        assert_eq!(json.matches("\"eu-bastion\"").count(), 4, "one definition, three references");
+    }
+
+    #[test]
+    fn a_jump_host_travels_as_a_name() {
+        let mut b = bundle();
+        b.ssh_connections.push(SharedSshConnection {
+            name: "edge".into(),
+            endpoint: SshEndpoint {
+                host: "edge.example.com".into(),
+                port: 22,
+                user: "jump".into(),
+                auth: SshAuth::Agent,
+            },
+            jump_host: None,
+        });
+        b.ssh_connections[0].jump_host = Some("edge".into());
+
+        let parsed = ConfigBundle::from_json(&b.to_json().unwrap()).unwrap();
+        assert_eq!(parsed.ssh_connections[0].jump_host.as_deref(), Some("edge"));
+    }
+
+    #[test]
     fn an_empty_report_is_recognisable() {
         assert!(ImportReport::default().is_empty());
         let mut report = ImportReport::default();
         report.profiles_created.push("a".into());
         assert!(!report.is_empty());
+
+        let mut ssh_only = ImportReport::default();
+        ssh_only.ssh_connections_created.push("bastion".into());
+        assert!(
+            !ssh_only.is_empty(),
+            "importing only SSH connections is still a change"
+        );
     }
 }

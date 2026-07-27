@@ -10,14 +10,16 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
+use uuid::Uuid;
 
 use crate::db::{ConnectParams, Introspector, connect as db_connect};
-use crate::profile::{ConnectionProfile, SshAuth};
+use crate::profile::ConnectionProfile;
 use crate::secrets::{self, SecretKind};
 use crate::ssh::{
     HopCredentials, RusshTunnelProvider, SshCredentials, StoreHostKeyVerifier, TunnelError,
     TunnelHandle, TunnelProvider,
 };
+use crate::sshconn::ResolvedSsh;
 use crate::store::Store;
 
 #[derive(Debug, thiserror::Error)]
@@ -51,47 +53,31 @@ impl ProfileConnection {
     }
 }
 
-/// Read a profile's secrets out of the keychain.
-fn resolve_credentials(profile: &ConnectionProfile) -> Result<SshCredentials, ConnectError> {
+/// Read an SSH connection's secrets out of the keychain.
+///
+/// Each hop is looked up under its *own* connection id. Before saved
+/// connections existed both hops shared the profile's single entry, so a
+/// bastion and the server behind it could not have different passphrases; now
+/// they are different records and each carries its own.
+pub fn resolve_credentials(resolved: &ResolvedSsh) -> Result<SshCredentials, ConnectError> {
     let mut creds = SshCredentials::default();
 
-    // Only fetch the passphrase when the profile says a key file needs one;
+    // Only fetch a passphrase when the connection says a key file needs one;
     // asking otherwise can trigger a pointless keychain prompt.
-    let endpoint_needs_passphrase = profile.ssh.as_ref().is_some_and(|s| {
-        matches!(
-            &s.endpoint.auth,
-            SshAuth::KeyFile {
-                passphrase_in_keychain: true,
-                ..
-            }
-        )
-    });
-
-    if endpoint_needs_passphrase {
+    if resolved.connection.endpoint.needs_passphrase() {
         creds.endpoint = HopCredentials {
-            key_passphrase: secrets::get_secret(profile.id, SecretKind::SshKeyPassphrase)?,
+            key_passphrase: secrets::get_secret(
+                resolved.connection.id,
+                SecretKind::SshKeyPassphrase,
+            )?,
         };
     }
 
-    // A jump host reuses the same stored passphrase; per-hop passphrases would
-    // need their own keychain entries and are not exposed yet.
-    let jump_needs_passphrase = profile
-        .ssh
-        .as_ref()
-        .and_then(|s| s.jump_host.as_ref())
-        .is_some_and(|j| {
-            matches!(
-                &j.auth,
-                SshAuth::KeyFile {
-                    passphrase_in_keychain: true,
-                    ..
-                }
-            )
-        });
-
-    if jump_needs_passphrase {
+    if let Some(jump) = &resolved.jump_host
+        && jump.endpoint.needs_passphrase()
+    {
         creds.jump_host = HopCredentials {
-            key_passphrase: secrets::get_secret(profile.id, SecretKind::SshKeyPassphrase)?,
+            key_passphrase: secrets::get_secret(jump.id, SecretKind::SshKeyPassphrase)?,
         };
     }
 
@@ -103,19 +89,80 @@ pub async fn open_tunnel(
     profile: &ConnectionProfile,
     store: &Store,
 ) -> Result<Option<TunnelHandle>, ConnectError> {
-    let Some(ssh) = &profile.ssh else {
+    let Some(ssh_id) = profile.ssh_connection_id else {
         return Ok(None);
     };
 
-    let credentials = resolve_credentials(profile)?;
+    let resolved = store.resolve_ssh(ssh_id).await?;
+    let credentials = resolve_credentials(&resolved)?;
     let verifier = Arc::new(StoreHostKeyVerifier::new(store.clone()));
     let provider = RusshTunnelProvider::new(verifier);
 
     let handle = provider
-        .open(ssh, &credentials, &profile.db.host, profile.db.port)
+        .open(
+            &resolved.config,
+            &credentials,
+            &profile.db.host,
+            profile.db.port,
+        )
         .await?;
 
     Ok(Some(handle))
+}
+
+/// Connect and authenticate a saved SSH connection, without a database.
+///
+/// This is what makes an SSH connection testable on its own terms. Reaching a
+/// bastion is a different question from reaching a database through it, and
+/// answering them separately is the point of the record existing.
+pub async fn test_ssh_connection(id: Uuid, store: &Store) -> SshReport {
+    let resolved = match store.resolve_ssh(id).await {
+        Ok(r) => r,
+        Err(e) => {
+            return SshReport {
+                ssh: StepOutcome::failed(e.to_string()),
+                host_key: None,
+                authenticated_as: None,
+                host_key_prompt: None,
+            };
+        }
+    };
+
+    let credentials = match resolve_credentials(&resolved) {
+        Ok(c) => c,
+        Err(e) => {
+            return SshReport {
+                ssh: StepOutcome::failed(format!("could not read the keychain: {e}")),
+                host_key: None,
+                authenticated_as: None,
+                host_key_prompt: None,
+            };
+        }
+    };
+
+    let provider = RusshTunnelProvider::new(Arc::new(StoreHostKeyVerifier::new(store.clone())));
+    match provider.probe(&resolved.config, &credentials).await {
+        Ok(probe) => SshReport {
+            ssh: StepOutcome::ok(match &resolved.jump_host {
+                Some(jump) => format!("authenticated, through {}", jump.name),
+                None => "authenticated".to_string(),
+            }),
+            host_key: Some(probe.host_key.fingerprint),
+            authenticated_as: Some(probe.authenticated_as),
+            host_key_prompt: None,
+        },
+        Err(e) => {
+            let error = ConnectError::Tunnel(e);
+            SshReport {
+                ssh: StepOutcome::failed(error.to_string()),
+                host_key: None,
+                authenticated_as: None,
+                // The fingerprint is the whole content of a first-contact
+                // failure; dropping it here would leave no way to accept it.
+                host_key_prompt: host_key_prompt_from(&error, store).await,
+            }
+        }
+    }
 }
 
 /// Open a full connection: tunnel (if configured) plus a database client.
@@ -199,6 +246,22 @@ pub struct HostKeyPrompt {
     pub previous_fingerprint: Option<String>,
 }
 
+/// Result of testing a saved SSH connection on its own.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SshReport {
+    pub ssh: StepOutcome,
+    /// Fingerprint of the key the server presented, once it is trusted.
+    pub host_key: Option<String>,
+    pub authenticated_as: Option<String>,
+    pub host_key_prompt: Option<HostKeyPrompt>,
+}
+
+impl SshReport {
+    pub fn succeeded(&self) -> bool {
+        self.ssh.is_ok()
+    }
+}
+
 /// Step-by-step result of testing a profile.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct ConnectionReport {
@@ -235,10 +298,16 @@ pub async fn test_connection(profile: &ConnectionProfile, store: &Store) -> Conn
         host_key_prompt: None,
     };
 
-    let tunnel = if profile.ssh.is_some() {
+    let tunnel = if profile.ssh_connection_id.is_some() {
         match open_tunnel(profile, store).await {
             Ok(handle) => {
-                report.ssh = StepOutcome::ok("authenticated");
+                // Named, not just "authenticated": with connections shared
+                // between profiles, *which* one was used is the thing a reader
+                // cannot infer from the profile in front of them.
+                report.ssh = StepOutcome::ok(match ssh_connection_name(profile, store).await {
+                    Some(name) => format!("authenticated to {name}"),
+                    None => "authenticated".to_string(),
+                });
                 match &handle {
                     Some(t) => {
                         report.tunnel = StepOutcome::ok(format!(
@@ -318,6 +387,17 @@ pub async fn test_connection(profile: &ConnectionProfile, store: &Store) -> Conn
     }
 
     report
+}
+
+/// The name of the SSH connection a profile tunnels through, if it has one.
+async fn ssh_connection_name(profile: &ConnectionProfile, store: &Store) -> Option<String> {
+    let id = profile.ssh_connection_id?;
+    store
+        .get_ssh_connection(id)
+        .await
+        .ok()
+        .flatten()
+        .map(|c| c.name)
 }
 
 /// Turn a host-key failure into something the UI can prompt about.

@@ -10,12 +10,13 @@ use std::time::Duration;
 use db_sync_engine::backup::{
     BackupRequest, CommonBackupOptions, EngineBackupOptions, MysqlBackupOptions, TableSelection,
 };
+use db_sync_engine::sshconn::{SshAuth, SshConfig, SshConnectionCreate, SshEndpoint};
 use db_sync_engine::job::JobContext;
 use db_sync_engine::mask::{MaskRule, MaskTransform};
 use db_sync_engine::ops::{self, SyncRequest};
 use db_sync_engine::plan::{SyncPlanCreate, parse_tables_conf};
 use db_sync_engine::profile::{
-    ConnectionProfile, DbConfig, ProfileCreate, SshAuth, SshConfig, SshEndpoint, ToolOverrides,
+    ConnectionProfile, DbConfig, ProfileCreate, ToolOverrides,
 };
 use db_sync_engine::restore::{EngineRestoreOptions, MysqlRestoreOptions, TargetNaming};
 use db_sync_engine::retention::RetentionPolicy;
@@ -84,19 +85,37 @@ macro_rules! require_containers {
     };
 }
 
+fn ssh_endpoint() -> SshEndpoint {
+    SshEndpoint {
+        host: "127.0.0.1".into(),
+        port: SSH_PORT,
+        user: "tunnel".into(),
+        auth: SshAuth::KeyFile {
+            path: key_path(),
+            passphrase_in_keychain: false,
+        },
+    }
+}
+
+/// The same endpoint resolved, for driving the tunnel provider directly.
 fn ssh_config() -> SshConfig {
     SshConfig {
-        endpoint: SshEndpoint {
-            host: "127.0.0.1".into(),
-            port: SSH_PORT,
-            user: "tunnel".into(),
-            auth: SshAuth::KeyFile {
-                path: key_path(),
-                passphrase_in_keychain: false,
-            },
-        },
+        endpoint: ssh_endpoint(),
         jump_host: None,
     }
+}
+
+/// Save the fixture SSH server as a reusable connection.
+async fn saved_ssh(store: &Store, name: &str) -> uuid::Uuid {
+    store
+        .create_ssh_connection(SshConnectionCreate {
+            name: name.into(),
+            endpoint: ssh_endpoint(),
+            jump_host_id: None,
+        })
+        .await
+        .expect("save the ssh connection")
+        .id
 }
 
 struct Cleanup(Vec<Uuid>);
@@ -146,7 +165,7 @@ async fn profile(
             name: name.into(),
             engine,
             environment: EnvironmentTag::Dev,
-            ssh: Some(ssh_config()),
+            ssh_connection_id: Some(saved_ssh(store, "fixture-ssh").await),
             db: DbConfig {
                 host: host.into(),
                 port,
@@ -215,7 +234,7 @@ db_test! {
                 name: "src".into(),
                 engine: Engine::Mysql,
                 environment: EnvironmentTag::Dev,
-                ssh: None,
+                ssh_connection_id: None,
                 db: DbConfig {
                     host: "127.0.0.1".into(),
                     port: 3306,
@@ -273,7 +292,7 @@ db_test! {
                 name: "src".into(),
                 engine: Engine::Mysql,
                 environment: EnvironmentTag::Dev,
-                ssh: None,
+                ssh_connection_id: None,
                 db: DbConfig {
                     host: "127.0.0.1".into(),
                     port: 3306,
@@ -316,7 +335,7 @@ db_test! {
                 name: "src".into(),
                 engine: Engine::Mysql,
                 environment: EnvironmentTag::Dev,
-                ssh: None,
+                ssh_connection_id: None,
                 db: DbConfig {
                     host: "127.0.0.1".into(),
                     port: 3306,

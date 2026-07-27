@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use db_sync_engine::db::{ConnectParams, Introspector, connect};
-use db_sync_engine::profile::{SshAuth, SshConfig, SshEndpoint};
+use db_sync_engine::sshconn::{SshAuth, SshConfig, SshEndpoint};
 use db_sync_engine::ssh::{
     AcceptAllHostKeys, RusshTunnelProvider, SshCredentials, TunnelHandle, TunnelProvider,
 };

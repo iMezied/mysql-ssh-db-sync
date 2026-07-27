@@ -1544,6 +1544,59 @@ call site, so the CLI and the app produce the same record. An entry that only
 appeared when the import happened to go through the GUI would be worse than
 none: its absence would mean nothing.
 
+## M15 — An SSH server is a record, not a field on six profiles
+
+A tunnel used to be a JSON blob on the profile that used it. That representation
+said something untrue: it said each database has its own SSH server. In practice
+one bastion fronts a dozen databases, and when its address, user or key rotates
+it rotates for all of them at once. Six copies of the same address is six
+chances to update five of them.
+
+So an SSH connection is its own named record and a profile holds a reference.
+Editing it in one place changes every database reached through it.
+
+- **Jump hosts are references too.** Embedding the bastion's fields would push
+  the same duplication one level down. Chained jumps stay out of scope, and the
+  rule is enforced at *write* time: an impossible route cannot be stored and
+  then discovered at 3am.
+- **The passphrase is keyed by the connection, not the profile.** That keying is
+  what makes the sharing real — a bastion used by six profiles has one keychain
+  entry rather than six.
+- **Deleting one that is still referenced is refused, and the error names the
+  holders.** SQLite enforces it with `ON DELETE RESTRICT`; the message lists
+  every profile and jump host still pointing at it. The alternative — cascading
+  — would silently turn a tunnelled profile into a direct one, which either
+  fails or, worse, succeeds against something else.
+
+### Existing configurations are adopted, not abandoned
+
+Anyone upgrading already has tunnels configured, and a migration that left them
+to re-enter by hand would be a data loss with extra steps. `adopt_legacy_configs`
+runs at startup in **both** the app and the CLI — whichever is opened first does
+the work and the other finds nothing to do, because a CLI reading a
+half-migrated store is worse than either doing it or not.
+
+Adoption matches on the *endpoint*, not the name: the same server typed into
+three profiles is one server, and handing back three identical records would
+defeat the point. The passphrase is copied to the new key before the old one is
+deleted, so an interrupted move loses nothing.
+
+`profiles.ssh_config` is deliberately left in place and simply stops being read.
+Dropping it in the same migration would mean an upgrade interrupted halfway had
+thrown away the only copy of the configuration.
+
+### Sharing refers to a tunnel by name
+
+`SharedSshConnection` names its jump host rather than carrying its id, for the
+same reason profiles match by name: ids differ between machines. A bundle
+written before this existed still parses — `ssh_connections` is defaulted, not
+required.
+
+A profile whose bundle did not carry its SSH server is imported as a **direct**
+connection and reported in red, individually. This is the one import outcome
+where nothing failed, which is precisely the problem: a tunnelled connection
+quietly becoming a direct one is noticed when it fails, or not at all.
+
 ## M14 — Not attempted, and why that is the right call
 
 MongoDB and SQL Server are on the roadmap. They are not in this codebase, and

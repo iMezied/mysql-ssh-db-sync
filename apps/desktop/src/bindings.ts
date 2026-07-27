@@ -11,8 +11,11 @@ export const commands = {
 	name: string,
 	engine: Engine,
 	environment: EnvironmentTag,
-	/**  `None` means connect directly, without a tunnel. */
-	ssh: SshConfig | null,
+	/**
+	 *  The saved SSH connection this profile tunnels through. `None` means
+	 *  connect directly, without a tunnel.
+	 */
+	ssh_connection_id: string | null,
 	db: DbConfig,
 	tool_overrides: ToolOverrides,
 	created_at: string,
@@ -31,6 +34,27 @@ export const commands = {
 	setProfileSecret: (id: string, kind: string, value: string) => typedError<null, CommandError>(__TAURI_INVOKE("set_profile_secret", { id, kind, value })),
 	/**  Report whether secrets exist — never their values. */
 	profileSecretStatus: (id: string) => typedError<SecretStatus, CommandError>(__TAURI_INVOKE("profile_secret_status", { id })),
+	listSshConnections: () => typedError<SshConnection[], CommandError>(__TAURI_INVOKE("list_ssh_connections")),
+	createSshConnection: (input: SshConnectionCreate, passphrase: string | null) => typedError<SshConnection, CommandError>(__TAURI_INVOKE("create_ssh_connection", { input, passphrase })),
+	/**  Edit a connection. Every profile tunnelling through it follows. */
+	updateSshConnection: (id: string, patch: SshConnectionUpdate_Deserialize) => typedError<SshConnection, CommandError>(__TAURI_INVOKE("update_ssh_connection", { id, patch })),
+	/**
+	 *  Delete a connection and its stored passphrase.
+	 * 
+	 *  Refused while any profile or jump host still points at it — the error names
+	 *  them, so the answer to "why not" does not need a second look.
+	 */
+	deleteSshConnection: (id: string) => typedError<boolean, CommandError>(__TAURI_INVOKE("delete_ssh_connection", { id })),
+	/**  Store or clear the passphrase protecting an SSH connection's key. */
+	setSshConnectionPassphrase: (id: string, value: string) => typedError<null, CommandError>(__TAURI_INVOKE("set_ssh_connection_passphrase", { id, value })),
+	sshConnectionStatus: (id: string) => typedError<SshConnectionStatus, CommandError>(__TAURI_INVOKE("ssh_connection_status", { id })),
+	/**
+	 *  Connect and authenticate an SSH connection on its own, without a database.
+	 * 
+	 *  Never returns `Err` for an unreachable server, for the same reason
+	 *  [`test_connection`] does not: a failed connection is a successful test.
+	 */
+	testSshConnection: (id: string) => typedError<SshReport, CommandError>(__TAURI_INVOKE("test_ssh_connection", { id })),
 	/**
 	 *  Test a profile, reporting each step separately.
 	 * 
@@ -154,7 +178,7 @@ export const commands = {
 	 */
 	exportConfigToFile: () => typedError<string, CommandError>(__TAURI_INVOKE("export_config_to_file")),
 	/**  Read a bundle and report what it would change, without changing anything. */
-	previewConfigImport: (path: string) => typedError<ConfigBundle, CommandError>(__TAURI_INVOKE("preview_config_import", { path })),
+	previewConfigImport: (path: string) => typedError<ConfigBundle_Serialize, CommandError>(__TAURI_INVOKE("preview_config_import", { path })),
 	/**  Apply a bundle. Never writes a credential; never removes anything. */
 	importConfig: (path: string) => typedError<ImportReport, CommandError>(__TAURI_INVOKE("import_config", { path })),
 	listDestinations: () => typedError<DestinationView[], CommandError>(__TAURI_INVOKE("list_destinations")),
@@ -349,12 +373,28 @@ export type CommonBackupOptions = {
 	record_row_counts?: boolean,
 };
 
-export type ConfigBundle = {
+export type ConfigBundle = ConfigBundle_Serialize | ConfigBundle_Deserialize;
+
+export type ConfigBundle_Deserialize = {
 	bundle_version: number,
 	exported_at: string,
 	/**  The version of DBSync that wrote it, for a human reading a diff. */
 	engine_version: string,
-	profiles: SharedProfile[],
+	/**  Defaulted rather than required, so a version 1 bundle still parses. */
+	ssh_connections?: SharedSshConnection[],
+	profiles: SharedProfile_Deserialize[],
+	plans: SharedPlan[],
+	destinations: SharedDestination[],
+};
+
+export type ConfigBundle_Serialize = {
+	bundle_version: number,
+	exported_at: string,
+	/**  The version of DBSync that wrote it, for a human reading a diff. */
+	engine_version: string,
+	/**  Defaulted rather than required, so a version 1 bundle still parses. */
+	ssh_connections: SharedSshConnection[],
+	profiles: SharedProfile_Serialize[],
 	plans: SharedPlan[],
 	destinations: SharedDestination[],
 };
@@ -364,8 +404,11 @@ export type ConnectionProfile = {
 	name: string,
 	engine: Engine,
 	environment: EnvironmentTag,
-	/**  `None` means connect directly, without a tunnel. */
-	ssh: SshConfig | null,
+	/**
+	 *  The saved SSH connection this profile tunnels through. `None` means
+	 *  connect directly, without a tunnel.
+	 */
+	ssh_connection_id: string | null,
 	db: DbConfig,
 	tool_overrides: ToolOverrides,
 	created_at: string,
@@ -429,7 +472,7 @@ export type DatabaseStats = {
 
 /**
  *  Database coordinates *as seen from the SSH host* (or from this machine when
- *  `ConnectionProfile::ssh` is `None`).
+ *  `ConnectionProfile::ssh_connection_id` is `None`).
  */
 export type DbConfig = {
 	host: string,
@@ -564,12 +607,20 @@ export type HostKeyPrompt = {
 
 /**  What an import changed, and what it deliberately did not. */
 export type ImportReport = {
+	ssh_connections_created: string[],
+	ssh_connections_updated: string[],
 	profiles_created: string[],
 	profiles_updated: string[],
 	plans_created: string[],
 	plans_updated: string[],
 	destinations_created: string[],
 	destinations_updated: string[],
+	/**
+	 *  SSH connections whose key needs a passphrase that is not in this
+	 *  machine's keychain. Named individually for the same reason connections
+	 *  needing a password are: a count is not something anyone acts on.
+	 */
+	ssh_needing_passphrase: string[],
 	/**
 	 *  Connections that now exist but cannot connect until someone supplies a
 	 *  password. Named individually, because "some of these need credentials"
@@ -578,6 +629,13 @@ export type ImportReport = {
 	needs_credentials: string[],
 	/**  Plans whose profile was not in the bundle and is not on this machine. */
 	orphaned_plans: string[],
+	/**
+	 *  Connections that named an SSH connection the bundle did not carry.
+	 *  They are imported as direct connections and listed here, because a
+	 *  tunnelled profile silently becoming a direct one is exactly the kind
+	 *  of change that is only noticed when it fails.
+	 */
+	orphaned_ssh_references: string[],
 	/**  Destinations that exist but have no stored access key. */
 	destinations_needing_keys: string[],
 };
@@ -792,7 +850,7 @@ export type ProfileCreate = {
 	name: string,
 	engine: Engine,
 	environment: EnvironmentTag,
-	ssh: SshConfig | null,
+	ssh_connection_id?: string | null,
 	db: DbConfig,
 	tool_overrides?: ToolOverrides,
 };
@@ -800,9 +858,9 @@ export type ProfileCreate = {
 /**
  *  Patch for an existing profile. An omitted field means "leave unchanged".
  * 
- *  `ssh` is doubly-optional on purpose, and the distinction is carried by
- *  *presence*, not by value: omitting the key leaves the SSH config alone,
- *  while sending an explicit `null` clears it. Every field is
+ *  `ssh_connection_id` is doubly-optional on purpose, and the distinction is
+ *  carried by *presence*, not by value: omitting the key leaves the tunnel
+ *  alone, while sending an explicit `null` detaches it. Every field is
  *  `#[serde(default)]` so that omission is legal and so the generated
  *  TypeScript renders them as optional — without it the frontend would be
  *  forced to send every key and could never express "leave unchanged".
@@ -812,9 +870,9 @@ export type ProfileUpdate = ProfileUpdate_Serialize | ProfileUpdate_Deserialize;
 /**
  *  Patch for an existing profile. An omitted field means "leave unchanged".
  * 
- *  `ssh` is doubly-optional on purpose, and the distinction is carried by
- *  *presence*, not by value: omitting the key leaves the SSH config alone,
- *  while sending an explicit `null` clears it. Every field is
+ *  `ssh_connection_id` is doubly-optional on purpose, and the distinction is
+ *  carried by *presence*, not by value: omitting the key leaves the tunnel
+ *  alone, while sending an explicit `null` detaches it. Every field is
  *  `#[serde(default)]` so that omission is legal and so the generated
  *  TypeScript renders them as optional — without it the frontend would be
  *  forced to send every key and could never express "leave unchanged".
@@ -823,7 +881,7 @@ export type ProfileUpdate_Deserialize = {
 	name?: string | null,
 	engine?: Engine | null,
 	environment?: EnvironmentTag | null,
-	ssh?: SshConfig | null,
+	ssh_connection_id?: string | null,
 	db?: DbConfig | null,
 	tool_overrides?: ToolOverrides | null,
 };
@@ -831,9 +889,9 @@ export type ProfileUpdate_Deserialize = {
 /**
  *  Patch for an existing profile. An omitted field means "leave unchanged".
  * 
- *  `ssh` is doubly-optional on purpose, and the distinction is carried by
- *  *presence*, not by value: omitting the key leaves the SSH config alone,
- *  while sending an explicit `null` clears it. Every field is
+ *  `ssh_connection_id` is doubly-optional on purpose, and the distinction is
+ *  carried by *presence*, not by value: omitting the key leaves the tunnel
+ *  alone, while sending an explicit `null` detaches it. Every field is
  *  `#[serde(default)]` so that omission is legal and so the generated
  *  TypeScript renders them as optional — without it the frontend would be
  *  forced to send every key and could never express "leave unchanged".
@@ -842,7 +900,7 @@ export type ProfileUpdate_Serialize = {
 	name: string | null,
 	engine: Engine | null,
 	environment: EnvironmentTag | null,
-	ssh?: SshConfig | null,
+	ssh_connection_id?: string | null,
 	db: DbConfig | null,
 	tool_overrides: ToolOverrides | null,
 };
@@ -1122,7 +1180,6 @@ export type SchedulerStatus = {
 /**  What the UI is allowed to know about stored secrets: whether they exist. */
 export type SecretStatus = {
 	has_db_password: boolean,
-	has_ssh_passphrase: boolean,
 };
 
 /**  An off-site destination, minus its credential. */
@@ -1155,15 +1212,80 @@ export type SharedPlan = {
  *  for the same server, and an import that matched on id would duplicate
  *  everything every time.
  */
-export type SharedProfile = {
+export type SharedProfile = SharedProfile_Serialize | SharedProfile_Deserialize;
+
+/**
+ *  A connection, minus the ability to connect.
+ * 
+ *  Identified by name rather than by id: two machines generate different ids
+ *  for the same server, and an import that matched on id would duplicate
+ *  everything every time.
+ */
+export type SharedProfile_Deserialize = {
 	name: string,
 	engine: Engine,
 	environment: EnvironmentTag,
 	/**  Host, port, user and database. No password — there is no field for one. */
 	db: DbConfig,
-	/**  Endpoint and auth *method*. A key-file path is a path, not a key. */
-	ssh: SshConfig | null,
+	/**
+	 *  The SSH connection this tunnels through, named rather than copied — so
+	 *  a bundle describing six databases behind one bastion says "bastion"
+	 *  six times and describes it once.
+	 */
+	ssh_connection?: string | null,
+	/**
+	 *  The inline tunnel a version 1 bundle carried.
+	 * 
+	 *  Read on import and never written: a bundle from an older DBSync must
+	 *  not lose the tunnel it believed it was sharing. See [`import`].
+	 */
+	ssh?: SshConfig | null,
 	tool_overrides?: ToolOverrides,
+};
+
+/**
+ *  A connection, minus the ability to connect.
+ * 
+ *  Identified by name rather than by id: two machines generate different ids
+ *  for the same server, and an import that matched on id would duplicate
+ *  everything every time.
+ */
+export type SharedProfile_Serialize = {
+	name: string,
+	engine: Engine,
+	environment: EnvironmentTag,
+	/**  Host, port, user and database. No password — there is no field for one. */
+	db: DbConfig,
+	/**
+	 *  The SSH connection this tunnels through, named rather than copied — so
+	 *  a bundle describing six databases behind one bastion says "bastion"
+	 *  six times and describes it once.
+	 */
+	ssh_connection: string | null,
+	/**
+	 *  The inline tunnel a version 1 bundle carried.
+	 * 
+	 *  Read on import and never written: a bundle from an older DBSync must
+	 *  not lose the tunnel it believed it was sharing. See [`import`].
+	 */
+	ssh?: SshConfig | null,
+	tool_overrides: ToolOverrides,
+};
+
+/**
+ *  An SSH server, minus the ability to authenticate to it.
+ * 
+ *  Endpoint and auth *method*. A key-file path is a path, not a key, and the
+ *  passphrase protecting it is in the receiver's keychain or nowhere.
+ */
+export type SharedSshConnection = {
+	name: string,
+	endpoint: SshEndpoint,
+	/**
+	 *  Another entry in the same list, by name — for the same reason profiles
+	 *  are matched by name: ids differ between machines.
+	 */
+	jump_host?: string | null,
 };
 
 /**  A backup that came out dramatically smaller than the one before it. */
@@ -1191,16 +1313,105 @@ export type SshAuth =
  */
 { kind: "key_file"; path: string; passphrase_in_keychain: boolean };
 
+/**
+ *  A route to an SSH server with its bastion resolved: what [`crate::ssh`]
+ *  needs in order to actually connect.
+ * 
+ *  This is a *derived* value, built by [`crate::store::Store::resolve_ssh`]
+ *  from a stored [`SshConnection`] and the connection it jumps through. It is
+ *  deliberately not persisted in this shape any more.
+ * 
+ *  It does still describe the layout of the `profiles.ssh_config` column that
+ *  versions before saved SSH connections wrote, which is why the endpoint stays
+ *  flattened: [`adopt_legacy_configs`] parses those rows with this type.
+ */
 export type SshConfig = {
 	/**  Optional single-hop ProxyJump. Chained jumps are out of scope for v1. */
 	jump_host: SshEndpoint | null,
 } & SshEndpoint;
+
+/**  A named SSH server, reusable by any number of connection profiles. */
+export type SshConnection = {
+	id: string,
+	/**  Unique, and what every profile and the audit log refer to it by. */
+	name: string,
+	endpoint: SshEndpoint,
+	/**
+	 *  Another saved connection used as a bastion. See the module docs for why
+	 *  this is a reference.
+	 */
+	jump_host_id: string | null,
+	created_at: string,
+	updated_at: string,
+};
+
+export type SshConnectionCreate = {
+	name: string,
+	endpoint: SshEndpoint,
+	jump_host_id?: string | null,
+};
+
+/**
+ *  An SSH connection plus the two things the UI cannot derive from the record:
+ *  whether its passphrase is stored, and what would break if it were deleted.
+ */
+export type SshConnectionStatus = {
+	has_passphrase: boolean,
+	/**  Names of the profiles tunnelling through it. */
+	used_by_profiles: string[],
+	/**  Names of the SSH connections jumping through it. */
+	used_by_jump: string[],
+};
+
+/**
+ *  A partial edit. An omitted field means "leave unchanged".
+ * 
+ *  `jump_host_id` is doubly-optional and carries the distinction by *presence*,
+ *  exactly as [`crate::profile::ProfileUpdate::ssh_connection_id`] does:
+ *  omitting the key keeps the current bastion, an explicit `null` removes it.
+ */
+export type SshConnectionUpdate = SshConnectionUpdate_Serialize | SshConnectionUpdate_Deserialize;
+
+/**
+ *  A partial edit. An omitted field means "leave unchanged".
+ * 
+ *  `jump_host_id` is doubly-optional and carries the distinction by *presence*,
+ *  exactly as [`crate::profile::ProfileUpdate::ssh_connection_id`] does:
+ *  omitting the key keeps the current bastion, an explicit `null` removes it.
+ */
+export type SshConnectionUpdate_Deserialize = {
+	name?: string | null,
+	endpoint?: SshEndpoint | null,
+	jump_host_id?: string | null,
+};
+
+/**
+ *  A partial edit. An omitted field means "leave unchanged".
+ * 
+ *  `jump_host_id` is doubly-optional and carries the distinction by *presence*,
+ *  exactly as [`crate::profile::ProfileUpdate::ssh_connection_id`] does:
+ *  omitting the key keeps the current bastion, an explicit `null` removes it.
+ */
+export type SshConnectionUpdate_Serialize = {
+	name: string | null,
+	endpoint: SshEndpoint | null,
+	jump_host_id?: string | null,
+};
 
 export type SshEndpoint = {
 	host: string,
 	port: number,
 	user: string,
 	auth: SshAuth,
+};
+
+/**  Result of testing a saved SSH connection on its own. */
+export type SshReport = {
+	ssh: StepOutcome,
+	/**  Fingerprint of the key the server presented, once it is trusted. */
+	host_key: string | null,
+	authenticated_as: string | null,
+	host_key_prompt: HostKeyPrompt | null,
 };
 
 export type StepOutcome = { status: "ok"; detail: string } | { status: "failed"; detail: string } | { status: "skipped"; detail: string };

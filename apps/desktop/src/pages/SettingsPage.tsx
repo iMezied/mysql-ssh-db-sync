@@ -138,7 +138,13 @@ function SharedConfigSection() {
     mutationFn: () => api.importConfig(path.trim()),
     onSuccess: () => {
       // Everything the import may have touched.
-      for (const key of ["profiles", "sync-plans", "destinations", "schedules"]) {
+      for (const key of [
+        "profiles",
+        "ssh-connections",
+        "sync-plans",
+        "destinations",
+        "schedules",
+      ]) {
         void queryClient.invalidateQueries({ queryKey: [key] });
       }
     },
@@ -152,8 +158,8 @@ function SharedConfigSection() {
 
       <div className="panel space-y-4 p-4">
         <p className="max-w-3xl text-xs leading-relaxed text-slate-400">
-          A bundle carries connections, sync plans and off-site destinations —
-          the shape of the work, not the ability to do it.{" "}
+          A bundle carries connections, SSH servers, sync plans and off-site
+          destinations — the shape of the work, not the ability to do it.{" "}
           <strong className="text-slate-200">
             It contains no passwords, no SSH keys and no access keys
           </strong>
@@ -231,6 +237,7 @@ function SharedConfigSection() {
           {preview.data && !report && (
             <p className="text-xs text-slate-400">
               {preview.data.profiles.length} connection(s),{" "}
+              {preview.data.ssh_connections.length} SSH server(s),{" "}
               {preview.data.plans.length} plan(s),{" "}
               {preview.data.destinations.length} destination(s), exported by
               DBSync {preview.data.engine_version}. Existing records with the
@@ -247,11 +254,13 @@ function SharedConfigSection() {
 
 function ImportSummary({ report }: { report: ImportReport }) {
   const created = [
+    ...report.ssh_connections_created,
     ...report.profiles_created,
     ...report.plans_created,
     ...report.destinations_created,
   ];
   const updated = [
+    ...report.ssh_connections_updated,
     ...report.profiles_updated,
     ...report.plans_updated,
     ...report.destinations_updated,
@@ -278,6 +287,27 @@ function ImportSummary({ report }: { report: ImportReport }) {
           These destinations arrived switched off and need an access key:{" "}
           <span className="font-mono">
             {report.destinations_needing_keys.join(", ")}
+          </span>
+        </p>
+      )}
+      {report.ssh_needing_passphrase.length > 0 && (
+        <p className="text-amber-400">
+          These SSH servers use a key with a passphrase this machine does not
+          have:{" "}
+          <span className="font-mono">
+            {report.ssh_needing_passphrase.join(", ")}
+          </span>
+        </p>
+      )}
+      {/* Louder than the others: nothing here failed, which is the problem. A
+          tunnelled connection quietly becoming a direct one is only noticed
+          when it fails, or worse, when it succeeds against the wrong host. */}
+      {report.orphaned_ssh_references.length > 0 && (
+        <p className="text-red-400">
+          These connections named an SSH server the bundle did not carry, and
+          were imported as <strong>direct</strong> connections:{" "}
+          <span className="font-mono">
+            {report.orphaned_ssh_references.join(", ")}
           </span>
         </p>
       )}

@@ -113,6 +113,13 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             commands::delete_profile,
             commands::set_profile_secret,
             commands::profile_secret_status,
+            commands::list_ssh_connections,
+            commands::create_ssh_connection,
+            commands::update_ssh_connection,
+            commands::delete_ssh_connection,
+            commands::set_ssh_connection_passphrase,
+            commands::ssh_connection_status,
+            commands::test_ssh_connection,
             commands::test_connection,
             commands::trust_host_key,
             commands::list_databases,
@@ -222,6 +229,31 @@ pub fn run() {
             // taking the connection pool's reactor with it and breaking every
             // later query.
             let store = tauri::async_runtime::block_on(Store::open(&store_path))?;
+
+            // Turn any SSH config left inline on a profile by an older version
+            // into a saved connection. A no-op after the first run, and the
+            // CLI does the same thing on its own start — whichever of the two
+            // the user happens to open first performs the upgrade.
+            match tauri::async_runtime::block_on(db_sync_engine::sshconn::adopt_legacy_configs(
+                &store,
+            )) {
+                Ok(adopted) if !adopted.is_empty() => {
+                    tracing::info!(
+                        "adopted {} inline SSH config(s) into saved connections: {}",
+                        adopted.len(),
+                        adopted
+                            .iter()
+                            .map(|a| format!("{} -> {}", a.profile_name, a.ssh_connection_name))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                Ok(_) => {}
+                // Not fatal: the profiles still hold their original config, so
+                // the next start can try again. Refusing to launch over it
+                // would leave the user with no way to reach the data.
+                Err(e) => tracing::error!("could not adopt inline SSH configurations: {e}"),
+            }
 
             let (event_tx, _rx) = create_event_channel(EVENT_CHANNEL_CAPACITY);
             let handle = app.handle().clone();

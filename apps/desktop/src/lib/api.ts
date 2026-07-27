@@ -36,6 +36,19 @@ export const api = {
     unwrap(commands.setProfileSecret(id, kind, value)),
   profileSecretStatus: (id: string) => unwrap(commands.profileSecretStatus(id)),
   testConnection: (id: string) => unwrap(commands.testConnection(id)),
+
+  listSshConnections: () => unwrap(commands.listSshConnections()),
+  /** The passphrase goes in and is never returned; it lands in the OS keychain. */
+  createSshConnection: (...args: Parameters<typeof commands.createSshConnection>) =>
+    unwrap(commands.createSshConnection(...args)),
+  updateSshConnection: (...args: Parameters<typeof commands.updateSshConnection>) =>
+    unwrap(commands.updateSshConnection(...args)),
+  deleteSshConnection: (id: string) => unwrap(commands.deleteSshConnection(id)),
+  setSshConnectionPassphrase: (id: string, value: string) =>
+    unwrap(commands.setSshConnectionPassphrase(id, value)),
+  sshConnectionStatus: (id: string) => unwrap(commands.sshConnectionStatus(id)),
+  testSshConnection: (id: string) => unwrap(commands.testSshConnection(id)),
+
   trustHostKey: (
     hostPort: string,
     algorithm: string,

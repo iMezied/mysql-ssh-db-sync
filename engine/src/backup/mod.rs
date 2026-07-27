@@ -380,7 +380,7 @@ mod tests {
             name: "p".into(),
             engine,
             environment: EnvironmentTag::Dev,
-            ssh: None,
+            ssh_connection_id: None,
             db: DbConfig {
                 host: "127.0.0.1".into(),
                 port: engine.default_port(),

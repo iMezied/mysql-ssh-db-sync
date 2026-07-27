@@ -1,10 +1,10 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Link } from "react-router-dom";
 import { ChevronDown, ChevronRight, KeyRound, Plus, Trash2 } from "lucide-react";
 
 import PageHeader from "@/components/PageHeader";
 import ConnectionTest from "@/components/ConnectionTest";
-import SshFields from "@/components/SshFields";
 import { api, ApiError } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import type {
@@ -28,7 +28,7 @@ function emptyDraft(): ProfileCreate & { db: DbConfig } {
     name: "",
     engine: "mysql",
     environment: "dev",
-    ssh: null,
+    ssh_connection_id: null,
     db: { host: "127.0.0.1", port: DEFAULT_PORT.mysql, user: "", database: null },
   };
 }
@@ -43,6 +43,16 @@ export default function ProfilesPage() {
     queryKey: ["profiles"],
     queryFn: api.listProfiles,
   });
+
+  // Named here so a row can say *which* server it tunnels through, and so the
+  // form can offer the saved ones rather than asking for the same host twice.
+  const sshConnections = useQuery({
+    queryKey: ["ssh-connections"],
+    queryFn: api.listSshConnections,
+  });
+  const sshNames = new Map(
+    (sshConnections.data ?? []).map((c) => [c.id, c.name] as const),
+  );
 
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["profiles"] });
 
@@ -114,6 +124,11 @@ export default function ProfilesPage() {
             <ProfileRow
               key={p.id}
               profile={p}
+              sshName={
+                p.ssh_connection_id
+                  ? (sshNames.get(p.ssh_connection_id) ?? "an SSH server")
+                  : null
+              }
               onDelete={() => remove.mutate(p.id)}
               deleting={remove.isPending && remove.variables === p.id}
             />
@@ -245,10 +260,43 @@ export default function ProfilesPage() {
                 />
               </label>
 
-              <SshFields
-                value={draft.ssh}
-                onChange={(ssh) => setDraft({ ...draft, ssh })}
-              />
+              <label className="col-span-2">
+                <span className="field-label">SSH tunnel</span>
+                <select
+                  className="field-input"
+                  value={draft.ssh_connection_id ?? ""}
+                  onChange={(e) =>
+                    setDraft({
+                      ...draft,
+                      ssh_connection_id: e.target.value || null,
+                    })
+                  }
+                >
+                  <option value="">No tunnel — connect directly</option>
+                  {sshConnections.data?.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name} ({c.endpoint.user}@{c.endpoint.host})
+                    </option>
+                  ))}
+                </select>
+                <p className="mt-1.5 text-xs leading-relaxed text-slate-500">
+                  {draft.ssh_connection_id ? (
+                    <>
+                      Through a tunnel, the host and port above are resolved{" "}
+                      <em>from the SSH server</em> — usually{" "}
+                      <code className="text-slate-400">127.0.0.1</code>.
+                    </>
+                  ) : (
+                    <>
+                      SSH servers are saved once and shared.{" "}
+                      <Link to="/ssh" className="text-blue-400 hover:underline">
+                        Add one
+                      </Link>{" "}
+                      to tunnel through a bastion.
+                    </>
+                  )}
+                </p>
+              </label>
 
               <label className="col-span-2">
                 <span className="field-label">Password (stored in keychain)</span>
@@ -294,10 +342,12 @@ export default function ProfilesPage() {
 
 function ProfileRow({
   profile,
+  sshName,
   onDelete,
   deleting,
 }: {
   profile: ConnectionProfile;
+  sshName: string | null;
   onDelete: () => void;
   deleting: boolean;
 }) {
@@ -341,7 +391,7 @@ function ProfileRow({
         <div className="mt-1 truncate font-mono text-xs text-slate-500">
           {profile.db.user}@{profile.db.host}:{profile.db.port}
           {profile.db.database ? `/${profile.db.database}` : ""}
-          {profile.ssh ? "  ·  via SSH" : ""}
+          {sshName ? `  ·  via ${sshName}` : ""}
         </div>
       </div>
 

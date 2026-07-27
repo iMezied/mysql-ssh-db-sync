@@ -13,9 +13,8 @@ use db_sync_engine::events::JobKind;
 use db_sync_engine::job::{JobOutcome, JobRecord};
 use db_sync_engine::mask::{MaskRule, MaskTransform};
 use db_sync_engine::plan::SyncPlanCreate;
-use db_sync_engine::profile::{
-    DbConfig, ProfileCreate, ProfileUpdate, SshAuth, SshConfig, SshEndpoint, ToolOverrides,
-};
+use db_sync_engine::profile::{DbConfig, ProfileCreate, ProfileUpdate, ToolOverrides};
+use db_sync_engine::sshconn::{SshAuth, SshConnectionCreate, SshEndpoint};
 use db_sync_engine::retention::RetentionPolicy;
 use db_sync_engine::store::{Store, StoreError};
 use db_sync_engine::types::{Engine, EnvironmentTag};
@@ -34,7 +33,7 @@ fn profile_input(name: &str, engine: Engine) -> ProfileCreate {
         name: name.to_string(),
         engine,
         environment: EnvironmentTag::Dev,
-        ssh: None,
+        ssh_connection_id: None,
         db: DbConfig {
             host: "127.0.0.1".into(),
             port: engine.default_port(),
@@ -45,24 +44,47 @@ fn profile_input(name: &str, engine: Engine) -> ProfileCreate {
     }
 }
 
-fn ssh_config() -> SshConfig {
-    SshConfig {
-        endpoint: SshEndpoint {
-            host: "bastion.example.com".into(),
-            port: 22,
-            user: "ubuntu".into(),
-            auth: SshAuth::KeyFile {
-                path: "~/.ssh/id_ed25519".into(),
-                passphrase_in_keychain: true,
-            },
+fn ssh_endpoint() -> SshEndpoint {
+    SshEndpoint {
+        host: "bastion.example.com".into(),
+        port: 22,
+        user: "ubuntu".into(),
+        auth: SshAuth::KeyFile {
+            path: "~/.ssh/id_ed25519".into(),
+            passphrase_in_keychain: true,
         },
-        jump_host: Some(SshEndpoint {
-            host: "jump.example.com".into(),
-            port: 2222,
-            user: "ops".into(),
-            auth: SshAuth::Agent,
-        }),
     }
+}
+
+fn jump_endpoint() -> SshEndpoint {
+    SshEndpoint {
+        host: "jump.example.com".into(),
+        port: 2222,
+        user: "ops".into(),
+        auth: SshAuth::Agent,
+    }
+}
+
+/// A saved bastion, and a connection reaching its server through it.
+async fn ssh_with_jump_host(store: &Store) -> Uuid {
+    let jump = store
+        .create_ssh_connection(SshConnectionCreate {
+            name: "edge".into(),
+            endpoint: jump_endpoint(),
+            jump_host_id: None,
+        })
+        .await
+        .unwrap();
+
+    store
+        .create_ssh_connection(SshConnectionCreate {
+            name: "bastion".into(),
+            endpoint: ssh_endpoint(),
+            jump_host_id: Some(jump.id),
+        })
+        .await
+        .unwrap()
+        .id
 }
 
 #[tokio::test]
@@ -93,9 +115,11 @@ async fn opening_an_existing_store_is_idempotent() {
 async fn profile_survives_a_full_round_trip() {
     let (store, _dir) = store().await;
 
+    let ssh_id = ssh_with_jump_host(&store).await;
+
     let mut input = profile_input("prod-germany", Engine::Mysql);
     input.environment = EnvironmentTag::Prod;
-    input.ssh = Some(ssh_config());
+    input.ssh_connection_id = Some(ssh_id);
     input.tool_overrides = ToolOverrides {
         mysqldump: Some("/opt/homebrew/bin/mysqldump".into()),
         ..Default::default()
@@ -110,11 +134,13 @@ async fn profile_survives_a_full_round_trip() {
     );
     assert_eq!(fetched.engine, Engine::Mysql);
     assert_eq!(fetched.environment, EnvironmentTag::Prod);
+    assert_eq!(fetched.ssh_connection_id, Some(ssh_id));
 
-    // Nested SSH config, including the jump host, must survive serialisation.
-    let ssh = fetched.ssh.expect("ssh config");
-    assert_eq!(ssh.endpoint.host, "bastion.example.com");
-    let jump = ssh.jump_host.expect("jump host");
+    // Resolving it produces the route the tunnel provider needs, jump host
+    // and all — the part that used to be stored inline on the profile.
+    let resolved = store.resolve_ssh(ssh_id).await.unwrap();
+    assert_eq!(resolved.config.endpoint.host, "bastion.example.com");
+    let jump = resolved.config.jump_host.expect("jump host");
     assert_eq!(jump.port, 2222);
     assert_eq!(jump.auth, SshAuth::Agent);
 
@@ -182,47 +208,65 @@ async fn update_applies_only_the_supplied_fields() {
 }
 
 #[tokio::test]
-async fn update_can_add_and_clear_ssh_config() {
+async fn update_can_attach_and_detach_an_ssh_connection() {
     let (store, _dir) = store().await;
+    let ssh_id = ssh_with_jump_host(&store).await;
     let created = store
         .create_profile(profile_input("s", Engine::Mysql))
         .await
         .unwrap();
-    assert!(created.ssh.is_none());
+    assert!(created.ssh_connection_id.is_none());
 
     let with_ssh = store
         .update_profile(
             created.id,
             ProfileUpdate {
-                ssh: Some(Some(ssh_config())),
+                ssh_connection_id: Some(Some(ssh_id)),
                 ..Default::default()
             },
         )
         .await
         .unwrap();
-    assert!(with_ssh.ssh.is_some());
+    assert_eq!(with_ssh.ssh_connection_id, Some(ssh_id));
 
-    // Some(None) clears; None would have left it alone.
+    // Some(None) detaches; None would have left it alone.
     let cleared = store
         .update_profile(
             created.id,
             ProfileUpdate {
-                ssh: Some(None),
+                ssh_connection_id: Some(None),
                 ..Default::default()
             },
         )
         .await
         .unwrap();
     assert!(
-        cleared.ssh.is_none(),
-        "Some(None) must clear the SSH config"
+        cleared.ssh_connection_id.is_none(),
+        "Some(None) must detach the tunnel"
     );
 
     let untouched = store
         .update_profile(created.id, ProfileUpdate::default())
         .await
         .unwrap();
-    assert!(untouched.ssh.is_none());
+    assert!(untouched.ssh_connection_id.is_none());
+}
+
+#[tokio::test]
+async fn a_profile_cannot_reference_an_ssh_connection_that_does_not_exist() {
+    // Reported by name rather than as a foreign-key violation, and refused
+    // rather than stored: a dangling reference reads as "connect directly" at
+    // the point of use, against a host that only resolves from the bastion.
+    let (store, _dir) = store().await;
+    let mut input = profile_input("dangling", Engine::Mysql);
+    input.ssh_connection_id = Some(Uuid::new_v4());
+
+    let err = store.create_profile(input).await.unwrap_err();
+    assert!(
+        matches!(err, StoreError::InvalidSshConnection(_)),
+        "expected a missing-connection error, got {err}"
+    );
+    assert!(store.list_profiles().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -485,29 +529,81 @@ async fn corrupt_rows_surface_as_errors_rather_than_wrong_data() {
 }
 
 #[tokio::test]
-async fn malformed_ssh_json_is_corruption_not_a_direct_connection() {
+async fn a_profile_cannot_point_at_an_ssh_connection_that_is_not_there() {
+    // Stronger than reporting corruption after the fact: with foreign keys on,
+    // a dangling reference cannot be written at all — not by the engine, and
+    // not by hand with sqlite3. A tunnelled profile therefore cannot degrade
+    // into a direct one, which would connect to a host and port that are only
+    // meaningful from the SSH server.
     let (store, _dir) = store().await;
     let created = store
         .create_profile(profile_input("c", Engine::Mysql))
         .await
         .unwrap();
 
-    sqlx::query("UPDATE profiles SET ssh_config = '{not json' WHERE id = ?1")
+    let err = sqlx::query("UPDATE profiles SET ssh_connection_id = ?2 WHERE id = ?1")
         .bind(created.id.to_string())
+        .bind(Uuid::new_v4().to_string())
+        .execute(store.pool())
+        .await
+        .expect_err("a reference to a missing connection must be refused");
+    assert!(err.to_string().contains("FOREIGN KEY"), "{err}");
+
+    let unchanged = store.get_profile(created.id).await.unwrap().unwrap();
+    assert!(unchanged.ssh_connection_id.is_none());
+}
+
+#[tokio::test]
+async fn deleting_a_profile_leaves_its_ssh_connection_alone() {
+    // The connection belongs to the installation, not to the database that
+    // happened to be created first. Removing one database must not take the
+    // bastion — or its keychain entry — away from the others.
+    let (store, _dir) = store().await;
+    let ssh_id = ssh_with_jump_host(&store).await;
+
+    let mut a = profile_input("a", Engine::Mysql);
+    a.ssh_connection_id = Some(ssh_id);
+    let mut b = profile_input("b", Engine::Mysql);
+    b.ssh_connection_id = Some(ssh_id);
+
+    let first = store.create_profile(a).await.unwrap();
+    store.create_profile(b).await.unwrap();
+
+    assert!(store.delete_profile(first.id).await.unwrap());
+    assert!(store.get_ssh_connection(ssh_id).await.unwrap().is_some());
+    assert_eq!(
+        store
+            .profiles_using_ssh_connection(ssh_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_ssh_endpoint_is_corruption() {
+    let (store, _dir) = store().await;
+    let id = store
+        .create_ssh_connection(SshConnectionCreate {
+            name: "bastion".into(),
+            endpoint: jump_endpoint(),
+            jump_host_id: None,
+        })
+        .await
+        .unwrap()
+        .id;
+
+    sqlx::query("UPDATE ssh_connections SET endpoint = '{not json' WHERE id = ?1")
+        .bind(id.to_string())
         .execute(store.pool())
         .await
         .unwrap();
 
-    let err = store.get_profile(created.id).await.unwrap_err();
+    let err = store.get_ssh_connection(id).await.unwrap_err();
     assert!(
-        matches!(
-            err,
-            StoreError::Corrupt {
-                field: "ssh_config",
-                ..
-            }
-        ),
-        "a tunnelled profile must never degrade into a direct connection"
+        matches!(err, StoreError::Corrupt { field: "endpoint", .. }),
+        "an unreadable endpoint must be reported, not guessed at: {err}"
     );
 }
 

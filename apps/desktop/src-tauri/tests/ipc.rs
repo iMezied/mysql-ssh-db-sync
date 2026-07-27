@@ -52,6 +52,11 @@ fn app_with(store: Store, store_path: PathBuf) -> MockApp {
             db_sync_desktop::commands::create_destination,
             db_sync_desktop::commands::update_destination,
             db_sync_desktop::commands::delete_destination,
+            db_sync_desktop::commands::list_ssh_connections,
+            db_sync_desktop::commands::create_ssh_connection,
+            db_sync_desktop::commands::update_ssh_connection,
+            db_sync_desktop::commands::delete_ssh_connection,
+            db_sync_desktop::commands::update_profile,
         ])
         .build(mock_context(noop_assets()))
         .expect("mock app should build");
@@ -137,7 +142,7 @@ async fn seeded() -> (Store, PathBuf, tempfile::TempDir, SyncPlan) {
             name: "src".into(),
             engine: Engine::Mysql,
             environment: EnvironmentTag::Dev,
-            ssh: None,
+            ssh_connection_id: None,
             db: DbConfig {
                 host: "127.0.0.1".into(),
                 port: 3306,
@@ -402,6 +407,163 @@ fn a_plaintext_http_destination_is_refused_over_ipc() {
         error["message"].as_str().unwrap().contains("https://"),
         "the error must carry the fix: {error}"
     );
+}
+
+// ── SSH connections ─────────────────────────────────────────────────────
+
+fn endpoint(host: &str) -> serde_json::Value {
+    serde_json::json!({
+        "host": host,
+        "port": 22,
+        "user": "ubuntu",
+        "auth": { "kind": "agent" }
+    })
+}
+
+/// Create one over IPC. Passing no passphrase keeps this keychain-free.
+fn create_ssh(app: &MockApp, name: &str, jump_host_id: Option<uuid::Uuid>) -> serde_json::Value {
+    invoke(
+        app,
+        "create_ssh_connection",
+        serde_json::json!({
+            "input": {
+                "name": name,
+                "endpoint": endpoint(&format!("{name}.example.com")),
+                "jump_host_id": jump_host_id
+            },
+            "passphrase": null
+        }),
+    )
+}
+
+#[test]
+fn an_ssh_connection_is_created_once_and_referenced_by_id() {
+    // The point of the whole milestone: the tunnel is a record of its own, and
+    // a profile carries a reference rather than a copy.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (store, path, _dir, plan) = rt.block_on(seeded());
+    let app = app_with(store, path);
+
+    let created = create_ssh(&app, "bastion", None);
+    let id: uuid::Uuid = serde_json::from_value(created["id"].clone()).unwrap();
+    assert_eq!(created["endpoint"]["host"], "bastion.example.com");
+    assert_eq!(created["jump_host_id"], serde_json::Value::Null);
+
+    let listed = invoke(&app, "list_ssh_connections", serde_json::json!({}));
+    assert_eq!(listed.as_array().map(Vec::len), Some(1), "got {listed}");
+
+    let attached = invoke(
+        &app,
+        "update_profile",
+        serde_json::json!({
+            "id": plan.profile_id,
+            "patch": { "ssh_connection_id": id }
+        }),
+    );
+    assert_eq!(
+        attached["ssh_connection_id"], created["id"],
+        "the profile must carry the reference, not the endpoint: {attached}"
+    );
+    assert!(
+        attached.get("ssh").is_none(),
+        "no embedded copy may survive the boundary: {attached}"
+    );
+}
+
+#[test]
+fn omitting_the_jump_host_keeps_it_and_an_explicit_null_removes_it() {
+    // Presence versus value is decided by serde at exactly this boundary, and
+    // it is the difference between "leave the bastion alone" and "drop it".
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (store, path, _dir, _plan) = rt.block_on(seeded());
+    let app = app_with(store, path);
+
+    let jump = create_ssh(&app, "jump", None);
+    let jump_id: uuid::Uuid = serde_json::from_value(jump["id"].clone()).unwrap();
+    let conn = create_ssh(&app, "db-host", Some(jump_id));
+    let id: uuid::Uuid = serde_json::from_value(conn["id"].clone()).unwrap();
+    assert_eq!(conn["jump_host_id"], jump["id"]);
+
+    // A rename that says nothing about the bastion must not silently drop it.
+    let renamed = invoke(
+        &app,
+        "update_ssh_connection",
+        serde_json::json!({ "id": id, "patch": { "name": "db-host-2" } }),
+    );
+    assert_eq!(renamed["name"], "db-host-2");
+    assert_eq!(
+        renamed["jump_host_id"], jump["id"],
+        "an omitted key means unchanged: {renamed}"
+    );
+
+    let detached = invoke(
+        &app,
+        "update_ssh_connection",
+        serde_json::json!({ "id": id, "patch": { "jump_host_id": null } }),
+    );
+    assert_eq!(
+        detached["jump_host_id"],
+        serde_json::Value::Null,
+        "an explicit null means remove: {detached}"
+    );
+}
+
+#[test]
+fn a_connection_in_use_is_refused_and_the_error_names_what_uses_it() {
+    // "Cannot delete" without saying what holds it is the kind of error that
+    // sends someone clicking through every profile to find out.
+    //
+    // Keychain-free: the refusal happens before any secret is touched.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (store, path, _dir, plan) = rt.block_on(seeded());
+    let app = app_with(store, path);
+
+    let conn = create_ssh(&app, "bastion", None);
+    let id: uuid::Uuid = serde_json::from_value(conn["id"].clone()).unwrap();
+
+    invoke(
+        &app,
+        "update_profile",
+        serde_json::json!({
+            "id": plan.profile_id,
+            "patch": { "ssh_connection_id": id }
+        }),
+    );
+
+    let error = invoke_err(
+        &app,
+        "delete_ssh_connection",
+        serde_json::json!({ "id": id }),
+    );
+    assert_eq!(error["kind"], "invalid", "got {error}");
+    assert!(
+        error["message"].as_str().unwrap().contains("src"),
+        "the error must name the profile holding it: {error}"
+    );
+
+    // Still there, and still attached.
+    let listed = invoke(&app, "list_ssh_connections", serde_json::json!({}));
+    assert_eq!(listed.as_array().map(Vec::len), Some(1), "got {listed}");
+}
+
+#[test]
+fn two_connections_cannot_share_a_name() {
+    // Names are how a shared config refers to a tunnel on another machine, so
+    // a duplicate is ambiguous rather than merely untidy.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (store, path, _dir, _plan) = rt.block_on(seeded());
+    let app = app_with(store, path);
+
+    create_ssh(&app, "bastion", None);
+    let error = invoke_err(
+        &app,
+        "create_ssh_connection",
+        serde_json::json!({
+            "input": { "name": "bastion", "endpoint": endpoint("other.example.com") },
+            "passphrase": null
+        }),
+    );
+    assert_eq!(error["kind"], "duplicate_name", "got {error}");
 }
 
 #[test]

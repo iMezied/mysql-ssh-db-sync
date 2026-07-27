@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::profile::{SshAuth, SshConfig, SshEndpoint};
+use crate::sshconn::{SshAuth, SshConfig, SshEndpoint};
 
 /// Identity of a server's host key, as shown to the user for confirmation.
 #[derive(Debug, Clone, PartialEq, Eq)]

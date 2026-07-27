@@ -8,6 +8,7 @@ import {
   DownloadCloud,
   EyeOff,
   ListChecks,
+  Server,
   Settings,
   UploadCloud,
 } from "lucide-react";
@@ -16,6 +17,7 @@ import { cn } from "@/lib/utils";
 
 const links = [
   { to: "/profiles", label: "Connections", icon: Database },
+  { to: "/ssh", label: "SSH servers", icon: Server },
   { to: "/backup", label: "Backup", icon: DownloadCloud },
   { to: "/restore", label: "Restore", icon: UploadCloud },
   { to: "/sync", label: "Sync", icon: ArrowLeftRight },

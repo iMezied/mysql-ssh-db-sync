@@ -41,6 +41,12 @@ struct Cli {
 enum Command {
     /// List connection profiles.
     Profiles,
+    /// List saved SSH servers and what tunnels through them.
+    ///
+    /// Read-only, like `profiles`. Creating one belongs in the desktop app,
+    /// where an unrecognised host key can be verified before it is pinned —
+    /// a prompt this command has no way to answer from cron.
+    Ssh,
     /// List recent job history.
     Jobs {
         #[arg(long, default_value_t = 20)]
@@ -508,13 +514,13 @@ async fn main() -> Result<()> {
         Command::Doctor => {
             eprintln!("dbsync {ENGINE_VERSION}");
             eprintln!("store: {}", store_path.display());
-            let store = Store::open(&store_path).await?;
+            let store = open_store(&store_path).await?;
             let profiles = store.list_profiles().await?;
             eprintln!("profiles: {}", profiles.len());
             store.close().await;
         }
         Command::Profiles => {
-            let store = Store::open(&store_path).await?;
+            let store = open_store(&store_path).await?;
             let profiles = store.list_profiles().await?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&profiles)?);
@@ -536,8 +542,49 @@ async fn main() -> Result<()> {
             }
             store.close().await;
         }
+        Command::Ssh => {
+            let store = open_store(&store_path).await?;
+            let connections = store.list_ssh_connections().await?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&connections)?);
+            } else if connections.is_empty() {
+                eprintln!("no SSH servers saved");
+            } else {
+                let by_id: std::collections::HashMap<_, _> =
+                    connections.iter().map(|c| (c.id, c.name.as_str())).collect();
+                for c in &connections {
+                    // Named, not counted: the reason to look at this list is
+                    // usually "what breaks if I change this one".
+                    let used_by = store.profiles_using_ssh_connection(c.id).await?;
+                    let used = if used_by.is_empty() {
+                        "unused".to_string()
+                    } else {
+                        used_by
+                            .iter()
+                            .map(|p| p.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    let via = match c.jump_host_id.and_then(|id| by_id.get(&id)) {
+                        Some(name) => format!(" via {name}"),
+                        None => String::new(),
+                    };
+                    println!(
+                        "{}  {:<24} {}@{}:{}{}  [{}]",
+                        c.id,
+                        c.name,
+                        c.endpoint.user,
+                        c.endpoint.host,
+                        c.endpoint.port,
+                        via,
+                        used
+                    );
+                }
+            }
+            store.close().await;
+        }
         Command::Jobs { limit } => {
-            let store = Store::open(&store_path).await?;
+            let store = open_store(&store_path).await?;
             let jobs = store.list_jobs(limit).await?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&jobs)?);
@@ -559,7 +606,7 @@ async fn main() -> Result<()> {
             store.close().await;
         }
         Command::Schedule(cmd) => {
-            let store = Store::open(&store_path).await?;
+            let store = open_store(&store_path).await?;
             let result = run_schedule_command(cmd, &store, cli.json).await;
             store.close().await;
             result?;
@@ -570,7 +617,7 @@ async fn main() -> Result<()> {
             deep,
             keep_on_failure,
         } => {
-            let store = Store::open(&store_path).await?;
+            let store = open_store(&store_path).await?;
             let result = run_drill(&store, &profile, dir, deep, keep_on_failure, cli.json).await;
             store.close().await;
             result?;
@@ -585,7 +632,7 @@ async fn main() -> Result<()> {
             no_compress,
             count_rows,
         } => {
-            let store = Store::open(&store_path).await?;
+            let store = open_store(&store_path).await?;
             let result = run_backup(
                 &store,
                 BackupArgs {
@@ -605,7 +652,7 @@ async fn main() -> Result<()> {
             result?;
         }
         Command::Audit { limit } => {
-            let store = Store::open(&store_path).await?;
+            let store = open_store(&store_path).await?;
             let entries = store.list_audit(limit).await;
             store.close().await;
             let entries = entries?;
@@ -705,7 +752,7 @@ async fn main() -> Result<()> {
             jobs,
             clean,
         } => {
-            let store = Store::open(&store_path).await?;
+            let store = open_store(&store_path).await?;
             let result = run_restore(
                 &store,
                 RestoreArgs {
@@ -727,31 +774,31 @@ async fn main() -> Result<()> {
             result?;
         }
         Command::Mask(cmd) => {
-            let store = Store::open(&store_path).await?;
+            let store = open_store(&store_path).await?;
             let result = run_mask_command(cmd, &store, cli.json).await;
             store.close().await;
             result?;
         }
         Command::Key(cmd) => {
-            let store = Store::open(&store_path).await?;
+            let store = open_store(&store_path).await?;
             let result = run_key_command(cmd, &store).await;
             store.close().await;
             result?;
         }
         Command::Config(cmd) => {
-            let store = Store::open(&store_path).await?;
+            let store = open_store(&store_path).await?;
             let result = run_config_command(cmd, &store).await;
             store.close().await;
             result?;
         }
         Command::Destination(cmd) => {
-            let store = Store::open(&store_path).await?;
+            let store = open_store(&store_path).await?;
             let result = run_destination_command(cmd, &store, cli.json).await;
             store.close().await;
             result?;
         }
         Command::Daemon { interval } => {
-            let store = Store::open(&store_path).await?;
+            let store = open_store(&store_path).await?;
             let (event_tx, _rx) = create_event_channel(EVENT_CHANNEL_CAPACITY);
 
             let scheduler = Scheduler::new(store.clone(), JobRegistry::new(), event_tx.clone())
@@ -1255,6 +1302,32 @@ async fn run_restore(store: &Store, args: RestoreArgs<'_>, json: bool) -> Result
         );
     }
     Ok(())
+}
+
+/// Open the shared store, upgrading anything an older version left behind.
+///
+/// The GUI does the same on start. Whichever the user opens first performs the
+/// adoption of inline SSH configs into saved connections; the other finds
+/// nothing to do. Doing it in only one of the two would mean the CLI reading a
+/// half-migrated store, which is worse than either doing it or not.
+async fn open_store(path: &std::path::Path) -> Result<Store> {
+    let store = Store::open(path).await?;
+
+    match db_sync_engine::sshconn::adopt_legacy_configs(&store).await {
+        Ok(adopted) => {
+            for a in &adopted {
+                eprintln!(
+                    "upgraded: {} now tunnels through the saved SSH connection {:?}",
+                    a.profile_name, a.ssh_connection_name
+                );
+            }
+        }
+        // Reported, not fatal: the original configuration is still on the
+        // profiles, so the next run can try again.
+        Err(e) => eprintln!("warning: could not adopt inline SSH configurations: {e}"),
+    }
+
+    Ok(store)
 }
 
 /// Find a profile by id or by a unique prefix of its name.
