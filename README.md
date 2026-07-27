@@ -12,8 +12,27 @@ desktop app for DBAs, plus a headless CLI that does exactly the same things.
 
 ---
 
+## Documentation
+
+Full documentation lives in **[docs/](docs/README.md)**, organised by role:
+
+| You are | Start here |
+|---|---|
+| Evaluating this | [For decision makers](docs/roles/decision-makers.md) |
+| Running it | [For operators](docs/roles/operators.md) · [First backup](docs/tutorials/01-first-backup.md) |
+| Working on the code | [For developers](docs/roles/developers.md) · [Architecture](docs/explanation/architecture.md) |
+| Reviewing it for security | [For security reviewers](docs/roles/security-reviewers.md) · [Security model](docs/explanation/security-model.md) |
+
+Plus [concepts](docs/concepts.md), eleven [how-to guides](docs/README.md#how-to-guides--task-oriented),
+and complete [CLI](docs/reference/cli.md), [IPC](docs/reference/ipc-api.md) and
+[data model](docs/reference/data-model.md) reference. This README stays focused
+on building and packaging the project itself.
+
+---
+
 ## Contents
 
+- [Documentation](#documentation)
 - [Why](#why)
 - [Architecture](#architecture)
 - [How a backup job flows through the system](#how-a-backup-job-flows-through-the-system)
