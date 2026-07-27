@@ -48,6 +48,17 @@ enum Command {
     },
     /// Report the resolved store path and engine version.
     Doctor,
+    /// Summarise the backup library: sizes, growth, and backups that shrank.
+    ///
+    /// Exits non-zero when a backup came out dramatically smaller than the one
+    /// before it, so this is usable as a cron check. That is the failure
+    /// nothing else notices: the artifact is valid, its checksum matches, and
+    /// it restores — it is only wrong relative to yesterday.
+    Library {
+        /// Directory holding the backups. Defaults to the app's backup folder.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
     /// Strip `DEFINER=` clauses from a MySQL dump on stdin, writing to stdout.
     ///
     /// Useful on its own for repairing an existing dump that fails to restore
@@ -554,6 +565,73 @@ async fn main() -> Result<()> {
             store.close().await;
             result?;
         }
+        Command::Library { dir } => {
+            let directory = match dir {
+                Some(d) => d,
+                None => db_sync_engine::paths::app_data_dir()
+                    .context("could not determine the backup directory")?
+                    .join("backups"),
+            };
+            let stats = db_sync_engine::library::stats(&directory);
+
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&stats)?);
+            } else {
+                println!(
+                    "{} artifact(s), {} across {} database(s)",
+                    stats.total_artifacts,
+                    human_bytes(stats.total_bytes),
+                    stats.databases.len()
+                );
+                if stats.unattributed > 0 {
+                    println!(
+                        "{} without a manifest ({})",
+                        stats.unattributed,
+                        human_bytes(stats.unattributed_bytes)
+                    );
+                }
+                println!();
+                for d in &stats.databases {
+                    println!(
+                        "{:<24} {:>10} latest  {:>10} total  {:>3} artifact(s)  {}",
+                        truncate(&d.database, 24),
+                        human_bytes(d.newest_bytes),
+                        human_bytes(d.total_bytes),
+                        d.artifacts,
+                        match d.bytes_per_day {
+                            None => "no trend yet".to_string(),
+                            Some(rate) if rate.abs() < 1024.0 => "flat".to_string(),
+                            Some(rate) => format!(
+                                "{}{}/day",
+                                if rate > 0.0 { "+" } else { "-" },
+                                human_bytes(rate.abs() as u64)
+                            ),
+                        }
+                    );
+                }
+            }
+
+            let shrinks = stats.all_shrinks();
+            if !shrinks.is_empty() {
+                eprintln!();
+                for s in &shrinks {
+                    eprintln!(
+                        "SHRANK: {} is {} ({:.0}% of {}, which was {})",
+                        s.filename,
+                        human_bytes(s.bytes),
+                        s.percent_of_previous(),
+                        s.previous_filename,
+                        human_bytes(s.previous_bytes)
+                    );
+                }
+                bail!(
+                    "{} backup(s) came out far smaller than the one before — usually a table \
+                     that stopped being selected, a truncated dump, or a row filter matching \
+                     nothing",
+                    shrinks.len()
+                );
+            }
+        }
         Command::Restore {
             profile,
             artifact,
@@ -919,6 +997,22 @@ fn default_backup_options(
 }
 
 // ── Restore ─────────────────────────────────────────────────────────────
+
+/// Bytes at a size a person reads, for table output.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
 
 /// Grouped so the call site is not eleven positional arguments.
 struct RestoreArgs<'a> {

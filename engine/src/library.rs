@@ -77,6 +77,208 @@ fn describe(path: &Path) -> Option<Artifact> {
     })
 }
 
+// ── Analytics ───────────────────────────────────────────────────────────
+
+/// How much smaller than its predecessor an artifact may be before it is
+/// called out.
+///
+/// Not a guess at a "normal" growth rate — backups do legitimately shrink when
+/// rows are archived or a table is dropped. It is set where a *halving* trips
+/// it, because the failures worth catching are categorical rather than
+/// gradual: a table that stopped being selected, a dump that was truncated, a
+/// `--where` filter that started matching nothing. Those roughly halve a file
+/// or worse; a month of deletions does not.
+pub const SHRINK_RATIO: f64 = 0.5;
+
+/// Artifacts smaller than this are not compared at all.
+///
+/// A 300-byte schema-only dump next to a 200-byte one is a 33% "shrink" and
+/// means nothing. Comparing them would produce warnings nobody can act on,
+/// which is how a warning stops being read.
+pub const SHRINK_FLOOR_BYTES: u64 = 64 * 1024;
+
+/// One artifact's size at a point in time.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct SizePoint {
+    pub at: DateTime<Utc>,
+    #[specta(type = f64)]
+    pub bytes: u64,
+    pub filename: String,
+}
+
+/// A backup that came out dramatically smaller than the one before it.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct ShrinkWarning {
+    pub filename: String,
+    pub at: DateTime<Utc>,
+    #[specta(type = f64)]
+    pub bytes: u64,
+    pub previous_filename: String,
+    #[specta(type = f64)]
+    pub previous_bytes: u64,
+}
+
+impl ShrinkWarning {
+    /// How much of the previous artifact's size this one is, as a percentage.
+    pub fn percent_of_previous(&self) -> f64 {
+        if self.previous_bytes == 0 {
+            return 100.0;
+        }
+        (self.bytes as f64 / self.previous_bytes as f64) * 100.0
+    }
+}
+
+/// What the library holds for one database.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct DatabaseStats {
+    pub database: String,
+    pub engine: Option<Engine>,
+    #[specta(type = f64)]
+    pub artifacts: usize,
+    #[specta(type = f64)]
+    pub total_bytes: u64,
+    #[specta(type = f64)]
+    pub newest_bytes: u64,
+    pub newest_at: DateTime<Utc>,
+    pub oldest_at: DateTime<Utc>,
+    /// Oldest first, so a chart reads left to right.
+    pub series: Vec<SizePoint>,
+    /// Average change per day across the whole span.
+    ///
+    /// `None` with fewer than two artifacts, or when they share a timestamp —
+    /// there is no rate to report, and inventing one from a single point is
+    /// the kind of number that gets quoted back later as if it meant
+    /// something.
+    pub bytes_per_day: Option<f64>,
+    pub shrinks: Vec<ShrinkWarning>,
+}
+
+/// Everything the library page reports.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct LibraryStats {
+    #[specta(type = f64)]
+    pub total_artifacts: usize,
+    #[specta(type = f64)]
+    pub total_bytes: u64,
+    /// Artifacts with no readable manifest, so no database to group under.
+    ///
+    /// Reported rather than dropped: they still take up space, and a library
+    /// whose totals silently exclude them would understate what is on disk.
+    #[specta(type = f64)]
+    pub unattributed: usize,
+    #[specta(type = f64)]
+    pub unattributed_bytes: u64,
+    /// Largest total first — the one filling the disk is the one to look at.
+    pub databases: Vec<DatabaseStats>,
+}
+
+impl LibraryStats {
+    /// Every shrink warning across every database, newest first.
+    pub fn all_shrinks(&self) -> Vec<&ShrinkWarning> {
+        let mut all: Vec<&ShrinkWarning> = self
+            .databases
+            .iter()
+            .flat_map(|d| d.shrinks.iter())
+            .collect();
+        all.sort_by_key(|s| std::cmp::Reverse(s.at));
+        all
+    }
+}
+
+/// Summarise a directory of artifacts.
+pub fn stats(dir: impl AsRef<Path>) -> LibraryStats {
+    summarise(list_artifacts(dir))
+}
+
+/// The pure half, so the arithmetic is testable without a filesystem.
+pub fn summarise(artifacts: Vec<Artifact>) -> LibraryStats {
+    let total_artifacts = artifacts.len();
+    let total_bytes = artifacts.iter().map(|a| a.size_bytes).sum();
+
+    let mut grouped: std::collections::BTreeMap<String, Vec<Artifact>> =
+        std::collections::BTreeMap::new();
+    let mut unattributed = 0usize;
+    let mut unattributed_bytes = 0u64;
+
+    for artifact in artifacts {
+        match artifact.database.clone() {
+            Some(database) => grouped.entry(database).or_default().push(artifact),
+            None => {
+                unattributed += 1;
+                unattributed_bytes += artifact.size_bytes;
+            }
+        }
+    }
+
+    let mut databases: Vec<DatabaseStats> = grouped
+        .into_iter()
+        .map(|(database, group)| database_stats(database, group))
+        .collect();
+
+    // Largest first: the question this answers is "what is filling the disk".
+    databases.sort_by_key(|d| std::cmp::Reverse(d.total_bytes));
+
+    LibraryStats {
+        total_artifacts,
+        total_bytes,
+        unattributed,
+        unattributed_bytes,
+        databases,
+    }
+}
+
+fn database_stats(database: String, mut group: Vec<Artifact>) -> DatabaseStats {
+    // Oldest first for both the series and the shrink comparison: "smaller
+    // than the one before it" only means anything in chronological order.
+    group.sort_by_key(|a| a.modified_at);
+
+    let series: Vec<SizePoint> = group
+        .iter()
+        .map(|a| SizePoint {
+            at: a.modified_at,
+            bytes: a.size_bytes,
+            filename: a.filename.clone(),
+        })
+        .collect();
+
+    let mut shrinks = Vec::new();
+    for pair in group.windows(2) {
+        let (previous, current) = (&pair[0], &pair[1]);
+        if previous.size_bytes < SHRINK_FLOOR_BYTES {
+            continue;
+        }
+        if (current.size_bytes as f64) < previous.size_bytes as f64 * SHRINK_RATIO {
+            shrinks.push(ShrinkWarning {
+                filename: current.filename.clone(),
+                at: current.modified_at,
+                bytes: current.size_bytes,
+                previous_filename: previous.filename.clone(),
+                previous_bytes: previous.size_bytes,
+            });
+        }
+    }
+
+    let oldest = group.first().expect("a group is never empty");
+    let newest = group.last().expect("a group is never empty");
+
+    let span_days = (newest.modified_at - oldest.modified_at).num_seconds() as f64 / 86_400.0;
+    let bytes_per_day = (group.len() > 1 && span_days > 0.0)
+        .then(|| (newest.size_bytes as f64 - oldest.size_bytes as f64) / span_days);
+
+    DatabaseStats {
+        database,
+        engine: newest.engine,
+        artifacts: group.len(),
+        total_bytes: group.iter().map(|a| a.size_bytes).sum(),
+        newest_bytes: newest.size_bytes,
+        newest_at: newest.modified_at,
+        oldest_at: oldest.modified_at,
+        series,
+        bytes_per_day,
+        shrinks,
+    }
+}
+
 /// Result of checking an artifact against its manifest.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "snake_case", tag = "status")]
@@ -301,5 +503,169 @@ mod tests {
             only.exists(),
             "a policy must not leave the user with nothing"
         );
+    }
+
+    // ── Analytics ───────────────────────────────────────────────────────
+
+    fn artifact_at(database: Option<&str>, name: &str, bytes: u64, days_ago: i64) -> Artifact {
+        Artifact {
+            path: format!("/backups/{name}"),
+            filename: name.into(),
+            size_bytes: bytes,
+            modified_at: Utc::now() - chrono::Duration::days(days_ago),
+            database: database.map(str::to_string),
+            engine: Some(Engine::Mysql),
+            source_profile_name: Some("prod".into()),
+            table_count: Some(10),
+            tables_with_data: Some(8),
+            has_manifest: database.is_some(),
+        }
+    }
+
+    const MB: u64 = 1024 * 1024;
+
+    #[test]
+    fn artifacts_are_grouped_by_database_and_sorted_by_size() {
+        let stats = summarise(vec![
+            artifact_at(Some("small"), "small_1.sql.gz", MB, 1),
+            artifact_at(Some("big"), "big_1.sql.gz", 10 * MB, 2),
+            artifact_at(Some("big"), "big_2.sql.gz", 12 * MB, 1),
+        ]);
+
+        assert_eq!(stats.total_artifacts, 3);
+        assert_eq!(stats.total_bytes, 23 * MB);
+        assert_eq!(stats.databases.len(), 2);
+        assert_eq!(
+            stats.databases[0].database, "big",
+            "largest first — the one filling the disk is the one to look at"
+        );
+        assert_eq!(stats.databases[0].artifacts, 2);
+        assert_eq!(stats.databases[0].total_bytes, 22 * MB);
+        assert_eq!(stats.databases[0].newest_bytes, 12 * MB);
+    }
+
+    #[test]
+    fn artifacts_without_a_manifest_are_counted_not_dropped() {
+        // They still take up space. Totals that silently excluded them would
+        // understate what is actually on the disk.
+        let stats = summarise(vec![
+            artifact_at(Some("app"), "app.sql.gz", 5 * MB, 1),
+            artifact_at(None, "mystery.sql.gz", 3 * MB, 1),
+        ]);
+
+        assert_eq!(stats.total_bytes, 8 * MB);
+        assert_eq!(stats.unattributed, 1);
+        assert_eq!(stats.unattributed_bytes, 3 * MB);
+        assert_eq!(stats.databases.len(), 1);
+    }
+
+    #[test]
+    fn the_series_runs_oldest_first() {
+        // Both the chart and the shrink comparison depend on it: "smaller than
+        // the one before" only means anything in chronological order.
+        let stats = summarise(vec![
+            artifact_at(Some("app"), "newest.sql.gz", 3 * MB, 1),
+            artifact_at(Some("app"), "oldest.sql.gz", MB, 30),
+            artifact_at(Some("app"), "middle.sql.gz", 2 * MB, 15),
+        ]);
+
+        let names: Vec<&str> = stats.databases[0]
+            .series
+            .iter()
+            .map(|p| p.filename.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["oldest.sql.gz", "middle.sql.gz", "newest.sql.gz"]
+        );
+    }
+
+    #[test]
+    fn a_halved_backup_is_flagged() {
+        // The failure worth catching: a table stopped being selected, a dump
+        // was truncated, a WHERE filter started matching nothing.
+        let stats = summarise(vec![
+            artifact_at(Some("app"), "full.sql.gz", 100 * MB, 2),
+            artifact_at(Some("app"), "truncated.sql.gz", 20 * MB, 1),
+        ]);
+
+        let shrinks = &stats.databases[0].shrinks;
+        assert_eq!(shrinks.len(), 1);
+        assert_eq!(shrinks[0].filename, "truncated.sql.gz");
+        assert_eq!(shrinks[0].previous_filename, "full.sql.gz");
+        assert_eq!(shrinks[0].percent_of_previous().round(), 20.0);
+    }
+
+    #[test]
+    fn ordinary_shrinkage_is_not_flagged() {
+        // Backups legitimately get smaller when rows are archived. Warning on
+        // that is how a warning stops being read.
+        let stats = summarise(vec![
+            artifact_at(Some("app"), "a.sql.gz", 100 * MB, 3),
+            artifact_at(Some("app"), "b.sql.gz", 90 * MB, 2),
+            artifact_at(Some("app"), "c.sql.gz", 80 * MB, 1),
+        ]);
+        assert!(stats.databases[0].shrinks.is_empty());
+    }
+
+    #[test]
+    fn tiny_artifacts_are_not_compared_at_all() {
+        // A 300-byte schema-only dump next to a 200-byte one is a 33% shrink
+        // and means nothing.
+        let stats = summarise(vec![
+            artifact_at(Some("app"), "a.sql.gz", 300, 2),
+            artifact_at(Some("app"), "b.sql.gz", 100, 1),
+        ]);
+        assert!(
+            stats.databases[0].shrinks.is_empty(),
+            "below the floor there is no signal, only noise"
+        );
+    }
+
+    #[test]
+    fn growth_is_reported_per_day_across_the_span() {
+        let stats = summarise(vec![
+            artifact_at(Some("app"), "a.sql.gz", 100 * MB, 10),
+            artifact_at(Some("app"), "b.sql.gz", 200 * MB, 0),
+        ]);
+
+        let per_day = stats.databases[0]
+            .bytes_per_day
+            .expect("two points, ten days");
+        // 100 MB over 10 days.
+        assert!(
+            (per_day - (10 * MB) as f64).abs() < (MB as f64) * 0.1,
+            "got {per_day}"
+        );
+    }
+
+    #[test]
+    fn a_single_artifact_reports_no_growth_rate() {
+        // Inventing a rate from one point produces a number that gets quoted
+        // back later as if it meant something.
+        let stats = summarise(vec![artifact_at(Some("app"), "only.sql.gz", 5 * MB, 1)]);
+        assert_eq!(stats.databases[0].bytes_per_day, None);
+    }
+
+    #[test]
+    fn an_empty_library_summarises_to_nothing_rather_than_panicking() {
+        let stats = summarise(Vec::new());
+        assert_eq!(stats.total_artifacts, 0);
+        assert_eq!(stats.total_bytes, 0);
+        assert!(stats.databases.is_empty());
+    }
+
+    #[test]
+    fn every_shrink_is_reachable_from_the_top_level_newest_first() {
+        let stats = summarise(vec![
+            artifact_at(Some("a"), "a1.sql.gz", 100 * MB, 4),
+            artifact_at(Some("a"), "a2.sql.gz", 10 * MB, 3),
+            artifact_at(Some("b"), "b1.sql.gz", 100 * MB, 2),
+            artifact_at(Some("b"), "b2.sql.gz", 10 * MB, 1),
+        ]);
+
+        let all = stats.all_shrinks();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].filename, "b2.sql.gz", "newest first");
     }
 }

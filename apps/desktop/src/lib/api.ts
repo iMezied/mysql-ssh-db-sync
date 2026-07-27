@@ -97,6 +97,9 @@ export const api = {
   /** Writes the secret to a file and returns the path. It never returns the key. */
   exportBackupKeyToFile: () => unwrap(commands.exportBackupKeyToFile()),
 
+  libraryStats: (directory: string | null = null) =>
+    unwrap(commands.libraryStats(directory)),
+
   listDestinations: () => unwrap(commands.listDestinations()),
   /** The secret goes in and is never returned; it lands in the OS keychain. */
   createDestination: (...args: Parameters<typeof commands.createDestination>) =>

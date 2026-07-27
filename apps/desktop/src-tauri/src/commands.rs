@@ -1173,6 +1173,17 @@ mod tests {
     }
 }
 
+/// Size and growth across the backup library.
+#[tauri::command]
+#[specta::specta]
+pub async fn library_stats(directory: Option<String>) -> CmdResult<library::LibraryStats> {
+    let dir = match directory {
+        Some(d) => PathBuf::from(d),
+        None => default_backup_dir(),
+    };
+    Ok(library::stats(dir))
+}
+
 // ── Off-site destinations ───────────────────────────────────────────────
 
 /// A destination as the UI sees it.

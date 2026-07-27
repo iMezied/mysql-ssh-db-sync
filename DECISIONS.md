@@ -1441,3 +1441,37 @@ The three states are distinct in the report, which is the point:
   record counts and how to change that
 
 A missing table is a failure in all three.
+
+## M12 — The useful part of library analytics is the shrink warning
+
+Size totals and a growth line are worth showing, but they are reporting. The
+part that catches something is noticing that a backup came out at a fraction of
+the one before it.
+
+That failure is invisible to everything else in this application. The artifact
+is valid. Its checksum matches. A restore of it succeeds, and a drill of it
+passes. It is only wrong *relative to yesterday* — which is exactly what
+happens when a table stops being selected, a dump is truncated, or a `--where`
+filter starts matching nothing.
+
+Two thresholds keep it from becoming noise:
+
+- **`SHRINK_RATIO` is 0.5.** Not an attempt to model normal growth — backups
+  legitimately shrink when rows are archived. It is set where a *halving* trips
+  it because the failures worth catching are categorical rather than gradual. A
+  month of deletions does not halve a file; a dropped table does.
+- **`SHRINK_FLOOR_BYTES` is 64 KiB.** A 300-byte schema-only dump next to a
+  200-byte one is a 33% shrink and means nothing. Warning on it is how a
+  warning stops being read.
+
+`dbsync library` exits non-zero when any artifact trips this, so it is usable
+as a cron check rather than only a screen.
+
+Two smaller decisions:
+
+- **Artifacts with no manifest are counted, not dropped.** They occupy the same
+  disk. A total that quietly excluded them would understate what is there,
+  which is the sort of number someone plans capacity against.
+- **A single artifact reports no growth rate at all**, rather than zero.
+  Inventing a rate from one point produces a number that gets quoted back later
+  as if it meant something.

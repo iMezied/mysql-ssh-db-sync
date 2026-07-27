@@ -389,6 +389,12 @@ dbsync destination test              # exits non-zero if any is unusable
 dbsync destination push backup.sql.gz   # backfill or retry one artifact
 ```
 
+`dbsync library` summarises what is on disk — sizes, per-day growth, and any
+backup that came out far smaller than the one before it. It exits non-zero on
+that last one, so it works as a cron check. That failure is invisible to
+everything else in the app: the artifact is valid, its checksum matches and it
+restores. It is only wrong relative to yesterday.
+
 The desktop app has the same thing under **Off-site**, with presets for S3, R2,
 B2 and MinIO. The Library page's *Send off-site* button is the `push` command.
 A destination with no stored credential is called out in red there, because it
@@ -643,10 +649,9 @@ a schedule that comes due, moves data, verifies it, and enforces retention.
 | **M8** | Restore drills — proving an artifact restores, on a schedule | **Done** |
 | **M9** | Column-level masking on the destination, with a verified read-back | **Done** |
 | **M10** | Off-site destinations: S3-compatible upload, credentials, off-site retention, CLI and GUI | **Done** |
-| **M12** | Slack and Teams webhook rendering | **Partly** — library analytics outstanding |
+| **M12** | Slack and Teams webhook rendering, library size and growth analytics | **Done** |
 
-Outstanding: team features (M13), MongoDB and SQL Server (M14), and library
-size/growth analytics.
+Outstanding: team features (M13) and MongoDB / SQL Server (M14).
 
 A drill compares exact row counts only when the backup recorded them
 (`--count-rows`, or the toggle on the Backup and Schedules pages). Without

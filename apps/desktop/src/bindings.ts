@@ -140,6 +140,8 @@ export const commands = {
 	schedulerStatus: () => typedError<SchedulerStatus, CommandError>(__TAURI_INVOKE("scheduler_status")),
 	getAppSettings: () => typedError<AppSettings, CommandError>(__TAURI_INVOKE("get_app_settings")),
 	setAppSettings: (next: AppSettings) => typedError<AppSettings, CommandError>(__TAURI_INVOKE("set_app_settings", { next })),
+	/**  Size and growth across the backup library. */
+	libraryStats: (directory: string | null) => typedError<LibraryStats, CommandError>(__TAURI_INVOKE("library_stats", { directory })),
 	listDestinations: () => typedError<DestinationView[], CommandError>(__TAURI_INVOKE("list_destinations")),
 	/**
 	 *  Create a destination and file its credential.
@@ -366,6 +368,29 @@ export type DatabaseInfo = {
 	collation: string | null,
 };
 
+/**  What the library holds for one database. */
+export type DatabaseStats = {
+	database: string,
+	engine: Engine | null,
+	artifacts: number | null,
+	total_bytes: number | null,
+	newest_bytes: number | null,
+	newest_at: string,
+	oldest_at: string,
+	/**  Oldest first, so a chart reads left to right. */
+	series: SizePoint[],
+	/**
+	 *  Average change per day across the whole span.
+	 * 
+	 *  `None` with fewer than two artifacts, or when they share a timestamp —
+	 *  there is no rate to report, and inventing one from a single point is
+	 *  the kind of number that gets quoted back later as if it meant
+	 *  something.
+	 */
+	bytes_per_day: number | null,
+	shrinks: ShrinkWarning[],
+};
+
 /**
  *  Database coordinates *as seen from the SSH host* (or from this machine when
  *  `ConnectionProfile::ssh` is `None`).
@@ -561,6 +586,22 @@ export type KeyStatus = {
 	public: string | null,
 	exported: boolean,
 	extra_recipients: string[],
+};
+
+/**  Everything the library page reports. */
+export type LibraryStats = {
+	total_artifacts: number | null,
+	total_bytes: number | null,
+	/**
+	 *  Artifacts with no readable manifest, so no database to group under.
+	 * 
+	 *  Reported rather than dropped: they still take up space, and a library
+	 *  whose totals silently exclude them would understate what is on disk.
+	 */
+	unattributed: number | null,
+	unattributed_bytes: number | null,
+	/**  Largest total first — the one filling the disk is the one to look at. */
+	databases: DatabaseStats[],
 };
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
@@ -1026,6 +1067,22 @@ export type SchedulerStatus = {
 export type SecretStatus = {
 	has_db_password: boolean,
 	has_ssh_passphrase: boolean,
+};
+
+/**  A backup that came out dramatically smaller than the one before it. */
+export type ShrinkWarning = {
+	filename: string,
+	at: string,
+	bytes: number | null,
+	previous_filename: string,
+	previous_bytes: number | null,
+};
+
+/**  One artifact's size at a point in time. */
+export type SizePoint = {
+	at: string,
+	bytes: number | null,
+	filename: string,
 };
 
 export type SshAuth = 
