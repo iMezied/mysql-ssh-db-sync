@@ -13,6 +13,7 @@ import type {
   Engine,
   EnvironmentTag,
   ProfileCreate,
+  SshConnection,
 } from "@/bindings";
 
 const ENV_STYLES: Record<EnvironmentTag, string> = {
@@ -129,6 +130,7 @@ export default function ProfilesPage() {
                   ? (sshNames.get(p.ssh_connection_id) ?? "an SSH server")
                   : null
               }
+              connections={sshConnections.data ?? []}
               onDelete={() => remove.mutate(p.id)}
               deleting={remove.isPending && remove.variables === p.id}
             />
@@ -343,11 +345,13 @@ export default function ProfilesPage() {
 function ProfileRow({
   profile,
   sshName,
+  connections,
   onDelete,
   deleting,
 }: {
   profile: ConnectionProfile;
   sshName: string | null;
+  connections: SshConnection[];
   onDelete: () => void;
   deleting: boolean;
 }) {
@@ -427,10 +431,74 @@ function ProfileRow({
       </div>
 
       {expanded && (
-        <div className="border-t border-slate-800 px-4 py-3">
+        <div className="space-y-4 border-t border-slate-800 px-4 py-3">
+          <TunnelSelect profile={profile} connections={connections} />
           <ConnectionTest profileId={profile.id} />
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * Re-points an existing connection at a different tunnel, or removes it.
+ *
+ * Only reachable once a connection exists, which is when the question actually
+ * comes up: a bastion is introduced, retired, or replaced long after the
+ * database it fronts was first configured.
+ */
+function TunnelSelect({
+  profile,
+  connections,
+}: {
+  profile: ConnectionProfile;
+  connections: SshConnection[];
+}) {
+  const queryClient = useQueryClient();
+  const [error, setError] = useState<string | null>(null);
+
+  const attach = useMutation({
+    // Presence is what carries the meaning here: an explicit null detaches,
+    // and omitting the key would leave the tunnel exactly as it was.
+    mutationFn: (id: string | null) =>
+      api.updateProfile(profile.id, { ssh_connection_id: id }),
+    onSuccess: async () => {
+      setError(null);
+      await queryClient.invalidateQueries({ queryKey: ["profiles"] });
+    },
+    onError: (e: unknown) =>
+      setError(e instanceof Error ? e.message : "Could not change the tunnel."),
+  });
+
+  return (
+    <div>
+      <label className="block max-w-md">
+        <span className="field-label">SSH tunnel</span>
+        <select
+          className="field-input"
+          disabled={attach.isPending}
+          value={profile.ssh_connection_id ?? ""}
+          onChange={(e) => attach.mutate(e.target.value || null)}
+        >
+          <option value="">No tunnel — connect directly</option>
+          {connections.map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.name} ({c.endpoint.user}@{c.endpoint.host})
+            </option>
+          ))}
+        </select>
+      </label>
+
+      <p className="mt-1.5 text-xs leading-relaxed text-slate-500">
+        {/* Said here rather than after the fact: the host field means a
+            different thing on each side of this change, and a tunnel added to
+            a working connection is the moment it silently stops working. */}
+        The host and port above are resolved <em>from the SSH server</em> when a
+        tunnel is set, and from this machine when it is not. Re-test the
+        connection after changing this.
+      </p>
+
+      {error && <p className="mt-2 text-xs text-red-400">{error}</p>}
     </div>
   );
 }

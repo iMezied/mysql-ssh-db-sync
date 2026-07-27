@@ -509,6 +509,77 @@ fn omitting_the_jump_host_keeps_it_and_an_explicit_null_removes_it() {
 }
 
 #[test]
+fn a_profile_can_be_re_pointed_and_detached_after_it_exists() {
+    // What the tunnel selector on an existing connection sends. A bastion is
+    // introduced, replaced or retired long after the database it fronts was
+    // configured, and `ProfileUpdate` carries that by presence too — a
+    // different struct from `SshConnectionUpdate`, so a different seam.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (store, path, _dir, plan) = rt.block_on(seeded());
+    let app = app_with(store, path);
+
+    let first = create_ssh(&app, "bastion", None);
+    let second = create_ssh(&app, "bastion-2", None);
+
+    let attached = invoke(
+        &app,
+        "update_profile",
+        serde_json::json!({
+            "id": plan.profile_id,
+            "patch": { "ssh_connection_id": first["id"] }
+        }),
+    );
+    assert_eq!(attached["ssh_connection_id"], first["id"]);
+
+    let moved = invoke(
+        &app,
+        "update_profile",
+        serde_json::json!({
+            "id": plan.profile_id,
+            "patch": { "ssh_connection_id": second["id"] }
+        }),
+    );
+    assert_eq!(moved["ssh_connection_id"], second["id"], "got {moved}");
+
+    // An edit that says nothing about the tunnel must not drop it — this is
+    // the patch every *other* form on that page sends.
+    let renamed = invoke(
+        &app,
+        "update_profile",
+        serde_json::json!({ "id": plan.profile_id, "patch": { "name": "src-2" } }),
+    );
+    assert_eq!(renamed["name"], "src-2");
+    assert_eq!(
+        renamed["ssh_connection_id"], second["id"],
+        "an omitted key means unchanged: {renamed}"
+    );
+
+    let detached = invoke(
+        &app,
+        "update_profile",
+        serde_json::json!({
+            "id": plan.profile_id,
+            "patch": { "ssh_connection_id": null }
+        }),
+    );
+    assert_eq!(
+        detached["ssh_connection_id"],
+        serde_json::Value::Null,
+        "an explicit null detaches: {detached}"
+    );
+
+    // And with nothing pointing at it, the connection can now be deleted.
+    assert_eq!(
+        invoke(
+            &app,
+            "delete_ssh_connection",
+            serde_json::json!({ "id": second["id"] })
+        ),
+        true
+    );
+}
+
+#[test]
 fn a_connection_in_use_is_refused_and_the_error_names_what_uses_it() {
     // "Cannot delete" without saying what holds it is the kind of error that
     // sends someone clicking through every profile to find out.
