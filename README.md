@@ -1,13 +1,13 @@
 # DBSync Studio
 
 Cross-server database backup, restore and sync for MySQL, PostgreSQL and
-MongoDB — a
-desktop app for DBAs, plus a headless CLI that does exactly the same things.
+MongoDB — a desktop app for DBAs, plus a headless CLI that does exactly the
+same things.
 
-> **Status: M15.** MySQL, PostgreSQL and MongoDB backup and restore work end to end over
-> SSH tunnels; cross-server sync runs as one job with verification and
-> retention. Scheduling, packaging, encryption at rest, content verification,
-> restore drills and column masking are in. See the
+> **Status: M15.** MySQL, PostgreSQL and MongoDB backup and restore work end
+> to end over SSH tunnels; cross-server sync runs as one job with verification
+> and retention. Scheduling, packaging, encryption at rest, content
+> verification, restore drills and column masking are in. See the
 > [roadmap](#roadmap) for what is outstanding. The original Bash tool in this
 > repo still works and is unchanged; see [Legacy tool](#legacy-tool).
 
@@ -160,24 +160,37 @@ must be able to do.
 ## Development setup
 
 Requires Rust (stable, edition 2024 — 1.85+), Node 20+, Docker for the
-integration fixtures, and the MySQL client tools.
+integration fixtures, and the client tools for whichever engines you use.
 
-The engine shells out to `mysqldump`/`mysql` and `pg_dump`/`pg_restore`/`psql`;
-they are never bundled (see [DECISIONS.md](DECISIONS.md) on the GPL
-implications for `mysqldump`).
+The engine shells out to `mysqldump`/`mysql`, `pg_dump`/`pg_restore`/`psql`
+and `mongodump`/`mongorestore`; none of them are ever bundled (see
+[DECISIONS.md](DECISIONS.md) on the GPL implications for `mysqldump`). Install
+only what you need — a MongoDB-only user needs none of the SQL clients.
 
 ```bash
-brew install mysql-client libpq        # macOS
-apt install mysql-client postgresql-client   # Debian
+brew install mysql-client libpq mongodb-database-tools        # macOS
 ```
 
-Homebrew installs both keg-only, which is fine — discovery searches those
-locations even though they are not on `PATH`.
+```bash
+apt install mysql-client postgresql-client mongodb-database-tools   # Debian
+```
+
+`mongodb-database-tools` comes from MongoDB's own tap on macOS
+(`brew tap mongodb/brew` first) and from their apt repository on Debian; it is
+not in either default index. `mysql-client` and `libpq` install keg-only, which
+is fine — discovery searches those locations even though they are not on
+`PATH`. A tool that cannot be found can also be pointed at explicitly, per
+connection, under **Tool overrides**.
 
 **Match the PostgreSQL client major version to the server you back up.** A
 newer `pg_dump` produces a dump an older server cannot restore: `pg_dump` 18
 emits `SET transaction_timeout = 0`, which PostgreSQL 16 rejects. The app warns
 when it detects this.
+
+**The MongoDB Database Tools are versioned separately from the server**, in
+their own `100.x` series, so there is no such match to make — a 100.13 client
+against a 7.0 server is the normal case. The app only warns if it finds a
+`mongodump` from before the tools were split out of the server at 4.4.
 
 ```bash
 cargo build --workspace
