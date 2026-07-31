@@ -15,7 +15,8 @@ use tokio_util::sync::CancellationToken;
 use super::{EngineRestoreOptions, MysqlRestoreOptions, RestoreError, RestoreRequest};
 use crate::backup::mysql::Endpoint;
 use crate::events::JobPhase;
-use crate::exec::{ChildHandle, ToolCommand, find_tool, wait_checked};
+use crate::exec::{ChildHandle, ToolCommand, wait_checked};
+use crate::tools::{ResolvedTool, Tool, ToolSource};
 use crate::job::JobContext;
 use crate::manifest::BackupManifest;
 use crate::profile::ConnectionProfile;
@@ -34,6 +35,8 @@ pub async fn run_mysql_restore(
     profile: &ConnectionProfile,
     request: &RestoreRequest,
     endpoint: Endpoint,
+    // Where the client binaries come from: this machine, or a container.
+    tools: &ToolSource,
     ctx: &JobContext,
 ) -> Result<String, RestoreError> {
     let manifest = BackupManifest::read(&request.artifact_path).ok();
@@ -75,11 +78,19 @@ pub async fn run_mysql_restore(
         });
     };
 
-    let mysql = find_tool("mysql", profile.tool_overrides.mysql.as_deref()).ok_or_else(|| {
-        RestoreError::Invalid(
-            "could not find the mysql client; install it or set an override".into(),
-        )
-    })?;
+    let mysql = ResolvedTool::resolve(Tool::Mysql, tools, profile.tool_overrides.mysql.as_deref())
+        .ok_or_else(|| {
+            RestoreError::Invalid(
+                "could not find the mysql client; install it or set an override".into(),
+            )
+        })?;
+
+    // Inside a container, loopback is the container rather than the host that
+    // holds the tunnel's local end. See `ToolSource::rewrite_host`.
+    let endpoint = Endpoint {
+        host: tools.rewrite_host(&endpoint.host),
+        ..endpoint
+    };
 
     // Corruption must be caught before a destination database is touched.
     if request.verify_checksum {
@@ -170,7 +181,7 @@ pub async fn run_mysql_restore(
 }
 
 struct RestoreWorker {
-    mysql: PathBuf,
+    mysql: ResolvedTool,
     endpoint: Endpoint,
     target: String,
     artifact: PathBuf,
@@ -205,7 +216,7 @@ impl RestoreWorker {
     }
 
     fn base_command(&self) -> ToolCommand {
-        let mut cmd = ToolCommand::new(self.mysql.display().to_string()).args([
+        let mut cmd = self.mysql.command().args([
             format!("--host={}", self.endpoint.host),
             format!("--port={}", self.endpoint.port),
             format!("--user={}", self.endpoint.user),
@@ -436,13 +447,20 @@ pub fn manifest_path_for(artifact: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tool pinned to a path that exists, so these fixtures never depend on
+    /// whether the client happens to be installed on the machine running the
+    /// tests. Only the rendered command line is under test.
+    fn local_tool(tool: Tool) -> ResolvedTool {
+        ResolvedTool::resolve(tool, &ToolSource::Local, Some("/bin/sh")).expect("/bin/sh exists")
+    }
     use crate::restore::TargetNaming;
     use secrecy::SecretString;
 
     fn worker(naming: &TargetNaming) -> RestoreWorker {
         RestoreWorker {
             identity: None,
-            mysql: PathBuf::from("/usr/bin/mysql"),
+            mysql: local_tool(Tool::Mysql),
             endpoint: Endpoint {
                 host: "127.0.0.1".into(),
                 port: 13307,

@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { Navigate, Route, Routes, useNavigate } from "react-router-dom";
 
 import Sidebar from "@/components/Sidebar";
@@ -14,9 +15,11 @@ import LibraryPage from "@/pages/LibraryPage";
 import DestinationsPage from "@/pages/DestinationsPage";
 import SettingsPage from "@/pages/SettingsPage";
 import { events } from "@/bindings";
+import { useProgressStore } from "@/lib/jobProgress";
 
 export default function App() {
   useTrayNavigation();
+  useJobProgressFeed();
 
   return (
     <div className="flex h-full">
@@ -40,6 +43,35 @@ export default function App() {
       </main>
     </div>
   );
+}
+
+/**
+ * Collect job progress for the whole app, not just the Jobs page.
+ *
+ * Subscribed here because the events keep arriving while the user is on some
+ * other page: starting a backup and then going to look at a connection should
+ * not mean coming back to a progress bar that missed the first two minutes.
+ */
+function useJobProgressFeed() {
+  const queryClient = useQueryClient();
+  const record = useProgressStore((s) => s.record);
+  const forget = useProgressStore((s) => s.forget);
+
+  useEffect(() => {
+    const progress = events.jobProgress.listen((e) => record(e.payload));
+    const finished = events.jobFinished.listen((e) => {
+      // The row's own outcome takes over from here, and keeping the last
+      // sample would leave a 98% bar next to a green "success".
+      forget(e.payload.job_id);
+      void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+      void queryClient.invalidateQueries({ queryKey: ["active-jobs"] });
+    });
+
+    return () => {
+      void progress.then((unlisten) => unlisten());
+      void finished.then((unlisten) => unlisten());
+    };
+  }, [queryClient, record, forget]);
 }
 
 /**

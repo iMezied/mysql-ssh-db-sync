@@ -863,6 +863,7 @@ async fn run_drill(
             keep_on_failure,
         },
         store,
+        &store.tool_source().await,
         &ctx,
     )
     .await
@@ -1014,7 +1015,8 @@ async fn run_backup(store: &Store, args: BackupArgs<'_>, json: bool) -> Result<(
     .await
     .map_err(|e| anyhow::anyhow!("could not record the job: {e}"))?;
 
-    let result = db_sync_engine::ops::backup(&profile, &request, store, &ctx).await;
+    let result = db_sync_engine::ops::backup(&profile, &request, store, &store.tool_source().await, &ctx)
+        .await;
 
     // The off-site copy is part of a backup, not an extra step, so a headless
     // run ships to the same destinations the app does.
@@ -1292,7 +1294,8 @@ async fn run_restore(store: &Store, args: RestoreArgs<'_>, json: bool) -> Result
     .await
     .map_err(|e| anyhow::anyhow!("could not record the job: {e}"))?;
 
-    let result = db_sync_engine::ops::restore(&profile, &request, store, &ctx).await;
+    let result = db_sync_engine::ops::restore(&profile, &request, store, &store.tool_source().await, &ctx)
+        .await;
 
     let outcome = match &result {
         Ok(_) => JobOutcome::Success,

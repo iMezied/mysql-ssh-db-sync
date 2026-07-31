@@ -226,6 +226,32 @@ export const commands = {
 	 *  trust than this feature is worth.
 	 */
 	installCli: () => typedError<CliInstall, CommandError>(__TAURI_INVOKE("install_cli")),
+	/**
+	 *  Look for every client binary through the configured source.
+	 * 
+	 *  On a blocking thread: probing versions runs each tool, and with a container
+	 *  source that means starting a container per tool. Holding the async runtime
+	 *  for that would freeze every other command, including the one drawing the
+	 *  spinner the user is looking at.
+	 */
+	discoverTools: () => typedError<ToolStatus[], CommandError>(__TAURI_INVOKE("discover_tools")),
+	/**
+	 *  The same, for a source the user is considering but has not saved.
+	 * 
+	 *  Separate from [`discover_tools`] so the settings page can answer "would
+	 *  this container work?" before committing to it — finding out by saving and
+	 *  then watching a backup fail is a much worse way to learn.
+	 */
+	testToolSource: (source: ToolSource) => typedError<ToolStatus[], CommandError>(__TAURI_INVOKE("test_tool_source", { source })),
+	/**  Running containers, for the exec source picker. */
+	listDockerContainers: () => typedError<DockerContainer[], CommandError>(__TAURI_INVOKE("list_docker_containers")),
+	/**
+	 *  Install a client with Homebrew.
+	 * 
+	 *  The formula is validated in the engine against the app's own list, so this
+	 *  cannot be talked into installing something else.
+	 */
+	installToolWithBrew: (formula: string) => typedError<string, CommandError>(__TAURI_INVOKE("install_tool_with_brew", { formula })),
 };
 
 /** Events */
@@ -269,6 +295,14 @@ export type AppSettings = {
 	 *  quit. Shown once, not every time.
 	 */
 	background_notice_shown: boolean,
+	/**
+	 *  Where the external client binaries come from.
+	 * 
+	 *  A property of this machine rather than of any one database, which is
+	 *  why it lives here and not on a profile. A per-profile binary override
+	 *  still wins over it.
+	 */
+	tool_source: ToolSource,
 };
 
 /**  One artifact, as the library lists it. */
@@ -561,6 +595,12 @@ export type DestinationView = {
 	/**  Where this points, e.g. `s3://backups/prod`. */
 	location: string,
 } & Destination;
+
+/**  A container that is currently running, for the exec source picker. */
+export type DockerContainer = {
+	name: string,
+	image: string,
+};
 
 /**
  *  A supported database engine.
@@ -999,11 +1039,32 @@ export type ProgressEvent = {
 	level: LogLevel,
 	message: string,
 	table: string | null,
-	bytes_done: number | null,
-	bytes_total: number | null,
+	done: number | null,
+	total: number | null,
+	/**  What `done`/`total` count. `None` whenever they are. */
+	unit: ProgressUnit | null,
+	/**
+	 *  Size of the artifact written so far.
+	 * 
+	 *  Separate from `done` because the two answer different questions during
+	 *  the same phase: a MySQL dump knows which table it is on *and* how large
+	 *  the file has grown, and neither one implies the other.
+	 */
+	bytes: number | null,
 	rows: number | null,
 	percent: number | null,
 };
+
+/**
+ *  What the `done`/`total` pair on a [`ProgressEvent`] counts.
+ * 
+ *  Carried explicitly because the two are not interchangeable to a reader:
+ *  "table 12 of 47" and "3 MB of 10 MB" are the same numbers with different
+ *  meanings. It also decides whether an estimate is worth showing at all —
+ *  bytes advance at a roughly steady rate, table counts do not, because table
+ *  sizes differ by orders of magnitude within one database.
+ */
+export type ProgressUnit = "bytes" | "tables";
 
 export type RestoreRequest = {
 	artifact_path: string,
@@ -1603,6 +1664,8 @@ export type TargetNaming =
 /**  Restore into an existing database without dropping. */
 { strategy: "into_existing"; name: string };
 
+export type Tool = "mysqldump" | "mysql" | "mydumper" | "myloader" | "pg_dump" | "pg_dumpall" | "pg_restore" | "psql" | "mongodump" | "mongorestore";
+
 /**
  *  Per-profile overrides for external client binaries.
  * 
@@ -1621,6 +1684,58 @@ export type ToolOverrides = {
 	/**  Defaulted so profiles stored before MongoDB support still deserialise. */
 	mongodump?: string | null,
 	mongorestore?: string | null,
+};
+
+/**
+ *  Where the external client binaries come from.
+ * 
+ *  Global rather than per-profile: this describes the machine the app is
+ *  running on, not the database being talked to. A per-profile binary override
+ *  still wins over whatever is set here — that one *is* about the database,
+ *  which is why the two coexist.
+ */
+export type ToolSource = 
+/**
+ *  Binaries installed on this machine.
+ * 
+ *  The default, and the only one that works with no container runtime
+ *  present. Changing the default would silently re-route every existing
+ *  install through Docker.
+ */
+{ kind: "local" } | 
+/**
+ *  Borrow the binaries from a container that is already running.
+ * 
+ *  Nothing to download when a database container is already there, and the
+ *  most fragile of the three: it stops working the moment that container
+ *  is stopped or replaced, and the client version is whatever that image
+ *  happens to ship.
+ */
+{ kind: "docker_exec"; container: string; 
+/**
+ *  Directory holding the binaries inside the container. `None` means
+ *  they are on the container's `PATH`, which is the usual case.
+ */
+bin_dir?: string | null } | 
+/**
+ *  Run a throwaway container from an image, one per invocation.
+ * 
+ *  Costs an image pull once and then always has the right client, with no
+ *  dependency on anything else still running.
+ */
+{ kind: "docker_run"; image: string };
+
+/**  What discovery found for one tool, in the shape the settings page needs. */
+export type ToolStatus = {
+	tool: Tool,
+	binary: string,
+	/**  How it would be invoked — a host path, or a `docker …` line. */
+	location: string | null,
+	version: string | null,
+	/**  Whether its absence stops an engine working at all. */
+	required: boolean,
+	/**  The Homebrew formula that would provide it, if Homebrew is available. */
+	brew_formula: string | null,
 };
 
 /**

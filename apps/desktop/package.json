@@ -1,7 +1,7 @@
 {
   "name": "db-sync-desktop",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.3.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -15,6 +15,7 @@
   "dependencies": {
     "@tanstack/react-query": "^5.59.0",
     "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-dialog": "^2.7.2",
     "clsx": "^2.1.1",
     "lucide-react": "^0.451.0",
     "react": "^18.3.1",

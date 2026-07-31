@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Minimum capabilities for DBSync Studio. Dump and restore processes are spawned by the Rust engine, not by the webview, so no shell permission is granted.",
+  "description": "Minimum capabilities for DBSync Studio. Dump and restore processes are spawned by the Rust engine, not by the webview, so no shell permission is granted. `dialog:allow-open` is the read-only half of the dialog plugin: it lets the SSH form open a native file picker for the private key. `dialog:allow-save` is deliberately withheld — nothing in the webview writes files.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "dialog:allow-open"]
 }

@@ -16,7 +16,8 @@ use tokio_util::sync::CancellationToken;
 use super::{EngineRestoreOptions, PostgresRestoreOptions, RestoreError, RestoreRequest};
 use crate::backup::mysql::Endpoint;
 use crate::events::JobPhase;
-use crate::exec::{ChildHandle, ToolCommand, find_tool, wait_checked};
+use crate::exec::{ChildHandle, ToolCommand, wait_checked};
+use crate::tools::{MountMode,ResolvedTool, Tool, ToolSource};
 use crate::job::JobContext;
 use crate::manifest::{ArtifactFormat, BackupManifest};
 use crate::profile::ConnectionProfile;
@@ -30,6 +31,8 @@ pub async fn run_postgres_restore(
     profile: &ConnectionProfile,
     request: &RestoreRequest,
     endpoint: Endpoint,
+    // Where the client binaries come from: this machine, or a container.
+    tools: &ToolSource,
     ctx: &JobContext,
 ) -> Result<String, RestoreError> {
     let manifest = BackupManifest::read(&request.artifact_path).ok();
@@ -49,18 +52,31 @@ pub async fn run_postgres_restore(
         .map(|m| m.format)
         .unwrap_or_else(|| infer_format(&request.artifact_path));
 
-    let psql = find_tool("psql", profile.tool_overrides.psql.as_deref()).ok_or_else(|| {
-        RestoreError::Invalid("could not find psql; install the PostgreSQL client tools".into())
-    })?;
+    let psql = ResolvedTool::resolve(Tool::Psql, tools, profile.tool_overrides.psql.as_deref())
+        .ok_or_else(|| {
+            RestoreError::Invalid("could not find psql; install the PostgreSQL client tools".into())
+        })?;
 
     let pg_restore = if format.supports_selective_restore() {
         Some(
-            find_tool("pg_restore", profile.tool_overrides.pg_restore.as_deref()).ok_or_else(
-                || RestoreError::Invalid("could not find pg_restore for this archive".into()),
-            )?,
+            ResolvedTool::resolve(
+                Tool::PgRestore,
+                tools,
+                profile.tool_overrides.pg_restore.as_deref(),
+            )
+            .ok_or_else(|| {
+                RestoreError::Invalid("could not find pg_restore for this archive".into())
+            })?,
         )
     } else {
         None
+    };
+
+    // Inside a container, loopback is the container rather than the host that
+    // holds the tunnel's local end. See `ToolSource::rewrite_host`.
+    let endpoint = Endpoint {
+        host: tools.rewrite_host(&endpoint.host),
+        ..endpoint
     };
 
     // Only a single-file artifact has a checksum worth verifying.
@@ -146,8 +162,8 @@ fn infer_format(path: &Path) -> ArtifactFormat {
 }
 
 struct RestoreWorker {
-    psql: PathBuf,
-    pg_restore: Option<PathBuf>,
+    psql: ResolvedTool,
+    pg_restore: Option<ResolvedTool>,
     endpoint: Endpoint,
     target: String,
     artifact: PathBuf,
@@ -197,7 +213,7 @@ impl RestoreWorker {
     }
 
     fn psql_command(&self, database: &str) -> ToolCommand {
-        let mut cmd = ToolCommand::new(self.psql.display().to_string()).args([
+        let mut cmd = self.psql.command().args([
             format!("--host={}", self.endpoint.host),
             format!("--port={}", self.endpoint.port),
             format!("--username={}", self.endpoint.user),
@@ -278,13 +294,25 @@ impl RestoreWorker {
         if let Some(jobs) = self.options.parallel_jobs {
             args.push(format!("--jobs={jobs}"));
         }
+        // Both paths below are on this machine. A containerised pg_restore
+        // cannot see either, and would report "no such file" for an archive
+        // that is plainly there — so each is bound in read-only and the tool
+        // is given the path it will actually find.
+        let mut pg_restore = pg_restore.clone();
+
         if let Some(list) = &list_file {
-            args.push(format!("--use-list={}", list.path().display()));
+            let mounted = pg_restore
+                .mount(list.path(), MountMode::ReadOnly)
+                .map_err(|e| RestoreError::Invalid(e.to_string()))?;
+            args.push(format!("--use-list={}", mounted.display()));
         }
 
-        args.push(self.artifact.display().to_string());
+        let artifact = pg_restore
+            .mount(&self.artifact, MountMode::ReadOnly)
+            .map_err(|e| RestoreError::Invalid(e.to_string()))?;
+        args.push(artifact.display().to_string());
 
-        let mut cmd = ToolCommand::new(pg_restore.display().to_string()).args(args);
+        let mut cmd = pg_restore.command().args(args);
         if let Some(pw) = &self.endpoint.password {
             cmd = cmd.secret_env("PGPASSWORD", pw.clone());
         }
@@ -299,13 +327,18 @@ impl RestoreWorker {
     /// unable to be created.
     fn build_toc_filter(
         &self,
-        pg_restore: &Path,
+        pg_restore: &ResolvedTool,
         current_child: &Arc<Mutex<Option<ChildHandle>>>,
         cancel: &CancellationToken,
     ) -> Result<tempfile::NamedTempFile, RestoreError> {
-        let mut cmd = ToolCommand::new(pg_restore.display().to_string())
+        let mut pg_restore = pg_restore.clone();
+        let artifact = pg_restore
+            .mount(&self.artifact, MountMode::ReadOnly)
+            .map_err(|e| RestoreError::Invalid(e.to_string()))?;
+        let mut cmd = pg_restore
+            .command()
             .arg("--list")
-            .arg(self.artifact.display().to_string());
+            .arg(artifact.display().to_string());
         if let Some(pw) = &self.endpoint.password {
             cmd = cmd.secret_env("PGPASSWORD", pw.clone());
         }
@@ -470,13 +503,20 @@ pub fn toc_line_wanted(line: &str, only_tables: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tool pinned to a path that exists, so these fixtures never depend on
+    /// whether the client happens to be installed on the machine running the
+    /// tests. Only the rendered command line is under test.
+    fn local_tool(tool: Tool) -> ResolvedTool {
+        ResolvedTool::resolve(tool, &ToolSource::Local, Some("/bin/sh")).expect("/bin/sh exists")
+    }
     use crate::restore::TargetNaming;
     use secrecy::SecretString;
 
     fn worker(format: ArtifactFormat, naming: &TargetNaming) -> RestoreWorker {
         RestoreWorker {
-            psql: PathBuf::from("/usr/bin/psql"),
-            pg_restore: Some(PathBuf::from("/usr/bin/pg_restore")),
+            psql: local_tool(Tool::Psql),
+            pg_restore: Some(local_tool(Tool::PgRestore)),
             endpoint: Endpoint {
                 host: "127.0.0.1".into(),
                 port: 15432,

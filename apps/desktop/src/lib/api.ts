@@ -80,6 +80,13 @@ export const api = {
   listJobs: (limit: number) => unwrap(commands.listJobs(limit)),
   listAudit: (limit: number) => unwrap(commands.listAudit(limit)),
   cancelJob: (id: string) => unwrap(commands.cancelJob(id)),
+  activeJobIds: () => unwrap(commands.activeJobIds()),
+  discoverTools: () => unwrap(commands.discoverTools()),
+  testToolSource: (...args: Parameters<typeof commands.testToolSource>) =>
+    unwrap(commands.testToolSource(...args)),
+  listDockerContainers: () => unwrap(commands.listDockerContainers()),
+  installToolWithBrew: (formula: string) =>
+    unwrap(commands.installToolWithBrew(formula)),
   appInfo: () => unwrap(commands.appInfo()),
 
   listSchedules: () => unwrap(commands.listSchedules()),

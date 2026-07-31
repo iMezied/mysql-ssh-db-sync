@@ -1,3 +1,8 @@
+import { useId, useState } from "react";
+import { homeDir } from "@tauri-apps/api/path";
+import { open } from "@tauri-apps/plugin-dialog";
+import { FolderOpen } from "lucide-react";
+
 import type { SshAuth, SshEndpoint } from "@/bindings";
 
 /**
@@ -14,6 +19,33 @@ export default function SshEndpointFields({
   onChange: (patch: Partial<SshEndpoint>) => void;
 }) {
   const keyFile = value.auth.kind === "key_file" ? value.auth : null;
+  const keyPathId = useId();
+  const [browseError, setBrowseError] = useState<string | null>(null);
+
+  async function browseForKey() {
+    if (!keyFile) return;
+    setBrowseError(null);
+    try {
+      // Tauri has returned this both with and without a trailing separator
+      // across versions; strip it so the joins below never double up.
+      const home = (await homeDir()).replace(/\/+$/, "");
+      const picked = await open({
+        title: "Select SSH private key",
+        multiple: false,
+        directory: false,
+        // No extension filter: `id_ed25519` and friends have no suffix, so
+        // any filter we invented would hide the very files being looked for.
+        defaultPath: startingDir(keyFile.path, home),
+      });
+      if (typeof picked === "string") {
+        onChange({ auth: { ...keyFile, path: collapseHome(picked, home) } });
+      }
+    } catch (e) {
+      setBrowseError(
+        e instanceof Error ? e.message : "Could not open the file picker.",
+      );
+    }
+  }
 
   return (
     <div className="grid grid-cols-6 gap-3">
@@ -75,18 +107,37 @@ export default function SshEndpointFields({
 
       {keyFile && (
         <>
-          <label className="col-span-4">
-            <span className="field-label">Private key path</span>
-            <input
-              className="field-input"
-              required
-              placeholder="~/.ssh/id_ed25519"
-              value={keyFile.path}
-              onChange={(e) =>
-                onChange({ auth: { ...keyFile, path: e.target.value } })
-              }
-            />
-          </label>
+          {/* A div rather than a label, because the Browse button is a sibling
+              of the input: a button inside a label steals the label's click. */}
+          <div className="col-span-4">
+            <label className="field-label" htmlFor={keyPathId}>
+              Private key path
+            </label>
+            <div className="flex gap-2">
+              <input
+                id={keyPathId}
+                className="field-input"
+                required
+                placeholder="~/.ssh/id_ed25519"
+                value={keyFile.path}
+                onChange={(e) =>
+                  onChange({ auth: { ...keyFile, path: e.target.value } })
+                }
+              />
+              <button
+                type="button"
+                onClick={browseForKey}
+                title="Browse for a private key file"
+                className="flex shrink-0 items-center gap-1.5 rounded-md border border-slate-700 px-3 py-2 text-sm text-slate-300 transition hover:bg-slate-800"
+              >
+                <FolderOpen className="h-4 w-4" />
+                Browse…
+              </button>
+            </div>
+            {browseError && (
+              <p className="mt-1 text-xs text-red-400">{browseError}</p>
+            )}
+          </div>
 
           <label className="col-span-6 flex items-center gap-2">
             <input
@@ -114,4 +165,33 @@ export default function SshEndpointFields({
       )}
     </div>
   );
+}
+
+/**
+ * Where the file picker should open.
+ *
+ * `~/.ssh` is a dot-directory, and every native picker hides those. Opening
+ * *inside* it is what makes the keys visible at all — landing in the home
+ * folder instead leaves the user to guess at Cmd+Shift+. (macOS) or Ctrl+H
+ * (GTK). Whatever is already typed wins, so re-opening the picker returns to
+ * the key it last chose.
+ */
+function startingDir(current: string, home: string): string {
+  const typed = expandHome(current.trim(), home);
+  return typed || `${home}/.ssh`;
+}
+
+/** Expand a leading `~`, matching what the engine does before opening the key. */
+function expandHome(path: string, home: string): string {
+  return path.startsWith("~/") ? `${home}/${path.slice(2)}` : path;
+}
+
+/**
+ * The inverse: store `~/.ssh/id_ed25519`, not `/Users/someone/.ssh/…`.
+ *
+ * The engine expands `~` itself, and the short form is what survives being
+ * copied to another machine or another account.
+ */
+function collapseHome(path: string, home: string): string {
+  return path.startsWith(`${home}/`) ? `~/${path.slice(home.length + 1)}` : path;
 }

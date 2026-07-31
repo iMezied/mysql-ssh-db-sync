@@ -28,11 +28,14 @@ use super::{BackupError, BackupRequest, EngineBackupOptions, MongoBackupOptions,
 use crate::backup::mysql::Endpoint;
 use crate::db::MONGO_AUTH_SOURCE;
 use crate::events::JobPhase;
-use crate::exec::{ChildHandle, ToolCommand, find_tool, probe_version, wait_checked};
+use crate::exec::{ChildHandle, ToolCommand, wait_checked};
 use crate::job::JobContext;
 use crate::manifest::{ArtifactFormat, BackupManifest, MANIFEST_VERSION, sha256_file};
 use crate::profile::ConnectionProfile;
-use crate::tools::{CompatibilityVerdict, Version, check_mongodump_compatibility};
+use crate::tools::{
+    CompatibilityVerdict, MountMode, ResolvedTool, Tool, ToolSource, Version,
+    check_mongodump_compatibility,
+};
 use crate::types::Engine;
 
 /// Hand a password to `mongodump`/`mongorestore` without putting it in argv.
@@ -108,7 +111,7 @@ fn yaml_quote(value: &str) -> String {
 
 /// Everything the blocking dump worker needs.
 struct DumpPlan {
-    mongodump: PathBuf,
+    mongodump: ResolvedTool,
     endpoint: Endpoint,
     database: String,
     options: MongoBackupOptions,
@@ -134,6 +137,8 @@ pub async fn run_mongo_backup(
     server_version: String,
     recipients: &[String],
     source_row_counts: &std::collections::BTreeMap<String, u64>,
+    // Where the client binaries come from: this machine, or a container.
+    tools: &ToolSource,
     ctx: &JobContext,
 ) -> Result<PathBuf, BackupError> {
     request.validate(profile)?;
@@ -145,12 +150,23 @@ pub async fn run_mongo_backup(
         });
     };
 
-    let mongodump = find_tool("mongodump", profile.tool_overrides.mongodump.as_deref())
-        .ok_or_else(|| BackupError::ToolMissing {
-            tool: "mongodump".into(),
-        })?;
+    let mongodump = ResolvedTool::resolve(
+        Tool::Mongodump,
+        tools,
+        profile.tool_overrides.mongodump.as_deref(),
+    )
+    .ok_or_else(|| BackupError::ToolMissing {
+        tool: "mongodump".into(),
+    })?;
 
-    let tool_version = probe_version(mongodump.as_os_str());
+    // Inside a container, loopback is the container rather than the host that
+    // holds the tunnel's local end. See `ToolSource::rewrite_host`.
+    let endpoint = Endpoint {
+        host: tools.rewrite_host(&endpoint.host),
+        ..endpoint
+    };
+
+    let tool_version = mongodump.probe_version();
     if let (Some(client), Some(server)) = (tool_version, Version::parse_first(&server_version))
         && let CompatibilityVerdict::Warn(message) =
             check_mongodump_compatibility(client, server)
@@ -342,7 +358,20 @@ fn run_dump(
         None => None,
     };
 
-    let cmd = dump_command(&plan, credentials.as_ref().map(|f| f.path()));
+    // The path the tool must use, which is not the path on this machine when
+    // the tool runs in a container. Registering the mount has to happen before
+    // the command is built — see `ResolvedTool::mount`.
+    let mut mongodump = plan.mongodump.clone();
+    let config_path = match &credentials {
+        Some(file) => Some(
+            mongodump
+                .mount(file.path(), MountMode::ReadOnly)
+                .map_err(|e| BackupError::Io(e.to_string()))?,
+        ),
+        None => None,
+    };
+
+    let cmd = dump_command(&mongodump, &plan, config_path.as_deref());
     let _ = tx.send(DumpProgress::Phase(JobPhase::DumpData, cmd.display()));
 
     let (child, stdout, stderr) = cmd.spawn_streaming()?;
@@ -399,7 +428,7 @@ fn run_dump(
         .map_err(|e| BackupError::Io(format!("could not stat the artifact: {e}")))
 }
 
-fn dump_command(plan: &DumpPlan, config: Option<&Path>) -> ToolCommand {
+fn dump_command(mongodump: &ResolvedTool, plan: &DumpPlan, config: Option<&Path>) -> ToolCommand {
     let o = &plan.options;
     let mut args = vec![
         format!("--host={}", plan.endpoint.host),
@@ -443,7 +472,7 @@ fn dump_command(plan: &DumpPlan, config: Option<&Path>) -> ToolCommand {
     }
     args.extend(o.extra_flags.clone());
 
-    ToolCommand::new(plan.mongodump.display().to_string()).args(args)
+    mongodump.command().args(args)
 }
 
 /// Backups routinely contain production data; keep them owner-readable only.
@@ -465,9 +494,16 @@ mod tests {
     use crate::types::EnvironmentTag;
     use secrecy::SecretString;
 
+    /// A tool pinned to a path that exists, so this fixture never depends on
+    /// whether the MongoDB tools happen to be installed on the machine running
+    /// the tests. Only the rendered command line is under test.
+    fn local_tool(tool: Tool) -> ResolvedTool {
+        ResolvedTool::resolve(tool, &ToolSource::Local, Some("/bin/sh")).expect("/bin/sh exists")
+    }
+
     fn plan() -> DumpPlan {
         DumpPlan {
-            mongodump: PathBuf::from("/usr/local/bin/mongodump"),
+            mongodump: local_tool(Tool::Mongodump),
             endpoint: Endpoint {
                 host: "127.0.0.1".into(),
                 port: 27018,
@@ -519,7 +555,7 @@ mod tests {
     #[test]
     fn the_password_never_appears_in_the_command_line() {
         let file = password_config(&SecretString::from("hunter2")).expect("config file");
-        let rendered = dump_command(&plan(), Some(file.path())).display();
+        let rendered = dump_command(&local_tool(Tool::Mongodump), &plan(), Some(file.path())).display();
         assert!(
             !rendered.contains("hunter2"),
             "password leaked into argv: {rendered}"
@@ -622,12 +658,12 @@ mod tests {
     fn no_config_flag_when_there_is_no_password() {
         let mut p = plan();
         p.endpoint.password = None;
-        assert!(!dump_command(&p, None).display().contains("--config"));
+        assert!(!dump_command(&local_tool(Tool::Mongodump), &p, None).display().contains("--config"));
     }
 
     #[test]
     fn the_archive_goes_to_stdout_so_it_can_be_hashed_in_one_pass() {
-        let rendered = dump_command(&plan(), None).display();
+        let rendered = dump_command(&local_tool(Tool::Mongodump), &plan(), None).display();
         // `--archive` with no `=path` means stdout. With a path, the stream
         // would never reach the encryption and checksum layers.
         assert!(rendered.contains(" --archive "), "{rendered}");
@@ -638,7 +674,7 @@ mod tests {
     fn the_tool_authenticates_against_the_same_database_as_the_driver() {
         // If these two disagree, a backup can succeed while the introspection
         // that verifies it cannot connect at all.
-        let rendered = dump_command(&plan(), None).display();
+        let rendered = dump_command(&local_tool(Tool::Mongodump), &plan(), None).display();
         assert!(rendered.contains(&format!("--authenticationDatabase={MONGO_AUTH_SOURCE}")));
     }
 
@@ -647,24 +683,24 @@ mod tests {
         let mut p = plan();
         p.endpoint.user = String::new();
         p.endpoint.password = None;
-        let rendered = dump_command(&p, None).display();
+        let rendered = dump_command(&local_tool(Tool::Mongodump), &p, None).display();
         assert!(!rendered.contains("--username"));
         assert!(!rendered.contains("--authenticationDatabase"));
     }
 
     #[test]
     fn compression_is_the_tools_own_not_a_second_layer() {
-        assert!(dump_command(&plan(), None).display().contains("--gzip"));
+        assert!(dump_command(&local_tool(Tool::Mongodump), &plan(), None).display().contains("--gzip"));
         let mut p = plan();
         p.compress = false;
-        assert!(!dump_command(&p, None).display().contains("--gzip"));
+        assert!(!dump_command(&local_tool(Tool::Mongodump), &p, None).display().contains("--gzip"));
     }
 
     #[test]
     fn excluded_collections_become_exclude_flags() {
         let mut p = plan();
         p.excluded = vec!["sessions".into(), "cache".into()];
-        let rendered = dump_command(&p, None).display();
+        let rendered = dump_command(&local_tool(Tool::Mongodump), &p, None).display();
         assert!(rendered.contains("--excludeCollection=sessions"));
         assert!(rendered.contains("--excludeCollection=cache"));
     }
@@ -673,16 +709,16 @@ mod tests {
     fn oplog_capture_is_off_unless_asked_for() {
         // Defaulting it on would break every standalone server, which is what
         // most development databases are.
-        assert!(!dump_command(&plan(), None).display().contains("--oplog"));
+        assert!(!dump_command(&local_tool(Tool::Mongodump), &plan(), None).display().contains("--oplog"));
         let mut p = plan();
         p.options.oplog = true;
-        assert!(dump_command(&p, None).display().contains("--oplog"));
+        assert!(dump_command(&local_tool(Tool::Mongodump), &p, None).display().contains("--oplog"));
     }
 
     #[test]
     fn users_and_roles_are_not_dumped_by_default() {
         assert!(
-            !dump_command(&plan(), None)
+            !dump_command(&local_tool(Tool::Mongodump), &plan(), None)
                 .display()
                 .contains("--dumpDbUsersAndRoles"),
             "restoring these elsewhere would change who can log in there"
@@ -693,7 +729,7 @@ mod tests {
     fn extra_flags_reach_the_command() {
         let mut p = plan();
         p.options.extra_flags = vec!["--quiet".into()];
-        assert!(dump_command(&p, None).display().contains("--quiet"));
+        assert!(dump_command(&local_tool(Tool::Mongodump), &p, None).display().contains("--quiet"));
     }
 
     // ── What MongoDB refuses, and why ───────────────────────────────────

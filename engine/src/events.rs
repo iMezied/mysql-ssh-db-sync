@@ -44,6 +44,20 @@ pub enum LogLevel {
     Error,
 }
 
+/// What the `done`/`total` pair on a [`ProgressEvent`] counts.
+///
+/// Carried explicitly because the two are not interchangeable to a reader:
+/// "table 12 of 47" and "3 MB of 10 MB" are the same numbers with different
+/// meanings. It also decides whether an estimate is worth showing at all —
+/// bytes advance at a roughly steady rate, table counts do not, because table
+/// sizes differ by orders of magnitude within one database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressUnit {
+    Bytes,
+    Tables,
+}
+
 /// A single point-in-time progress record.
 ///
 /// Every field beyond `job_id`/`ts`/`phase`/`level`/`message` is optional
@@ -62,9 +76,18 @@ pub struct ProgressEvent {
     // database. Emitting `bigint` instead would force BigInt handling through
     // the whole UI for no benefit.
     #[specta(type = Option<f64>)]
-    pub bytes_done: Option<u64>,
+    pub done: Option<u64>,
     #[specta(type = Option<f64>)]
-    pub bytes_total: Option<u64>,
+    pub total: Option<u64>,
+    /// What `done`/`total` count. `None` whenever they are.
+    pub unit: Option<ProgressUnit>,
+    /// Size of the artifact written so far.
+    ///
+    /// Separate from `done` because the two answer different questions during
+    /// the same phase: a MySQL dump knows which table it is on *and* how large
+    /// the file has grown, and neither one implies the other.
+    #[specta(type = Option<f64>)]
+    pub bytes: Option<u64>,
     #[specta(type = Option<f64>)]
     pub rows: Option<u64>,
     pub percent: Option<f64>,
@@ -79,8 +102,10 @@ impl ProgressEvent {
             level: LogLevel::Info,
             message: message.into(),
             table: None,
-            bytes_done: None,
-            bytes_total: None,
+            done: None,
+            total: None,
+            unit: None,
+            bytes: None,
             rows: None,
             percent: None,
         }
@@ -96,14 +121,32 @@ impl ProgressEvent {
         self
     }
 
+    /// Progress measured in bytes — transfers, and restores replaying a dump.
     pub fn with_progress(mut self, done: u64, total: u64) -> Self {
-        self.bytes_done = Some(done);
-        self.bytes_total = Some(total);
+        self.set_progress(done, total, ProgressUnit::Bytes);
+        self
+    }
+
+    /// Progress measured in tables, for dumps that walk a table list.
+    pub fn with_tables(mut self, done: u64, total: u64) -> Self {
+        self.set_progress(done, total, ProgressUnit::Tables);
+        self
+    }
+
+    fn set_progress(&mut self, done: u64, total: u64, unit: ProgressUnit) {
+        self.done = Some(done);
+        self.total = Some(total);
+        self.unit = Some(unit);
         self.percent = Some(if total > 0 {
             (done as f64 / total as f64) * 100.0
         } else {
             0.0
         });
+    }
+
+    /// How large the artifact has grown so far.
+    pub fn with_bytes(mut self, bytes: u64) -> Self {
+        self.bytes = Some(bytes);
         self
     }
 
@@ -168,6 +211,25 @@ mod tests {
     fn zero_total_does_not_divide_by_zero() {
         let e = ProgressEvent::new(Uuid::nil(), JobPhase::DumpData, "x").with_progress(0, 0);
         assert_eq!(e.percent, Some(0.0));
+    }
+
+    #[test]
+    fn the_unit_says_what_the_numbers_count() {
+        let bytes = ProgressEvent::new(Uuid::nil(), JobPhase::Transfer, "x").with_progress(1, 2);
+        assert_eq!(bytes.unit, Some(ProgressUnit::Bytes));
+
+        let tables = ProgressEvent::new(Uuid::nil(), JobPhase::DumpData, "x").with_tables(1, 2);
+        assert_eq!(tables.unit, Some(ProgressUnit::Tables));
+        assert_eq!(tables.percent, Some(50.0));
+    }
+
+    #[test]
+    fn artifact_size_is_independent_of_step_progress() {
+        let e = ProgressEvent::new(Uuid::nil(), JobPhase::DumpData, "x")
+            .with_tables(3, 40)
+            .with_bytes(9_000);
+        assert_eq!(e.done, Some(3));
+        assert_eq!(e.bytes, Some(9_000));
     }
 
     #[test]

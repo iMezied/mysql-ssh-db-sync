@@ -1,4 +1,6 @@
+import { useEffect, useState } from "react";
 import { NavLink } from "react-router-dom";
+import { getVersion } from "@tauri-apps/api/app";
 import {
   Archive,
   ArrowLeftRight,
@@ -30,6 +32,8 @@ const links = [
 ] as const;
 
 export default function Sidebar() {
+  const version = useAppVersion();
+
   return (
     <nav className="flex w-56 shrink-0 flex-col border-r border-slate-800 bg-slate-900">
       <div className="flex items-center gap-2 px-4 py-4">
@@ -61,6 +65,40 @@ export default function Sidebar() {
           </NavLink>
         ))}
       </div>
+
+      <div className="border-t border-slate-800 px-4 py-3">
+        <span className="text-[11px] tabular-nums text-slate-600">
+          {version ?? "—"}
+        </span>
+      </div>
     </nav>
   );
+}
+
+/**
+ * The version of the running bundle, as `v0.2.0`.
+ *
+ * Read from Tauri rather than baked in at build time by Vite: this is the
+ * number in the app's Info.plist, which is what a bug report needs to be
+ * about. A `__APP_VERSION__` define would report whatever the frontend was
+ * built against, which is the same thing right up until it isn't.
+ */
+function useAppVersion(): string | null {
+  const [version, setVersion] = useState<string | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    getVersion()
+      .then((v) => {
+        if (mounted) setVersion(`v${v}`);
+      })
+      // Nothing useful to say if it fails — the footer stays a dash rather
+      // than putting an error message where a version number belongs.
+      .catch(() => undefined);
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  return version;
 }

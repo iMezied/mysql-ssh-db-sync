@@ -29,11 +29,13 @@ use uuid::Uuid;
 use super::{BackupError, BackupRequest, EngineBackupOptions, MysqlBackupOptions, TableSelection};
 use crate::definer;
 use crate::events::{JobPhase, ProgressEvent};
-use crate::exec::{ChildHandle, ToolCommand, find_tool, probe_version, wait_checked};
+use crate::exec::{ChildHandle, ToolCommand, wait_checked};
 use crate::job::JobContext;
 use crate::manifest::{ArtifactFormat, BackupManifest, MANIFEST_VERSION, sha256_file};
 use crate::profile::ConnectionProfile;
-use crate::tools::{Version, mysql_needs_column_statistics_flag};
+use crate::tools::{
+    ResolvedTool, Tool, ToolSource, Version, mysql_needs_column_statistics_flag,
+};
 use crate::types::Engine;
 
 /// Where the dump is being sent, once a tunnel (if any) is up.
@@ -47,7 +49,7 @@ pub struct Endpoint {
 
 /// Everything the blocking dump worker needs.
 struct DumpPlan {
-    mysqldump: PathBuf,
+    mysqldump: ResolvedTool,
     endpoint: Endpoint,
     database: String,
     options: MysqlBackupOptions,
@@ -87,6 +89,8 @@ pub async fn run_mysql_backup(
     // Exact source row counts, when the request asked for them. Empty
     // otherwise — see `CommonBackupOptions::record_row_counts`.
     source_row_counts: &std::collections::BTreeMap<String, u64>,
+    // Where the client binaries come from: this machine, or a container.
+    tools: &ToolSource,
     ctx: &JobContext,
 ) -> Result<PathBuf, BackupError> {
     request.validate(profile)?;
@@ -98,12 +102,24 @@ pub async fn run_mysql_backup(
         });
     };
 
-    let mysqldump = find_tool("mysqldump", profile.tool_overrides.mysqldump.as_deref())
-        .ok_or_else(|| BackupError::ToolMissing {
-            tool: "mysqldump".into(),
-        })?;
+    let mysqldump = ResolvedTool::resolve(
+        Tool::Mysqldump,
+        tools,
+        profile.tool_overrides.mysqldump.as_deref(),
+    )
+    .ok_or_else(|| BackupError::ToolMissing {
+        tool: "mysqldump".into(),
+    })?;
 
-    let tool_version = probe_version(mysqldump.as_os_str());
+    // Inside a container, loopback is the container. A tunnel's local end is
+    // on the host, so it has to be named as such or the dump connects to
+    // nothing — see `ToolSource::rewrite_host`.
+    let endpoint = Endpoint {
+        host: tools.rewrite_host(&endpoint.host),
+        ..endpoint
+    };
+
+    let tool_version = mysqldump.probe_version();
     let server = Version::parse_first(&server_version);
 
     // An 8.x client against a pre-8.0 server queries a table that does not
@@ -187,8 +203,8 @@ pub async fn run_mysql_backup(
                     let event =
                         ProgressEvent::new(forward_ctx.job_id, JobPhase::DumpData, "dumping table")
                             .with_table(name)
-                            .with_progress(index as u64, total as u64)
-                            .with_rows(bytes);
+                            .with_tables(index as u64, total as u64)
+                            .with_bytes(bytes);
                     forward_ctx.emit_event(event).await;
                 }
                 DumpProgress::Warn(message) => {
@@ -506,7 +522,7 @@ fn schema_command(plan: &DumpPlan) -> ToolCommand {
     args.push(plan.database.clone());
 
     with_password(
-        ToolCommand::new(plan.mysqldump.display().to_string()).args(args),
+        plan.mysqldump.command().args(args),
         &plan.endpoint,
     )
 }
@@ -546,7 +562,7 @@ fn data_command(plan: &DumpPlan, table: &TableSelection) -> ToolCommand {
     args.push(table.name.clone());
 
     with_password(
-        ToolCommand::new(plan.mysqldump.display().to_string()).args(args),
+        plan.mysqldump.command().args(args),
         &plan.endpoint,
     )
 }
@@ -578,7 +594,7 @@ fn trigger_command(plan: &DumpPlan) -> ToolCommand {
     args.push(plan.database.clone());
 
     with_password(
-        ToolCommand::new(plan.mysqldump.display().to_string()).args(args),
+        plan.mysqldump.command().args(args),
         &plan.endpoint,
     )
 }
@@ -602,7 +618,12 @@ mod tests {
     fn plan() -> DumpPlan {
         DumpPlan {
             recipients: Vec::new(),
-            mysqldump: PathBuf::from("/usr/bin/mysqldump"),
+            mysqldump: ResolvedTool::resolve(
+                Tool::Mysqldump,
+                &ToolSource::Local,
+                Some("/bin/sh"),
+            )
+            .expect("an override that exists resolves without touching PATH"),
             endpoint: Endpoint {
                 host: "127.0.0.1".into(),
                 port: 13306,

@@ -19,6 +19,7 @@
 use std::time::Duration;
 
 use db_sync_engine::db::{ConnectParams, Introspector, MongoIntrospector};
+use db_sync_engine::tools::ToolSource;
 use db_sync_engine::mask::mongo as mask_mongo;
 use db_sync_engine::mask::{MaskRule, MaskTransform, derive_salt};
 use db_sync_engine::types::Engine;
@@ -733,6 +734,7 @@ db_test! {
             "7.0.0".into(),
             &[],
             &Default::default(),
+            &ToolSource::Local,
             &ctx,
         )
         .await
@@ -770,7 +772,13 @@ db_test! {
             typed_confirmation: None,
         };
 
-        let target = run_mongo_restore(&profile, &restore_request, endpoint(), &ctx)
+        let target = run_mongo_restore(
+            &profile,
+            &restore_request,
+            endpoint(),
+            &ToolSource::Local,
+            &ctx,
+        )
             .await
             .expect("mongorestore should restore the archive");
         assert!(target.starts_with(&target_prefix));
@@ -868,6 +876,7 @@ db_test! {
             "7.0.0".into(),
             std::slice::from_ref(&recipient),
             &Default::default(),
+            &ToolSource::Local,
             &ctx,
         )
         .await

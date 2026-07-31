@@ -21,6 +21,7 @@ use db_sync_engine::destination::{Destination, DestinationCreate, DestinationUpd
 use db_sync_engine::events::{JobKind, JobPhase};
 use db_sync_engine::job::JobRecord;
 use db_sync_engine::job::{JobContext, JobOutcome};
+use db_sync_engine::tools::{DockerContainer, ToolSource, ToolStatus};
 use db_sync_engine::library::{self, Artifact, IntegrityCheck};
 use db_sync_engine::mask::MaskRule;
 use db_sync_engine::ops::{self, SyncRequest};
@@ -613,6 +614,61 @@ pub async fn active_job_ids(state: State<'_, AppState>) -> CmdResult<Vec<Uuid>> 
     Ok(state.jobs.active_ids().await)
 }
 
+/// Look for every client binary through the configured source.
+///
+/// On a blocking thread: probing versions runs each tool, and with a container
+/// source that means starting a container per tool. Holding the async runtime
+/// for that would freeze every other command, including the one drawing the
+/// spinner the user is looking at.
+#[tauri::command]
+#[specta::specta]
+pub async fn discover_tools(state: State<'_, AppState>) -> CmdResult<Vec<ToolStatus>> {
+    let source = state.store.tool_source().await;
+    Ok(
+        tauri::async_runtime::spawn_blocking(move || db_sync_engine::tools::discover(&source))
+            .await
+            .map_err(|e| CommandError::new("tools", format!("tool discovery did not finish: {e}")))?,
+    )
+}
+
+/// The same, for a source the user is considering but has not saved.
+///
+/// Separate from [`discover_tools`] so the settings page can answer "would
+/// this container work?" before committing to it — finding out by saving and
+/// then watching a backup fail is a much worse way to learn.
+#[tauri::command]
+#[specta::specta]
+pub async fn test_tool_source(source: ToolSource) -> CmdResult<Vec<ToolStatus>> {
+    Ok(
+        tauri::async_runtime::spawn_blocking(move || db_sync_engine::tools::discover(&source))
+            .await
+            .map_err(|e| CommandError::new("tools", format!("tool discovery did not finish: {e}")))?,
+    )
+}
+
+/// Running containers, for the exec source picker.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_docker_containers() -> CmdResult<Vec<DockerContainer>> {
+    tauri::async_runtime::spawn_blocking(db_sync_engine::tools::docker_containers)
+        .await
+        .map_err(|e| CommandError::new("docker", format!("could not reach Docker: {e}")))?
+        .map_err(|m| CommandError::new("tools", m))
+}
+
+/// Install a client with Homebrew.
+///
+/// The formula is validated in the engine against the app's own list, so this
+/// cannot be talked into installing something else.
+#[tauri::command]
+#[specta::specta]
+pub async fn install_tool_with_brew(formula: String) -> CmdResult<String> {
+    tauri::async_runtime::spawn_blocking(move || db_sync_engine::tools::brew_install(&formula))
+        .await
+        .map_err(|e| CommandError::new("brew", format!("the install did not finish: {e}")))?
+        .map_err(|m| CommandError::new("tools", m))
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn app_info(state: State<'_, AppState>) -> CmdResult<AppInfo> {
@@ -676,7 +732,8 @@ pub async fn start_backup(
     let jobs = state.jobs.clone();
 
     tauri::async_runtime::spawn(async move {
-        let result = ops::backup(&profile, &request, &store, &ctx).await;
+        let tools = store.tool_source().await;
+        let result = ops::backup(&profile, &request, &store, &tools, &ctx).await;
 
         let (outcome, artifact) = match &result {
             Ok(path) => (JobOutcome::Success, Some(path.display().to_string())),
@@ -743,7 +800,8 @@ pub async fn start_restore(
     let jobs = state.jobs.clone();
 
     tauri::async_runtime::spawn(async move {
-        let result = ops::restore(&profile, &request, &store, &ctx).await;
+        let tools = store.tool_source().await;
+        let result = ops::restore(&profile, &request, &store, &tools, &ctx).await;
 
         let outcome = match &result {
             Ok(target) => {
@@ -1088,7 +1146,8 @@ pub async fn start_sync(
     let jobs = state.jobs.clone();
 
     tauri::async_runtime::spawn(async move {
-        let result = ops::sync(&source, &dest, &request, &store, &ctx).await;
+        let tools = store.tool_source().await;
+        let result = ops::sync(&source, &dest, &request, &store, &tools, &ctx).await;
 
         let (outcome, artifact) = match &result {
             Ok(o) => {
@@ -1397,6 +1456,13 @@ pub async fn set_app_settings(
     state
         .store
         .set_flag(settings::CLOSE_TO_TRAY, next.close_to_tray)
+        .await?;
+    state
+        .store
+        .set_setting(
+            settings::TOOL_SOURCE,
+            &serde_json::to_string(&next.tool_source).unwrap_or_default(),
+        )
         .await?;
     // Keep the copy the window-close handler reads in step with the stored one.
     state

@@ -8,11 +8,14 @@
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
+use crate::tools::ToolSource;
+
 pub const SCHEDULER_ENABLED: &str = "scheduler_enabled";
 pub const CLOSE_TO_TRAY: &str = "close_to_tray";
 pub const BACKGROUND_NOTICE_SHOWN: &str = "background_notice_shown";
+pub const TOOL_SOURCE: &str = "tool_source";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct AppSettings {
     /// Whether the app runs schedules itself.
     ///
@@ -32,6 +35,12 @@ pub struct AppSettings {
     /// Whether the user has already been told that closing the window does not
     /// quit. Shown once, not every time.
     pub background_notice_shown: bool,
+    /// Where the external client binaries come from.
+    ///
+    /// A property of this machine rather than of any one database, which is
+    /// why it lives here and not on a profile. A per-profile binary override
+    /// still wins over it.
+    pub tool_source: ToolSource,
 }
 
 impl Default for AppSettings {
@@ -41,6 +50,9 @@ impl Default for AppSettings {
             close_to_tray: true,
             launch_at_login: false,
             background_notice_shown: false,
+            // Anything else would silently re-route every existing install
+            // through a container runtime it may not even have.
+            tool_source: ToolSource::Local,
         }
     }
 }
@@ -60,6 +72,17 @@ pub fn parse_flag(raw: Option<&str>, default: bool) -> bool {
 
 pub const fn flag_str(value: bool) -> &'static str {
     if value { "true" } else { "false" }
+}
+
+/// Parse a stored [`ToolSource`], falling back to local execution.
+///
+/// A preference written by a newer version, or corrupted, must not stop
+/// backups from running with the binaries already on the machine — and unlike
+/// a toggle in the wrong position, a wrong tool source is visible the moment a
+/// job runs.
+pub fn parse_tool_source(raw: Option<&str>) -> ToolSource {
+    raw.and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(ToolSource::Local)
 }
 
 #[cfg(test)]
@@ -84,6 +107,26 @@ mod tests {
     fn flags_round_trip() {
         assert!(parse_flag(Some(flag_str(true)), false));
         assert!(!parse_flag(Some(flag_str(false)), true));
+    }
+
+    #[test]
+    fn tools_come_from_this_machine_until_told_otherwise() {
+        assert_eq!(AppSettings::default().tool_source, ToolSource::Local);
+    }
+
+    #[test]
+    fn a_stored_tool_source_round_trips_and_survives_corruption() {
+        let source = ToolSource::DockerExec {
+            container: "mysql8".into(),
+            bin_dir: None,
+        };
+        let json = serde_json::to_string(&source).unwrap();
+        assert_eq!(parse_tool_source(Some(&json)), source);
+
+        // Anything unreadable falls back rather than stopping a backup.
+        assert_eq!(parse_tool_source(Some("{{{")), ToolSource::Local);
+        assert_eq!(parse_tool_source(Some("null")), ToolSource::Local);
+        assert_eq!(parse_tool_source(None), ToolSource::Local);
     }
 
     #[test]

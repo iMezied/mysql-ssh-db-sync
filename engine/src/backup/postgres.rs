@@ -24,19 +24,21 @@ use super::{
     BackupError, BackupRequest, EngineBackupOptions, PgDumpFormat, PostgresBackupOptions, TableMode,
 };
 use crate::events::{JobPhase, ProgressEvent};
-use crate::exec::{ChildHandle, ToolCommand, find_tool, probe_version, wait_checked};
+use crate::exec::{ChildHandle, ToolCommand, wait_checked};
 use crate::job::JobContext;
 use crate::manifest::{BackupManifest, MANIFEST_VERSION, sha256_file};
 use crate::profile::ConnectionProfile;
-use crate::tools::{CompatibilityVerdict, Version, check_pg_dump_compatibility};
+use crate::tools::{MountMode,
+    CompatibilityVerdict, ResolvedTool, Tool, ToolSource, Version, check_pg_dump_compatibility,
+};
 use crate::types::Engine;
 
 /// How often to report the growing artifact size.
 const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 struct DumpPlan {
-    pg_dump: PathBuf,
-    pg_dumpall: Option<PathBuf>,
+    pg_dump: ResolvedTool,
+    pg_dumpall: Option<ResolvedTool>,
     endpoint: Endpoint,
     database: String,
     options: PostgresBackupOptions,
@@ -66,6 +68,8 @@ pub async fn run_postgres_backup(
     // Exact source row counts, when the request asked for them. Empty
     // otherwise — see `CommonBackupOptions::record_row_counts`.
     source_row_counts: &std::collections::BTreeMap<String, u64>,
+    // Where the client binaries come from: this machine, or a container.
+    tools: &ToolSource,
     ctx: &JobContext,
 ) -> Result<PathBuf, BackupError> {
     request.validate(profile)?;
@@ -77,14 +81,23 @@ pub async fn run_postgres_backup(
         });
     };
 
-    let pg_dump =
-        find_tool("pg_dump", profile.tool_overrides.pg_dump.as_deref()).ok_or_else(|| {
-            BackupError::ToolMissing {
-                tool: "pg_dump".into(),
-            }
-        })?;
+    let pg_dump = ResolvedTool::resolve(
+        Tool::PgDump,
+        tools,
+        profile.tool_overrides.pg_dump.as_deref(),
+    )
+    .ok_or_else(|| BackupError::ToolMissing {
+        tool: "pg_dump".into(),
+    })?;
 
-    let tool_version = probe_version(pg_dump.as_os_str());
+    // Inside a container, loopback is the container rather than the host that
+    // holds the tunnel's local end. See `ToolSource::rewrite_host`.
+    let endpoint = Endpoint {
+        host: tools.rewrite_host(&endpoint.host),
+        ..endpoint
+    };
+
+    let tool_version = pg_dump.probe_version();
 
     // pg_dump cannot read a server newer than itself, and the failure lands
     // mid-dump with a confusing message. Check before opening anything.
@@ -135,7 +148,11 @@ pub async fn run_postgres_backup(
     });
 
     let pg_dumpall = if options.include_globals {
-        let found = find_tool("pg_dumpall", profile.tool_overrides.pg_dumpall.as_deref());
+        let found = ResolvedTool::resolve(
+            Tool::PgDumpall,
+            tools,
+            profile.tool_overrides.pg_dumpall.as_deref(),
+        );
         if found.is_none() {
             ctx.emit_warn(
                 JobPhase::Initializing,
@@ -185,7 +202,7 @@ pub async fn run_postgres_backup(
                 DumpProgress::Size(bytes) => {
                     let event =
                         ProgressEvent::new(forward_ctx.job_id, JobPhase::DumpData, "dumping")
-                            .with_rows(bytes);
+                            .with_bytes(bytes);
                     forward_ctx.emit_event(event).await;
                 }
             }
@@ -333,7 +350,27 @@ fn run_dump(
         format!("dumping {}", plan.database),
     ));
 
-    let cmd = dump_command(&plan);
+    // Custom and directory archives are written by pg_dump itself, so the
+    // destination has to exist from the tool's point of view. Containerised,
+    // that is not this machine's path: without the bind mount pg_dump writes a
+    // perfectly good archive into a container that is then thrown away, and the
+    // failure surfaces as a missing file well after the dump reported success.
+    let mut pg_dump = plan.pg_dump.clone();
+    let artifact_arg = if plan.options.format == PgDumpFormat::Plain {
+        None
+    } else {
+        let dir = plan.artifact.parent().unwrap_or_else(|| Path::new("."));
+        let name = plan
+            .artifact
+            .file_name()
+            .ok_or_else(|| BackupError::Io("artifact has no file name".into()))?;
+        let mounted = pg_dump
+            .mount(dir, MountMode::ReadWrite)
+            .map_err(|e| BackupError::Io(e.to_string()))?;
+        Some(mounted.join(name))
+    };
+
+    let cmd = dump_command(&pg_dump, &plan, artifact_arg.as_deref());
     let _ = tx.send(DumpProgress::Phase(JobPhase::DumpSchema, cmd.display()));
 
     match plan.options.format {
@@ -480,7 +517,7 @@ fn with_password(mut cmd: ToolCommand, endpoint: &Endpoint) -> ToolCommand {
     cmd
 }
 
-fn dump_command(plan: &DumpPlan) -> ToolCommand {
+fn dump_command(pg_dump: &ResolvedTool, plan: &DumpPlan, artifact: Option<&Path>) -> ToolCommand {
     let o = &plan.options;
     let mut args = connection_args(&plan.endpoint);
 
@@ -521,19 +558,16 @@ fn dump_command(plan: &DumpPlan) -> ToolCommand {
 
     // Custom and directory archives are written by pg_dump; plain goes to
     // stdout so it can be compressed on the way past.
-    if o.format != PgDumpFormat::Plain {
-        args.push(format!("--file={}", plan.artifact.display()));
+    if let Some(path) = artifact {
+        args.push(format!("--file={}", path.display()));
     }
 
     args.push(format!("--dbname={}", plan.database));
 
-    with_password(
-        ToolCommand::new(plan.pg_dump.display().to_string()).args(args),
-        &plan.endpoint,
-    )
+    with_password(pg_dump.command().args(args), &plan.endpoint)
 }
 
-fn globals_command(plan: &DumpPlan, pg_dumpall: &Path) -> ToolCommand {
+fn globals_command(plan: &DumpPlan, pg_dumpall: &ResolvedTool) -> ToolCommand {
     let mut args = connection_args(&plan.endpoint);
     args.push("--globals-only".into());
     if plan.options.no_privileges {
@@ -541,7 +575,7 @@ fn globals_command(plan: &DumpPlan, pg_dumpall: &Path) -> ToolCommand {
     }
 
     with_password(
-        ToolCommand::new(pg_dumpall.display().to_string()).args(args),
+        pg_dumpall.command().args(args),
         &plan.endpoint,
     )
 }
@@ -561,11 +595,18 @@ mod tests {
     use super::*;
     use secrecy::SecretString;
 
+    /// A tool pinned to a path that exists, so the fixture never depends on
+    /// whether PostgreSQL happens to be installed on the machine running the
+    /// tests. Only the rendered command line is under test here.
+    fn local_tool(tool: Tool) -> ResolvedTool {
+        ResolvedTool::resolve(tool, &ToolSource::Local, Some("/bin/sh")).expect("/bin/sh exists")
+    }
+
     fn plan(format: PgDumpFormat) -> DumpPlan {
         DumpPlan {
             recipients: Vec::new(),
-            pg_dump: PathBuf::from("/usr/bin/pg_dump"),
-            pg_dumpall: Some(PathBuf::from("/usr/bin/pg_dumpall")),
+            pg_dump: local_tool(Tool::PgDump),
+            pg_dumpall: Some(local_tool(Tool::PgDumpall)),
             endpoint: Endpoint {
                 host: "127.0.0.1".into(),
                 port: 15432,
@@ -586,7 +627,7 @@ mod tests {
 
     #[test]
     fn the_password_never_appears_in_the_command_line() {
-        let rendered = dump_command(&plan(PgDumpFormat::Custom)).display();
+        let rendered = dump_command(&local_tool(Tool::PgDump), &plan(PgDumpFormat::Custom), Some(Path::new("/tmp/app.dump"))).display();
         assert!(!rendered.contains("hunter2"));
         assert!(
             rendered.contains("--no-password"),
@@ -596,7 +637,7 @@ mod tests {
 
     #[test]
     fn schema_only_tables_keep_structure_but_lose_rows() {
-        let rendered = dump_command(&plan(PgDumpFormat::Custom)).display();
+        let rendered = dump_command(&local_tool(Tool::PgDump), &plan(PgDumpFormat::Custom), Some(Path::new("/tmp/app.dump"))).display();
         assert!(
             rendered.contains("--exclude-table-data=public.audit_log"),
             "schema-only must exclude data, not the table"
@@ -606,13 +647,13 @@ mod tests {
 
     #[test]
     fn excluded_tables_are_dropped_entirely() {
-        let rendered = dump_command(&plan(PgDumpFormat::Custom)).display();
+        let rendered = dump_command(&local_tool(Tool::PgDump), &plan(PgDumpFormat::Custom), Some(Path::new("/tmp/app.dump"))).display();
         assert!(rendered.contains("--exclude-table=public.temp"));
     }
 
     #[test]
     fn portable_defaults_are_applied() {
-        let rendered = dump_command(&plan(PgDumpFormat::Custom)).display();
+        let rendered = dump_command(&local_tool(Tool::PgDump), &plan(PgDumpFormat::Custom), Some(Path::new("/tmp/app.dump"))).display();
         assert!(rendered.contains("--no-owner"));
         assert!(rendered.contains("--no-privileges"));
     }
@@ -620,14 +661,14 @@ mod tests {
     #[test]
     fn archive_formats_write_their_own_file() {
         for format in [PgDumpFormat::Custom, PgDumpFormat::Directory] {
-            let rendered = dump_command(&plan(format)).display();
+            let rendered = dump_command(&local_tool(Tool::PgDump), &plan(format), Some(Path::new("/tmp/app.dump"))).display();
             assert!(rendered.contains("--file=/tmp/app.dump"), "{format:?}");
         }
     }
 
     #[test]
     fn plain_format_streams_to_stdout_for_compression() {
-        let rendered = dump_command(&plan(PgDumpFormat::Plain)).display();
+        let rendered = dump_command(&local_tool(Tool::PgDump), &plan(PgDumpFormat::Plain), None).display();
         assert!(
             !rendered.contains("--file="),
             "plain output is piped through gzip, not written directly"
@@ -640,20 +681,20 @@ mod tests {
         let mut p = plan(PgDumpFormat::Custom);
         p.options.parallel_jobs = Some(4);
         assert!(
-            !dump_command(&p).display().contains("--jobs"),
+            !dump_command(&local_tool(Tool::PgDump), &p, None).display().contains("--jobs"),
             "pg_dump rejects -j for the custom format"
         );
 
         let mut p = plan(PgDumpFormat::Directory);
         p.options.parallel_jobs = Some(4);
-        assert!(dump_command(&p).display().contains("--jobs=4"));
+        assert!(dump_command(&local_tool(Tool::PgDump), &p, None).display().contains("--jobs=4"));
     }
 
     #[test]
     fn schema_restriction_is_passed_through() {
         let mut p = plan(PgDumpFormat::Custom);
         p.options.schemas = vec!["public".into(), "reporting".into()];
-        let rendered = dump_command(&p).display();
+        let rendered = dump_command(&local_tool(Tool::PgDump), &p, None).display();
         assert!(rendered.contains("--schema=public"));
         assert!(rendered.contains("--schema=reporting"));
     }
@@ -668,7 +709,7 @@ mod tests {
     #[test]
     fn globals_command_asks_only_for_globals() {
         let p = plan(PgDumpFormat::Custom);
-        let rendered = globals_command(&p, Path::new("/usr/bin/pg_dumpall")).display();
+        let rendered = globals_command(&p, &local_tool(Tool::PgDumpall)).display();
         assert!(rendered.contains("--globals-only"));
         assert!(rendered.contains("--no-password"));
     }

@@ -23,6 +23,7 @@ use db_sync_engine::events::JobKind;
 use db_sync_engine::job::{JobContext, JobOutcome};
 use db_sync_engine::manifest::BackupManifest;
 use db_sync_engine::ops;
+use db_sync_engine::tools::ToolSource;
 use db_sync_engine::profile::{
     ConnectionProfile, DbConfig, ProfileCreate, ToolOverrides,
 };
@@ -290,7 +291,7 @@ db_test! {
             .unwrap();
 
         let request = backup_request(out.path().to_path_buf());
-        let artifact = ops::backup(&source, &request, &store, &ctx)
+        let artifact = ops::backup(&source, &request, &store, &ToolSource::Local, &ctx)
             .await
             .expect("backup should succeed");
 
@@ -338,7 +339,7 @@ db_test! {
             typed_confirmation: None,
         };
 
-        let target = ops::restore(&dest, &restore_request, &store, &restore_ctx)
+        let target = ops::restore(&dest, &restore_request, &store, &ToolSource::Local, &restore_ctx)
             .await
             .expect("restore should succeed without SUPER");
 
@@ -429,7 +430,7 @@ db_test! {
 
         let ctx = JobContext::new(Uuid::new_v4());
         let request = backup_request(out.path().to_path_buf());
-        let artifact = ops::backup(&source, &request, &store, &ctx).await.unwrap();
+        let artifact = ops::backup(&source, &request, &store, &ToolSource::Local, &ctx).await.unwrap();
 
         let target = ops::restore(
             &dest,
@@ -443,6 +444,7 @@ db_test! {
                 typed_confirmation: None,
             },
             &store,
+            &ToolSource::Local,
             &ctx,
         )
         .await
@@ -497,7 +499,7 @@ db_test! {
         let _cleanup = Cleanup(vec![source.id, dest.id]);
 
         let ctx = JobContext::new(Uuid::new_v4());
-        let artifact = ops::backup(&source, &backup_request(out.path().to_path_buf()), &store, &ctx)
+        let artifact = ops::backup(&source, &backup_request(out.path().to_path_buf()), &store, &ToolSource::Local, &ctx)
             .await
             .unwrap();
 
@@ -524,6 +526,7 @@ db_test! {
                 typed_confirmation: None,
             },
             &store,
+            &ToolSource::Local,
             &ctx,
         )
         .await
@@ -571,6 +574,7 @@ db_test! {
             &source,
             &backup_request(out.path().to_path_buf()),
             &store,
+            &ToolSource::Local,
             &ctx,
         )
         .await;
@@ -917,7 +921,7 @@ db_test! {
         request.common.encrypt = true;
 
         let ctx = JobContext::new(Uuid::new_v4());
-        let artifact = ops::backup(&source, &request, &store, &ctx)
+        let artifact = ops::backup(&source, &request, &store, &ToolSource::Local, &ctx)
             .await
             .expect("encrypted backup");
 
@@ -954,7 +958,7 @@ db_test! {
             verify_checksum: true,
             typed_confirmation: None,
         };
-        let target = ops::restore(&dest, &restore, &store, &ctx)
+        let target = ops::restore(&dest, &restore, &store, &ToolSource::Local, &ctx)
             .await
             .expect("restore of an encrypted artifact");
 
@@ -976,7 +980,7 @@ db_test! {
         .await
         .unwrap();
 
-        let err = ops::restore(&dest, &restore, &store, &ctx)
+        let err = ops::restore(&dest, &restore, &store, &ToolSource::Local, &ctx)
             .await
             .expect_err("a foreign key must not decrypt this artifact");
         let message = err.to_string();
@@ -1023,7 +1027,7 @@ db_test! {
         request.common.encrypt = true;
 
         let ctx = JobContext::new(Uuid::new_v4());
-        let err = ops::backup(&source, &request, &store, &ctx)
+        let err = ops::backup(&source, &request, &store, &ToolSource::Local, &ctx)
             .await
             .expect_err("an un-escrowed key must block an encrypted backup");
         assert!(
@@ -1060,7 +1064,7 @@ db_test! {
         let _cleanup = Cleanup(vec![source.id, dest.id]);
 
         let ctx = JobContext::new(Uuid::new_v4());
-        let artifact = ops::backup(&source, &backup_request(out.path().to_path_buf()), &store, &ctx)
+        let artifact = ops::backup(&source, &backup_request(out.path().to_path_buf()), &store, &ToolSource::Local, &ctx)
             .await
             .expect("backup");
 
@@ -1074,6 +1078,7 @@ db_test! {
                 typed_confirmation: None,
             },
             &store,
+            &ToolSource::Local,
             &ctx,
         )
         .await
@@ -1162,7 +1167,7 @@ db_test! {
         let _cleanup = Cleanup(vec![source.id, dest.id]);
 
         let ctx = JobContext::new(Uuid::new_v4());
-        ops::backup(&source, &backup_request(out.path().to_path_buf()), &store, &ctx)
+        ops::backup(&source, &backup_request(out.path().to_path_buf()), &store, &ToolSource::Local, &ctx)
             .await
             .expect("backup");
 
@@ -1175,6 +1180,7 @@ db_test! {
                 keep_on_failure: false,
             },
             &store,
+            &ToolSource::Local,
             &ctx,
         )
         .await
@@ -1227,6 +1233,7 @@ db_test! {
                 keep_on_failure: false,
             },
             &store,
+            &ToolSource::Local,
             &ctx,
         )
         .await
@@ -1254,7 +1261,7 @@ db_test! {
         let _cleanup = Cleanup(vec![source.id, dest.id]);
 
         let ctx = JobContext::new(Uuid::new_v4());
-        let artifact = ops::backup(&source, &backup_request(out.path().to_path_buf()), &store, &ctx)
+        let artifact = ops::backup(&source, &backup_request(out.path().to_path_buf()), &store, &ToolSource::Local, &ctx)
             .await
             .expect("backup");
 
@@ -1270,6 +1277,7 @@ db_test! {
                 typed_confirmation: None,
             },
             &store,
+            &ToolSource::Local,
             &ctx,
         )
         .await
@@ -1300,7 +1308,7 @@ db_test! {
         let _cleanup = Cleanup(vec![source.id, dest.id]);
 
         let ctx = JobContext::new(Uuid::new_v4());
-        let artifact = ops::backup(&source, &backup_request(out.path().to_path_buf()), &store, &ctx)
+        let artifact = ops::backup(&source, &backup_request(out.path().to_path_buf()), &store, &ToolSource::Local, &ctx)
             .await
             .expect("backup");
 
@@ -1325,6 +1333,7 @@ db_test! {
                 typed_confirmation: None,
             },
             &store,
+            &ToolSource::Local,
             &ctx,
         )
         .await;
@@ -1372,7 +1381,7 @@ db_test! {
 
         // Something for the drill to find.
         let ctx = JobContext::new(Uuid::new_v4());
-        ops::backup(&source, &backup_request(out.path().to_path_buf()), &store, &ctx)
+        ops::backup(&source, &backup_request(out.path().to_path_buf()), &store, &ToolSource::Local, &ctx)
             .await
             .expect("a backup for the drill to check");
 
@@ -1489,7 +1498,7 @@ db_test! {
         let _cleanup = Cleanup(vec![source.id, dest.id]);
 
         let ctx = JobContext::new(Uuid::new_v4());
-        let artifact = ops::backup(&source, &backup_request(out.path().to_path_buf()), &store, &ctx)
+        let artifact = ops::backup(&source, &backup_request(out.path().to_path_buf()), &store, &ToolSource::Local, &ctx)
             .await
             .expect("backup");
 
@@ -1515,6 +1524,7 @@ db_test! {
                 keep_on_failure: false,
             },
             &store,
+            &ToolSource::Local,
             &ctx,
         )
         .await
@@ -1578,7 +1588,7 @@ db_test! {
         );
 
         let ctx = JobContext::new(Uuid::new_v4());
-        ops::backup(&source, &request, &store, &ctx).await.expect("backup");
+        ops::backup(&source, &request, &store, &ToolSource::Local, &ctx).await.expect("backup");
 
         let outcome = ops::drill(
             &dest,
@@ -1589,6 +1599,7 @@ db_test! {
                 keep_on_failure: false,
             },
             &store,
+            &ToolSource::Local,
             &ctx,
         )
         .await
@@ -1626,7 +1637,7 @@ db_test! {
         request.common.record_row_counts = true;
 
         let ctx = JobContext::new(Uuid::new_v4());
-        let artifact = ops::backup(&source, &request, &store, &ctx)
+        let artifact = ops::backup(&source, &request, &store, &ToolSource::Local, &ctx)
             .await
             .expect("backup");
 
@@ -1653,6 +1664,7 @@ db_test! {
                 keep_on_failure: false,
             },
             &store,
+            &ToolSource::Local,
             &ctx,
         )
         .await
@@ -1685,6 +1697,7 @@ db_test! {
                 keep_on_failure: false,
             },
             &store,
+            &ToolSource::Local,
             &ctx,
         )
         .await

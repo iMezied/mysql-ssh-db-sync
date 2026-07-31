@@ -33,6 +33,7 @@ tracing-subscriber.workspace = true
 specta.workspace = true
 specta-typescript.workspace = true
 tauri-specta.workspace = true
+tauri-plugin-dialog = "2.7.2"
 
 # Keep target-specific sections LAST. A `[target.'cfg(...)'.dependencies]`
 # header captures every key that follows it, so one placed mid-file silently

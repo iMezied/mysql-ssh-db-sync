@@ -3,7 +3,13 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import PageHeader from "@/components/PageHeader";
 import { api } from "@/lib/api";
-import type { AppSettings, ImportReport } from "@/bindings";
+import { cn } from "@/lib/utils";
+import type {
+  AppSettings,
+  ImportReport,
+  ToolSource,
+  ToolStatus,
+} from "@/bindings";
 
 export default function SettingsPage() {
   const queryClient = useQueryClient();
@@ -85,6 +91,8 @@ export default function SettingsPage() {
             </p>
           )}
         </section>
+
+        <DatabaseToolsSection />
 
         <BackupKeySection />
 
@@ -491,6 +499,289 @@ function BackupKeySection() {
  * invokes it — without this the first thing that line asks of the user is to
  * go and find a binary they were never given.
  */
+/** The three ways to supply the client binaries, in the order they are offered. */
+const SOURCE_KINDS = [
+  {
+    kind: "local" as const,
+    label: "Installed on this Mac",
+    blurb: "Binaries found on this machine. Needs no container runtime.",
+  },
+  {
+    kind: "docker_exec" as const,
+    label: "A running container",
+    blurb:
+      "Borrow the tools from a container you already have up. Nothing to download — but it stops working when that container does.",
+  },
+  {
+    kind: "docker_run" as const,
+    label: "A container image",
+    blurb:
+      "Start a throwaway container per job. Always the right client, and nothing else has to stay running.",
+  },
+];
+
+/**
+ * Where the dump and restore binaries come from.
+ *
+ * Worth a whole section because a missing `mysqldump` is otherwise invisible
+ * until a backup fails on it — and the failure names the binary without saying
+ * that Docker would do just as well.
+ */
+function DatabaseToolsSection() {
+  const queryClient = useQueryClient();
+  const settings = useQuery({
+    queryKey: ["app-settings"],
+    queryFn: api.getAppSettings,
+  });
+  const tools = useQuery({
+    queryKey: ["tools"],
+    queryFn: api.discoverTools,
+    // Every probe runs a binary, and with a container source that starts a
+    // container apiece. Far too expensive to refetch on a window focus.
+    staleTime: 60_000,
+    refetchOnWindowFocus: false,
+  });
+  const containers = useQuery({
+    queryKey: ["docker-containers"],
+    queryFn: api.listDockerContainers,
+    retry: false,
+  });
+
+  const source = settings.data?.tool_source;
+
+  const saveSource = useMutation({
+    mutationFn: async (next: ToolSource) => {
+      if (!settings.data) throw new Error("settings have not loaded yet");
+      return api.setAppSettings({ ...settings.data, tool_source: next });
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["app-settings"] });
+      void queryClient.invalidateQueries({ queryKey: ["tools"] });
+    },
+  });
+
+  const install = useMutation({
+    mutationFn: (formula: string) => api.installToolWithBrew(formula),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["tools"] }),
+  });
+
+  const missingRequired =
+    tools.data?.filter((t) => t.required && !t.location) ?? [];
+
+  return (
+    <section className="space-y-3">
+      <h2 className="text-sm font-medium text-slate-200">Database tools</h2>
+
+      <div className="panel space-y-4 p-4">
+        <p className="max-w-2xl text-xs leading-relaxed text-slate-500">
+          Dumps and restores run the vendors' own clients —{" "}
+          <code className="text-slate-400">mysqldump</code>,{" "}
+          <code className="text-slate-400">pg_dump</code>,{" "}
+          <code className="text-slate-400">mongodump</code>. This app never
+          bundles them; point it at binaries on this Mac, or let Docker supply
+          them.
+        </p>
+
+        <div className="space-y-2">
+          {SOURCE_KINDS.map(({ kind, label, blurb }) => (
+            <label
+              key={kind}
+              className={cn(
+                "flex cursor-pointer gap-3 rounded-md border p-3 transition",
+                source?.kind === kind
+                  ? "border-blue-500/60 bg-blue-500/5"
+                  : "border-slate-800 hover:bg-slate-800/40",
+              )}
+            >
+              <input
+                type="radio"
+                name="tool-source"
+                className="mt-0.5 h-4 w-4"
+                checked={source?.kind === kind}
+                onChange={() =>
+                  saveSource.mutate(
+                    kind === "local"
+                      ? { kind: "local" }
+                      : kind === "docker_exec"
+                        ? {
+                            kind: "docker_exec",
+                            container: containers.data?.[0]?.name ?? "",
+                            bin_dir: null,
+                          }
+                        : { kind: "docker_run", image: "mysql:8" },
+                  )
+                }
+              />
+              <div className="space-y-0.5">
+                <div className="text-sm text-slate-200">{label}</div>
+                <div className="text-xs leading-relaxed text-slate-500">
+                  {blurb}
+                </div>
+              </div>
+            </label>
+          ))}
+        </div>
+
+        {source?.kind === "docker_exec" && (
+          <ExecSourceFields
+            source={source}
+            containers={containers.data ?? []}
+            error={containers.error ? String(containers.error) : null}
+            onChange={(next) => saveSource.mutate(next)}
+          />
+        )}
+
+        {source?.kind === "docker_run" && (
+          <label className="block max-w-sm">
+            <span className="field-label">Image</span>
+            <input
+              className="field-input"
+              defaultValue={source.image}
+              placeholder="mysql:8"
+              onBlur={(e) =>
+                e.target.value !== source.image &&
+                saveSource.mutate({ kind: "docker_run", image: e.target.value })
+              }
+            />
+          </label>
+        )}
+
+        {missingRequired.length > 0 && (
+          <p className="text-xs text-amber-300/90">
+            Missing:{" "}
+            {missingRequired.map((t) => t.binary).join(", ")}. Backups for those
+            engines will fail immediately — which is the point, rather than
+            failing an hour in.
+          </p>
+        )}
+
+        <div className="divide-y divide-slate-800 rounded-md border border-slate-800">
+          {tools.isPending ? (
+            <p className="p-3 text-xs text-slate-500">Looking for the tools…</p>
+          ) : (
+            tools.data?.map((tool) => (
+              <ToolRow
+                key={tool.binary}
+                tool={tool}
+                installing={
+                  install.isPending && install.variables === tool.brew_formula
+                }
+                onInstall={() =>
+                  tool.brew_formula && install.mutate(tool.brew_formula)
+                }
+              />
+            ))
+          )}
+        </div>
+
+        {install.error && (
+          <p className="text-xs text-red-400">{String(install.error)}</p>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function ExecSourceFields({
+  source,
+  containers,
+  error,
+  onChange,
+}: {
+  source: Extract<ToolSource, { kind: "docker_exec" }>;
+  containers: { name: string; image: string }[];
+  error: string | null;
+  onChange: (next: ToolSource) => void;
+}) {
+  return (
+    <div className="grid max-w-2xl grid-cols-2 gap-3">
+      <label>
+        <span className="field-label">Running container</span>
+        <select
+          className="field-input"
+          value={source.container}
+          onChange={(e) =>
+            onChange({ ...source, container: e.target.value })
+          }
+        >
+          <option value="">Choose a container…</option>
+          {containers.map((c) => (
+            <option key={c.name} value={c.name}>
+              {c.name} ({c.image})
+            </option>
+          ))}
+        </select>
+        {/* An empty list and an unreachable Docker need different advice. */}
+        {error ? (
+          <span className="mt-1 block text-xs text-amber-300/90">
+            Docker did not answer. Is it installed and running?
+          </span>
+        ) : containers.length === 0 ? (
+          <span className="mt-1 block text-xs text-slate-500">
+            Nothing is running right now. Start a container and reopen this page.
+          </span>
+        ) : null}
+      </label>
+
+      <label>
+        <span className="field-label">Binary directory (optional)</span>
+        <input
+          className="field-input"
+          defaultValue={source.bin_dir ?? ""}
+          placeholder="on the container's PATH"
+          onBlur={(e) =>
+            onChange({ ...source, bin_dir: e.target.value.trim() || null })
+          }
+        />
+      </label>
+    </div>
+  );
+}
+
+function ToolRow({
+  tool,
+  installing,
+  onInstall,
+}: {
+  tool: ToolStatus;
+  installing: boolean;
+  onInstall: () => void;
+}) {
+  return (
+    <div className="flex items-center gap-3 px-3 py-2">
+      <span
+        className={cn(
+          "h-1.5 w-1.5 shrink-0 rounded-full",
+          tool.location
+            ? "bg-emerald-400"
+            : tool.required
+              ? "bg-red-400"
+              : "bg-slate-600",
+        )}
+      />
+      <span className="w-32 shrink-0 font-mono text-xs text-slate-300">
+        {tool.binary}
+      </span>
+      <span className="w-16 shrink-0 text-xs tabular-nums text-slate-400">
+        {tool.version ?? ""}
+      </span>
+      <span className="flex-1 truncate font-mono text-[11px] text-slate-600">
+        {tool.location ?? (tool.required ? "not found" : "not found (optional)")}
+      </span>
+      {!tool.location && tool.brew_formula && (
+        <button
+          type="button"
+          onClick={onInstall}
+          disabled={installing}
+          className="shrink-0 rounded border border-slate-700 px-2 py-1 text-xs text-slate-300 transition hover:bg-slate-800 disabled:opacity-50"
+        >
+          {installing ? "Installing…" : `brew install ${tool.brew_formula}`}
+        </button>
+      )}
+    </div>
+  );
+}
+
 function CommandLineSection() {
   const queryClient = useQueryClient();
   const status = useQuery({ queryKey: ["cli-status"], queryFn: api.cliStatus });

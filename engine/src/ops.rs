@@ -14,6 +14,7 @@ use crate::backup::{
 use crate::connect::{self, ConnectError};
 use crate::db::ConnectParams;
 use crate::events::{JobKind, JobPhase};
+use crate::tools::{ResolvedTool, Tool, ToolSource};
 use crate::job::{JobContext, JobOutcome, JobRecord};
 use crate::mask::{self, MaskError, MaskRule, MaskingCoverage, MaskingReport};
 use crate::profile::ConnectionProfile;
@@ -131,13 +132,44 @@ async fn server_version(
     Ok(info.version)
 }
 
+/// The binary that dumps this profile's engine, and its per-profile override.
+///
+/// Kept next to [`backup`] rather than on `Engine` because it answers a
+/// question only the backup path asks: restores need a different binary, and
+/// pairing them here would invite using the wrong one.
+fn dump_tool_for(profile: &ConnectionProfile) -> (Tool, Option<&str>) {
+    match profile.engine {
+        Engine::Mysql => (Tool::Mysqldump, profile.tool_overrides.mysqldump.as_deref()),
+        Engine::Postgres => (Tool::PgDump, profile.tool_overrides.pg_dump.as_deref()),
+        Engine::Mongo => (Tool::Mongodump, profile.tool_overrides.mongodump.as_deref()),
+    }
+}
+
 /// Run a backup end to end.
 pub async fn backup(
     profile: &ConnectionProfile,
     request: &BackupRequest,
     store: &Store,
+    // Where the client binaries come from. Global, so it arrives from the
+    // caller rather than from the profile — see `ToolSource`.
+    tools: &ToolSource,
     ctx: &JobContext,
 ) -> Result<PathBuf, OpError> {
+    // First, because it is the cheapest thing that can fail the whole job.
+    //
+    // Each engine checks this again when it builds its command line, but by
+    // then an SSH connection is open, the server has been introspected and the
+    // row counts are in — on a 109-table database that is over a minute spent
+    // to learn something a stat(2) knew before any of it started. Same
+    // reasoning as the escrow check below, applied to the earlier failure.
+    let (dump_tool, override_path) = dump_tool_for(profile);
+    if ResolvedTool::resolve(dump_tool, tools, override_path).is_none() {
+        return Err(BackupError::ToolMissing {
+            tool: dump_tool.binary_name().into(),
+        }
+        .into());
+    }
+
     ctx.emit(JobPhase::SshConnect, "connecting to the source")
         .await;
     let reachable = reach(profile, store).await?;
@@ -202,6 +234,7 @@ pub async fn backup(
                 version,
                 &recipients,
                 &row_counts,
+                tools,
                 ctx,
             )
             .await?
@@ -214,6 +247,7 @@ pub async fn backup(
                 version,
                 &recipients,
                 &row_counts,
+                tools,
                 ctx,
             )
             .await?
@@ -226,6 +260,7 @@ pub async fn backup(
                 version,
                 &recipients,
                 &row_counts,
+                tools,
                 ctx,
             )
             .await?
@@ -240,6 +275,8 @@ pub async fn restore(
     profile: &ConnectionProfile,
     request: &RestoreRequest,
     store: &Store,
+    // Where the client binaries come from. See `ToolSource`.
+    tools: &ToolSource,
     ctx: &JobContext,
 ) -> Result<String, OpError> {
     ctx.emit(JobPhase::SshConnect, "connecting to the destination")
@@ -250,9 +287,11 @@ pub async fn restore(
 
     let endpoint = reachable.endpoint.clone();
     let target = match profile.engine {
-        Engine::Mysql => run_mysql_restore(profile, request, endpoint, ctx).await?,
-        Engine::Postgres => run_postgres_restore(profile, request, endpoint, ctx).await?,
-        Engine::Mongo => run_mongo_restore(profile, request, endpoint, ctx).await?,
+        Engine::Mysql => run_mysql_restore(profile, request, endpoint, tools, ctx).await?,
+        Engine::Postgres => {
+            run_postgres_restore(profile, request, endpoint, tools, ctx).await?
+        }
+        Engine::Mongo => run_mongo_restore(profile, request, endpoint, tools, ctx).await?,
     };
     Ok(target)
 }
@@ -696,6 +735,8 @@ pub async fn sync(
     dest: &ConnectionProfile,
     request: &SyncRequest,
     store: &Store,
+    // Where the client binaries come from. See `ToolSource`.
+    tools: &ToolSource,
     ctx: &JobContext,
 ) -> Result<SyncOutcome, OpError> {
     // Cross-engine sync is not a copy, it is a migration, and nothing here
@@ -716,7 +757,7 @@ pub async fn sync(
     let coverage = plan_masking(source, request, store, ctx).await?;
 
     // ── Backup ──────────────────────────────────────────────────────────
-    let artifact = backup(source, &request.backup, store, ctx).await?;
+    let artifact = backup(source, &request.backup, store, tools, ctx).await?;
     ctx.bail_if_cancelled().map_err(|_| OpError::Cancelled)?;
 
     // ── Off-site copy ───────────────────────────────────────────────────
@@ -736,7 +777,7 @@ pub async fn sync(
         typed_confirmation: request.typed_confirmation.clone(),
     };
 
-    let target = restore(dest, &restore_request, store, ctx).await?;
+    let target = restore(dest, &restore_request, store, tools, ctx).await?;
     ctx.bail_if_cancelled().map_err(|_| OpError::Cancelled)?;
 
     // ── Mask ────────────────────────────────────────────────────────────
@@ -1632,6 +1673,8 @@ pub async fn drill(
     dest: &ConnectionProfile,
     request: &DrillRequest,
     store: &Store,
+    // Where the client binaries come from. See `ToolSource`.
+    tools: &ToolSource,
     ctx: &JobContext,
 ) -> Result<DrillOutcome, OpError> {
     ctx.emit(JobPhase::Initializing, "looking for the newest backup")
@@ -1680,7 +1723,7 @@ pub async fn drill(
         typed_confirmation: None,
     };
 
-    let scratch = restore(dest, &restore_request, store, ctx).await?;
+    let scratch = restore(dest, &restore_request, store, tools, ctx).await?;
 
     let report =
         check_against_manifest(dest, &manifest, &scratch, request.deep_verify, store, ctx).await?;
@@ -1947,6 +1990,62 @@ fn is_drill_stamp(stamp: &str) -> bool {
                 if i == 8 { c == '_' } else { c.is_ascii_digit() }
             },
         )
+}
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::*;
+    use crate::profile::{DbConfig, ToolOverrides};
+    use crate::types::EnvironmentTag;
+
+    fn profile(engine: Engine) -> ConnectionProfile {
+        ConnectionProfile {
+            id: uuid::Uuid::new_v4(),
+            name: "p".into(),
+            engine,
+            environment: EnvironmentTag::Dev,
+            ssh_connection_id: None,
+            db: DbConfig {
+                host: "127.0.0.1".into(),
+                port: engine.default_port(),
+                user: "root".into(),
+                database: None,
+            },
+            tool_overrides: ToolOverrides::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Every engine must name a dump binary, or its backups fail late — after
+    /// the connect and the row counts — instead of before any of it.
+    #[test]
+    fn every_engine_names_the_binary_its_backup_needs() {
+        let expected = [
+            (Engine::Mysql, Tool::Mysqldump),
+            (Engine::Postgres, Tool::PgDump),
+            (Engine::Mongo, Tool::Mongodump),
+        ];
+        assert_eq!(
+            expected.len(),
+            Engine::ALL.len(),
+            "an engine was added without a dump binary to preflight"
+        );
+
+        for (engine, tool) in expected {
+            let mut p = profile(engine);
+            assert_eq!(dump_tool_for(&p).0, tool);
+
+            // And the profile's own override is the one consulted: reading a
+            // different engine's field would silently ignore what was set.
+            match engine {
+                Engine::Mysql => p.tool_overrides.mysqldump = Some("/x".into()),
+                Engine::Postgres => p.tool_overrides.pg_dump = Some("/x".into()),
+                Engine::Mongo => p.tool_overrides.mongodump = Some("/x".into()),
+            }
+            assert_eq!(dump_tool_for(&p).1, Some("/x"));
+        }
+    }
 }
 
 #[cfg(test)]

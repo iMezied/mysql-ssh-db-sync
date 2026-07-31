@@ -28,7 +28,8 @@ use super::{EngineRestoreOptions, MongoRestoreOptions, RestoreError, RestoreRequ
 use crate::backup::mysql::Endpoint;
 use crate::db::MONGO_AUTH_SOURCE;
 use crate::events::JobPhase;
-use crate::exec::{ChildHandle, ToolCommand, find_tool, wait_checked};
+use crate::exec::{ChildHandle, ToolCommand, wait_checked};
+use crate::tools::{ResolvedTool, Tool, ToolSource};
 use crate::job::JobContext;
 use crate::manifest::BackupManifest;
 use crate::profile::ConnectionProfile;
@@ -46,6 +47,8 @@ pub async fn run_mongo_restore(
     profile: &ConnectionProfile,
     request: &RestoreRequest,
     endpoint: Endpoint,
+    // Where the client binaries come from: this machine, or a container.
+    tools: &ToolSource,
     ctx: &JobContext,
 ) -> Result<String, RestoreError> {
     let manifest = BackupManifest::read(&request.artifact_path).ok();
@@ -101,8 +104,9 @@ pub async fn run_mongo_restore(
         None
     };
 
-    let mongorestore = find_tool(
-        "mongorestore",
+    let mongorestore = ResolvedTool::resolve(
+        Tool::Mongorestore,
+        tools,
         profile.tool_overrides.mongorestore.as_deref(),
     )
     .ok_or_else(|| {
@@ -111,6 +115,13 @@ pub async fn run_mongo_restore(
                 .into(),
         )
     })?;
+
+    // Inside a container, loopback is the container rather than the host that
+    // holds the tunnel's local end. See `ToolSource::rewrite_host`.
+    let endpoint = Endpoint {
+        host: tools.rewrite_host(&endpoint.host),
+        ..endpoint
+    };
 
     if request.verify_checksum {
         if let Some(m) = &manifest {
@@ -209,7 +220,7 @@ pub async fn run_mongo_restore(
 }
 
 struct RestoreWorker {
-    mongorestore: PathBuf,
+    mongorestore: ResolvedTool,
     endpoint: Endpoint,
     /// The database the archive was dumped from, read from the manifest.
     source_database: String,
@@ -240,7 +251,7 @@ impl RestoreWorker {
         self.stream(&tx, &current_child, &cancel)
     }
 
-    fn command(&self, config: Option<&std::path::Path>) -> ToolCommand {
+    fn command(&self, mongorestore: &ResolvedTool, config: Option<&std::path::Path>) -> ToolCommand {
         let o = &self.options;
         let mut args = vec![
             format!("--host={}", self.endpoint.host),
@@ -293,7 +304,7 @@ impl RestoreWorker {
             args.push(format!("--nsInclude={}.{}", self.source_database, name));
         }
 
-        ToolCommand::new(self.mongorestore.display().to_string()).args(args)
+        mongorestore.command().args(args)
     }
 
     fn stream(
@@ -310,8 +321,21 @@ impl RestoreWorker {
             None => None,
         };
 
+        // A containerised tool cannot see this machine's temp directory, so
+        // the file is bound in and the tool is given the path it will actually
+        // find it at.
+        let mut mongorestore = self.mongorestore.clone();
+        let config_path = match &credentials {
+            Some(file) => Some(
+                mongorestore
+                    .mount(file.path(), crate::tools::MountMode::ReadOnly)
+                    .map_err(|e| RestoreError::Invalid(e.to_string()))?,
+            ),
+            None => None,
+        };
+
         let (child, mut stdin, stderr) = self
-            .command(credentials.as_ref().map(|f| f.path()))
+            .command(&mongorestore, config_path.as_deref())
             .spawn_writing()?;
         {
             *current_child.blocking_lock() = Some(child);
@@ -450,11 +474,18 @@ impl<R: std::io::Read> std::io::Read for CountingReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tool pinned to a path that exists, so these fixtures never depend on
+    /// whether the client happens to be installed on the machine running the
+    /// tests. Only the rendered command line is under test.
+    fn local_tool(tool: Tool) -> ResolvedTool {
+        ResolvedTool::resolve(tool, &ToolSource::Local, Some("/bin/sh")).expect("/bin/sh exists")
+    }
     use secrecy::SecretString;
 
     fn worker(naming: &TargetNaming) -> RestoreWorker {
         RestoreWorker {
-            mongorestore: PathBuf::from("/usr/local/bin/mongorestore"),
+            mongorestore: local_tool(Tool::Mongorestore),
             endpoint: Endpoint {
                 host: "127.0.0.1".into(),
                 port: 27018,
@@ -480,7 +511,7 @@ mod tests {
 
     #[test]
     fn the_password_never_appears_in_the_command_line() {
-        let rendered = worker(&timestamped()).command(None).display();
+        let rendered = worker(&timestamped()).command(&local_tool(Tool::Mongorestore), None).display();
         assert!(!rendered.contains("hunter2"), "{rendered}");
         assert!(!rendered.contains("--password"), "{rendered}");
     }
@@ -491,7 +522,7 @@ mod tests {
         // database it was dumped from — which on a production profile means
         // overwriting the source.
         let w = worker(&timestamped());
-        let rendered = w.command(None).display();
+        let rendered = w.command(&local_tool(Tool::Mongorestore), None).display();
         assert!(rendered.contains("--nsFrom=prod_app.*"), "{rendered}");
         assert!(
             rendered.contains(&format!("--nsTo={}.*", w.target)),
@@ -506,7 +537,7 @@ mod tests {
         // success.
         let mut w = worker(&timestamped());
         w.options.only_collections = vec!["orders".into()];
-        let rendered = w.command(None).display();
+        let rendered = w.command(&local_tool(Tool::Mongorestore), None).display();
         assert!(rendered.contains("--nsInclude=prod_app.orders"), "{rendered}");
         assert!(
             !rendered.contains(&format!("--nsInclude={}.orders", w.target)),
@@ -516,7 +547,7 @@ mod tests {
 
     #[test]
     fn a_timestamped_restore_never_drops() {
-        let rendered = worker(&timestamped()).command(None).display();
+        let rendered = worker(&timestamped()).command(&local_tool(Tool::Mongorestore), None).display();
         assert!(
             !rendered.contains("--drop"),
             "the default restore must be non-destructive: {rendered}"
@@ -528,7 +559,7 @@ mod tests {
         let w = worker(&TargetNaming::DropAndRecreate {
             name: "staging".into(),
         });
-        assert!(w.command(None).display().contains("--drop"));
+        assert!(w.command(&local_tool(Tool::Mongorestore), None).display().contains("--drop"));
         assert_eq!(w.target, "staging");
     }
 
@@ -538,33 +569,33 @@ mod tests {
             MongoRestoreOptions::default().stop_on_error,
             "without this mongorestore skips failed documents and exits 0"
         );
-        assert!(worker(&timestamped()).command(None).display().contains("--stopOnError"));
+        assert!(worker(&timestamped()).command(&local_tool(Tool::Mongorestore), None).display().contains("--stopOnError"));
     }
 
     #[test]
     fn gzip_is_passed_only_for_an_archive_that_has_it() {
-        assert!(worker(&timestamped()).command(None).display().contains("--gzip"));
+        assert!(worker(&timestamped()).command(&local_tool(Tool::Mongorestore), None).display().contains("--gzip"));
         let mut w = worker(&timestamped());
         w.gzipped = false;
-        assert!(!w.command(None).display().contains("--gzip"));
+        assert!(!w.command(&local_tool(Tool::Mongorestore), None).display().contains("--gzip"));
     }
 
     #[test]
     fn indexes_are_restored_unless_turned_off() {
         assert!(
             !worker(&timestamped())
-                .command(None)
+                .command(&local_tool(Tool::Mongorestore), None)
                 .display()
                 .contains("--noIndexRestore")
         );
         let mut w = worker(&timestamped());
         w.options.restore_indexes = false;
-        assert!(w.command(None).display().contains("--noIndexRestore"));
+        assert!(w.command(&local_tool(Tool::Mongorestore), None).display().contains("--noIndexRestore"));
     }
 
     #[test]
     fn the_tool_authenticates_against_the_same_database_as_the_driver() {
-        let rendered = worker(&timestamped()).command(None).display();
+        let rendered = worker(&timestamped()).command(&local_tool(Tool::Mongorestore), None).display();
         assert!(rendered.contains(&format!("--authenticationDatabase={MONGO_AUTH_SOURCE}")));
     }
 

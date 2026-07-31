@@ -175,6 +175,32 @@ brew install mysql-client libpq mongodb-database-tools        # macOS
 apt install mysql-client postgresql-client mongodb-database-tools   # Debian
 ```
 
+### Or don't install them at all
+
+The client tools can run inside a container instead, which is the quicker
+answer when a database container is already on the machine. **Settings → Tool
+source** offers three:
+
+| Source | What it does | Cost |
+|---|---|---|
+| **This machine** | Binaries installed here. The default. | An install per engine |
+| **A running container** | Borrows the binaries from a container that is already up | Nothing, until that container stops |
+| **An image** | A throwaway container per dump | One image pull (~160–280 MB) |
+
+Two consequences worth knowing before switching:
+
+- **A tunnelled connection still works**, because the tool's host is rewritten
+  from `127.0.0.1` to `host.docker.internal`. Introspection keeps talking to
+  loopback from this process — only the tool is redirected.
+- **Borrowing a running container cannot accept a file**, so it works for MySQL
+  and for MongoDB only without a password. A bind mount cannot be added to a
+  container that has already started, and copying a credentials file into
+  somebody else's container is not a trade this makes. Use an image for those.
+
+A per-connection binary override still wins over whichever source is set —
+pointing a connection at a specific `mysqldump` means that one runs, not a
+different one out of a container.
+
 `mongodb-database-tools` comes from MongoDB's own tap on macOS
 (`brew tap mongodb/brew` first) and from their apt repository on Debian; it is
 not in either default index. `mysql-client` and `libpq` install keg-only, which

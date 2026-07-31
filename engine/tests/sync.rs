@@ -14,6 +14,7 @@ use db_sync_engine::sshconn::{SshAuth, SshConfig, SshConnectionCreate, SshEndpoi
 use db_sync_engine::job::JobContext;
 use db_sync_engine::mask::{MaskRule, MaskTransform};
 use db_sync_engine::ops::{self, SyncRequest};
+use db_sync_engine::tools::ToolSource;
 use db_sync_engine::plan::{SyncPlanCreate, parse_tables_conf};
 use db_sync_engine::profile::{
     ConnectionProfile, DbConfig, ProfileCreate, ToolOverrides,
@@ -392,7 +393,7 @@ db_test! {
             typed_confirmation: None,
         };
 
-        let outcome = ops::sync(&source, &dest, &request, &store, &ctx)
+        let outcome = ops::sync(&source, &dest, &request, &store, &ToolSource::Local, &ctx)
             .await
             .expect("sync should succeed");
 
@@ -458,7 +459,7 @@ db_test! {
             typed_confirmation: None,
         };
 
-        let outcome = ops::sync(&source, &dest, &request, &store, &ctx)
+        let outcome = ops::sync(&source, &dest, &request, &store, &ToolSource::Local, &ctx)
             .await
             .expect("sync should succeed");
 
@@ -511,7 +512,7 @@ db_test! {
             typed_confirmation: None,
         };
 
-        let err = ops::sync(&source, &dest, &request, &store, &ctx)
+        let err = ops::sync(&source, &dest, &request, &store, &ToolSource::Local, &ctx)
             .await
             .expect_err("MySQL to PostgreSQL is a migration, not a copy");
 
@@ -558,7 +559,7 @@ db_test! {
             typed_confirmation: None,
         };
 
-        let err = ops::sync(&source, &dest, &request, &store, &ctx)
+        let err = ops::sync(&source, &dest, &request, &store, &ToolSource::Local, &ctx)
             .await
             .expect_err("dropping a database must require confirmation");
         assert!(format!("{err}").contains("type its name"), "got: {err}");
@@ -623,7 +624,7 @@ db_test! {
             typed_confirmation: None,
         };
 
-        let outcome = ops::sync(&source, &dest, &request, &store, &ctx)
+        let outcome = ops::sync(&source, &dest, &request, &store, &ToolSource::Local, &ctx)
             .await
             .expect("a masked sync should succeed");
 
@@ -701,7 +702,7 @@ db_test! {
             typed_confirmation: None,
         };
 
-        let err = ops::sync(&source, &dest, &request, &store, &ctx)
+        let err = ops::sync(&source, &dest, &request, &store, &ToolSource::Local, &ctx)
             .await
             .expect_err("NULLing a NOT NULL column cannot succeed");
         assert!(
@@ -743,7 +744,7 @@ db_test! {
             typed_confirmation: None,
         };
 
-        let err = ops::sync(&source, &dest, &request, &store, &ctx)
+        let err = ops::sync(&source, &dest, &request, &store, &ToolSource::Local, &ctx)
             .await
             .expect_err("a rule that protects nothing must not run");
         assert!(

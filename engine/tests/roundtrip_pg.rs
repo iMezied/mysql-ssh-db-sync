@@ -15,6 +15,7 @@ use db_sync_engine::sshconn::{SshAuth, SshConfig, SshConnectionCreate, SshEndpoi
 use db_sync_engine::job::JobContext;
 use db_sync_engine::manifest::{ArtifactFormat, BackupManifest};
 use db_sync_engine::ops;
+use db_sync_engine::tools::ToolSource;
 use db_sync_engine::profile::{
     ConnectionProfile, DbConfig, ProfileCreate, ToolOverrides,
 };
@@ -233,7 +234,7 @@ db_test! {
 
         let ctx = JobContext::new(Uuid::new_v4());
         let request = backup_request(out.path().to_path_buf(), PgDumpFormat::Custom);
-        let artifact = ops::backup(&p, &request, &store, &ctx)
+        let artifact = ops::backup(&p, &request, &store, &ToolSource::Local, &ctx)
             .await
             .expect("backup should succeed");
 
@@ -262,6 +263,7 @@ db_test! {
                 typed_confirmation: None,
             },
             &store,
+            &ToolSource::Local,
             &ctx,
         )
         .await
@@ -365,7 +367,7 @@ db_test! {
 
         let ctx = JobContext::new(Uuid::new_v4());
         let request = backup_request(out.path().to_path_buf(), PgDumpFormat::Plain);
-        let artifact = ops::backup(&p, &request, &store, &ctx).await.expect("backup");
+        let artifact = ops::backup(&p, &request, &store, &ToolSource::Local, &ctx).await.expect("backup");
 
         // Plain output is gzipped on the way past, like the MySQL path.
         assert!(artifact.to_string_lossy().ends_with(".sql.gz"));
@@ -388,6 +390,7 @@ db_test! {
                 typed_confirmation: None,
             },
             &store,
+            &ToolSource::Local,
             &ctx,
         )
         .await
@@ -419,7 +422,7 @@ db_test! {
         }
 
         let ctx = JobContext::new(Uuid::new_v4());
-        let artifact = ops::backup(&p, &request, &store, &ctx).await.expect("backup");
+        let artifact = ops::backup(&p, &request, &store, &ToolSource::Local, &ctx).await.expect("backup");
 
         assert!(artifact.is_dir(), "a directory archive is a directory");
         assert!(
@@ -446,6 +449,7 @@ db_test! {
                 typed_confirmation: None,
             },
             &store,
+            &ToolSource::Local,
             &ctx,
         )
         .await
@@ -468,7 +472,7 @@ db_test! {
 
         let ctx = JobContext::new(Uuid::new_v4());
         let request = backup_request(out.path().to_path_buf(), PgDumpFormat::Custom);
-        let artifact = ops::backup(&p, &request, &store, &ctx).await.expect("backup");
+        let artifact = ops::backup(&p, &request, &store, &ToolSource::Local, &ctx).await.expect("backup");
 
         let target = ops::restore(
             &p,
@@ -485,6 +489,7 @@ db_test! {
                 typed_confirmation: None,
             },
             &store,
+            &ToolSource::Local,
             &ctx,
         )
         .await

@@ -1826,3 +1826,104 @@ Now that MongoDB has landed, one thing is known that was not before: the
 `Introspector` seam held without splitting, and `Engine::is_relational()` marks
 the three places SQL generation actually branches. Whoever takes SQL Server on
 inherits a smaller problem than the previous entry assumed — but not this one.
+
+## M16 — The client tools can come from a container, and every host path is a bug waiting to happen
+
+M0 recorded that discovering binaries on the host "removes the Docker
+requirement the bash predecessor had". That was right about the *requirement*
+and wrong to leave Docker out entirely: a user with no `mysqldump` installed
+has a working database container sitting right there, and telling them to go
+and install client tools is telling them to duplicate something they already
+have.
+
+So `ToolSource` is now a global setting with three values:
+
+- **`Local`** — binaries on this machine. Still the default, because changing
+  it would silently re-route every existing install through Docker.
+- **`DockerExec`** — borrow the binaries from a container that is already
+  running. Nothing to download, and the client version matches that server
+  exactly. Also the most fragile: it stops working the moment that container
+  is stopped or replaced.
+- **`DockerRun`** — a throwaway container per invocation. Costs one image pull
+  and then always has the right client.
+
+A per-profile binary override still wins over all three. Someone who points a
+profile at `/usr/local/mysql-5.7/bin/mysqldump` is naming a specific binary,
+and quietly running a different one out of a container would defeat the only
+reason to set it.
+
+### The two things that make containerised tools different
+
+**Loopback is not the same loopback.** An SSH tunnel's local end is a port on
+*this* machine; inside a container, `127.0.0.1` is the container. Left alone, a
+tunnelled dump through Docker connects to nothing and fails with "connection
+refused" naming a port that is demonstrably open. `ToolSource::rewrite_host`
+maps every loopback spelling — including `::1`, which a tunnel really is
+written as in some configurations — onto `host.docker.internal`, and
+`--add-host=host.docker.internal:host-gateway` is passed so the name resolves
+on Linux too, where Docker does not provide it.
+
+The rewrite applies to the *tool's* endpoint only. Introspection runs in this
+process, over sqlx and the MongoDB driver, and must keep talking to
+`127.0.0.1`. Rewriting both would break the half that works.
+
+**Every host path handed to a tool has to be translated.** This is the one
+that fails quietly, and it is the reason `ResolvedTool::mount` exists rather
+than each backend formatting a path.
+
+`pg_dump -Fc -f /Users/me/backups/app.dump` inside a container writes a
+perfectly good archive — into the container, which is then discarded. Exit
+status zero. The host is left with nothing, and it surfaces as a missing file
+long after the dump reported success. Three sites had this shape:
+
+| Site | What crosses | Mode |
+|---|---|---|
+| `pg_dump --file=` for custom and directory archives | the artifact it writes itself | read-write |
+| `pg_restore <archive>` and its `--use-list` filter | the archive and the TOC file | read-only |
+| `mongodump`/`mongorestore` `--config` | the credentials file | read-only |
+
+Everything else already streams: MySQL both ways, plain-SQL PostgreSQL, the
+MongoDB archive, and `pg_dumpall --globals-only`, whose output this process
+writes to disk itself. Streaming needs no mount, which is why the backends
+that stream needed no changes at all.
+
+`mount` is the identity function for a local tool — it returns the path it was
+given. That is what keeps one code path: the backends call it unconditionally
+and never branch on the runtime.
+
+### `docker exec` refuses host files rather than working around them
+
+A container that is already running cannot gain a bind mount. `docker cp`
+would copy a file in, but the file this most often carries is a password, and
+that means leaving a credential inside a container this application neither
+owns nor started. So `DockerExec` returns an error naming the file, and points
+at the alternatives.
+
+The practical effect: borrowing binaries from a running database container
+works for MySQL, and for MongoDB only when the connection has no password.
+Stated plainly rather than discovered.
+
+### The password still never reaches argv
+
+`docker run -e NAME` with no `=value` forwards the caller's environment, so
+`MYSQL_PWD` and `PGPASSWORD` cross into the container without the value ever
+appearing on a command line. The variable *name* does; the secret does not.
+
+MongoDB has no such variable — see M14 — so it keeps the 0600 config file,
+which is now bind-mounted read-only.
+
+### Verified against real containers
+
+Unit tests can prove the command line has the right shape and nothing more.
+Each of the three mount sites was run for real against the fixtures:
+
+- containerised `mysqldump` reached the host's MySQL through
+  `host.docker.internal` and streamed 15 KB of SQL to a host file, with the
+  password forwarded and absent from argv;
+- containerised `pg_dump -Fc` wrote a 45 KB `PGDMP` archive **onto the host**
+  through a read-write mount, owned by the invoking user rather than root;
+- containerised `mongodump` authenticated from a read-only mounted credentials
+  file and dumped the fixture.
+
+The middle one is the whole point: before the mount it would have exited 0 and
+produced nothing.

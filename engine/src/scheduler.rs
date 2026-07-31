@@ -413,7 +413,7 @@ impl Scheduler {
                 .await
                 .map_err(|e| format!("could not record the job: {e}"))?;
 
-                let artifact = ops::backup(&source, &request, &self.store, ctx)
+                let artifact = ops::backup(&source, &request, &self.store, &self.store.tool_source().await, ctx)
                     .await
                     .map_err(|e| e.to_string())?;
 
@@ -499,7 +499,14 @@ impl Scheduler {
                 .await
                 .map_err(|e| format!("could not record the job: {e}"))?;
 
-                let out = ops::sync(&source, &dest, &sync_request, &self.store, ctx)
+                let out = ops::sync(
+                    &source,
+                    &dest,
+                    &sync_request,
+                    &self.store,
+                    &self.store.tool_source().await,
+                    ctx,
+                )
                     .await
                     .map_err(|e| e.to_string())?;
 
@@ -607,7 +614,7 @@ impl Scheduler {
 
         let _ = job_id;
 
-        let outcome = ops::drill(&dest, &request, &self.store, ctx)
+        let outcome = ops::drill(&dest, &request, &self.store, &self.store.tool_source().await, ctx)
             .await
             .map_err(|e| e.to_string())?;
 

@@ -171,6 +171,10 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             commands::push_artifact_offsite,
             commands::cli_status,
             commands::install_cli,
+            commands::discover_tools,
+            commands::test_tool_source,
+            commands::list_docker_containers,
+            commands::install_tool_with_brew,
         ])
         .events(collect_events![
             JobProgress,
@@ -179,6 +183,13 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             NavigateTo
         ])
 }
+
+/// Where `bindings.ts` is written, relative to this crate.
+///
+/// Both readers are cfg-gated — the debug-run export and the test — so a
+/// release build has no use for it and would warn about dead code.
+#[cfg(any(debug_assertions, test))]
+const BINDINGS_PATH: &str = "../src/bindings.ts";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -194,14 +205,14 @@ pub fn run() {
     // from the Rust command signatures.
     #[cfg(debug_assertions)]
     builder
-        .export(
-            specta_typescript::Typescript::default(),
-            "../src/bindings.ts",
-        )
+        .export(specta_typescript::Typescript::default(), BINDINGS_PATH)
         .expect("failed to export TypeScript bindings");
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
+        // The native file picker, for choosing an SSH private key. Only
+        // `dialog:allow-open` is granted — see capabilities/default.json.
+        .plugin(tauri_plugin_dialog::init())
         // LaunchAgent rather than a login item: it survives an app move and can
         // be inspected and removed by the user without going through us.
         .plugin(tauri_plugin_autostart::init(
@@ -420,10 +431,7 @@ mod tests {
     #[test]
     fn export_typescript_bindings() {
         specta_builder()
-            .export(
-                specta_typescript::Typescript::default(),
-                "../src/bindings.ts",
-            )
+            .export(specta_typescript::Typescript::default(), BINDINGS_PATH)
             .expect("bindings export must succeed");
     }
 }

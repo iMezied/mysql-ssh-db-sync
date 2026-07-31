@@ -1167,6 +1167,27 @@ impl Store {
     ///
     /// `launch_at_login` is left at its default here: the OS owns that state,
     /// and the desktop layer overwrites it with what the OS actually reports.
+    /// Where client binaries come from, with a fallback that always answers.
+    ///
+    /// Read fresh at the start of every job rather than cached: the app and
+    /// the scheduler both outlive the settings page, so a source changed at
+    /// 10am has to take effect on the 2am run without a restart. One store
+    /// read is nothing next to a backup.
+    ///
+    /// An unreadable store falls back to local binaries — the same answer
+    /// [`settings::parse_tool_source`] gives a corrupt value, and for the same
+    /// reason: a preferences problem must not stop a backup that could still
+    /// run.
+    pub async fn tool_source(&self) -> crate::tools::ToolSource {
+        match self.app_settings().await {
+            Ok(s) => s.tool_source,
+            Err(e) => {
+                tracing::warn!("could not read the tool source, using local binaries: {e}");
+                crate::tools::ToolSource::Local
+            }
+        }
+    }
+
     pub async fn app_settings(&self) -> Result<settings::AppSettings> {
         let defaults = settings::AppSettings::default();
         Ok(settings::AppSettings {
@@ -1179,6 +1200,9 @@ impl Store {
             close_to_tray: settings::parse_flag(
                 self.get_setting(settings::CLOSE_TO_TRAY).await?.as_deref(),
                 defaults.close_to_tray,
+            ),
+            tool_source: settings::parse_tool_source(
+                self.get_setting(settings::TOOL_SOURCE).await?.as_deref(),
             ),
             background_notice_shown: settings::parse_flag(
                 self.get_setting(settings::BACKGROUND_NOTICE_SHOWN)
