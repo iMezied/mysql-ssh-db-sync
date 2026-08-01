@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit",
     "tauri": "tauri",
     "bundle:cli": "node scripts/bundle-cli.mjs",
-    "bundle": "npm run bundle:cli && tauri build --config src-tauri/tauri.bundle.conf.json"
+    "bundle": "npm run bundle:cli && tauri build --config src-tauri/tauri.bundle.conf.json",
+    "install:mac": "bash scripts/install-macos.sh"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.59.0",
