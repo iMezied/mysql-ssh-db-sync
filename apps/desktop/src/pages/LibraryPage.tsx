@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Check,
@@ -12,6 +13,8 @@ import {
 
 import PageHeader from "@/components/PageHeader";
 import { api } from "@/lib/api";
+import { basename } from "@/lib/jobDetails";
+import { useProgressStore } from "@/lib/jobProgress";
 import { formatBytes, formatTimestamp } from "@/lib/utils";
 import type {
   Artifact,
@@ -22,6 +25,8 @@ import type {
 
 export default function LibraryPage() {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
+  const noteLaunch = useProgressStore((s) => s.noteLaunch);
   const [checks, setChecks] = useState<Record<string, IntegrityCheck>>({});
 
   const directory = useQuery({
@@ -59,6 +64,15 @@ export default function LibraryPage() {
   });
   const push = useMutation({
     mutationFn: (path: string) => api.pushArtifactOffsite(path),
+    // Uploading a large artifact takes as long as the dump that produced it,
+    // and this is the only place its per-destination results appear.
+    onSuccess: (jobId, path) => {
+      noteLaunch(jobId, {
+        title: "Off-site upload",
+        detail: basename(path) ?? path,
+      });
+      navigate(`/jobs/${jobId}`);
+    },
   });
   const enabledDestinations =
     destinations.data?.filter((d) => d.enabled).length ?? 0;

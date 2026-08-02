@@ -554,7 +554,46 @@ impl Store {
         .bind(plan.created_at.to_rfc3339())
         .bind(plan.updated_at.to_rfc3339())
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| {
+            if is_unique_violation(&e) {
+                StoreError::DuplicateName(plan.name.clone())
+            } else {
+                e.into()
+            }
+        })?;
+
+        Ok(plan)
+    }
+
+    /// Rename a table set.
+    ///
+    /// Deliberately does **not** bump `revision`. A revision means "what this
+    /// set backs up changed", and a schedule pointing at it has nothing to
+    /// re-examine because the selections are untouched — bumping would cry wolf
+    /// on every typo fix.
+    pub async fn rename_sync_plan(&self, id: Uuid, name: String) -> Result<SyncPlan> {
+        let mut plan = self
+            .get_sync_plan(id)
+            .await?
+            .ok_or(StoreError::SyncPlanNotFound(id))?;
+
+        plan.name = name;
+        plan.updated_at = Utc::now();
+
+        sqlx::query("UPDATE sync_plans SET name = ?2, updated_at = ?3 WHERE id = ?1")
+            .bind(plan.id.to_string())
+            .bind(&plan.name)
+            .bind(plan.updated_at.to_rfc3339())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                if is_unique_violation(&e) {
+                    StoreError::DuplicateName(plan.name.clone())
+                } else {
+                    e.into()
+                }
+            })?;
 
         Ok(plan)
     }

@@ -381,24 +381,11 @@ impl Scheduler {
             .validate(&source)
             .map_err(|e| format!("this schedule's options are not valid: {e}"))?;
 
-        // Drift is reported, not fatal: a table dropped last week should not
-        // stop tonight's backup of everything else — but it must be visible.
-        let available = plan
-            .selections
-            .iter()
-            .map(|s| s.name.clone())
-            .collect::<Vec<_>>();
-        let missing = plan.missing_from(&available);
-        if !missing.is_empty() {
-            ctx.emit_warn(
-                JobPhase::Introspect,
-                format!(
-                    "the plan lists tables that are no longer selected: {}",
-                    missing.join(", ")
-                ),
-            )
-            .await;
-        }
+        // Drift used to be checked here, against `plan.selections` — the plan
+        // compared with itself, so the warning could never fire. It now lives
+        // in `ops::resolve_selections`, which has the source's real table list
+        // and reports both directions: tables that have gone, and tables the
+        // plan never mentioned that are being included with their data.
 
         match schedule.dest_profile_id {
             None => {

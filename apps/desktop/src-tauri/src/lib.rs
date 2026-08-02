@@ -129,6 +129,7 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             commands::list_sync_plans,
             commands::create_sync_plan,
             commands::update_sync_plan,
+            commands::rename_sync_plan,
             commands::delete_sync_plan,
             commands::import_tables_conf,
             commands::set_sync_plan_masking,

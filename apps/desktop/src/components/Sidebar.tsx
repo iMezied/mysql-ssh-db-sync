@@ -9,6 +9,7 @@ import {
   Database,
   DownloadCloud,
   EyeOff,
+  Layers,
   ListChecks,
   Server,
   Settings,
@@ -20,6 +21,7 @@ import { cn } from "@/lib/utils";
 const links = [
   { to: "/profiles", label: "Connections", icon: Database },
   { to: "/ssh", label: "SSH servers", icon: Server },
+  { to: "/table-sets", label: "Table sets", icon: Layers },
   { to: "/backup", label: "Backup", icon: DownloadCloud },
   { to: "/restore", label: "Restore", icon: UploadCloud },
   { to: "/sync", label: "Sync", icon: ArrowLeftRight },

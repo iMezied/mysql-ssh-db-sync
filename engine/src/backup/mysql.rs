@@ -50,6 +50,12 @@ pub struct Endpoint {
 /// Everything the blocking dump worker needs.
 struct DumpPlan {
     mysqldump: ResolvedTool,
+    /// Tables to keep out of the artifact entirely.
+    ///
+    /// Needed because the schema pass names only the database, so without an
+    /// explicit `--ignore-table` an excluded table's `CREATE TABLE` still
+    /// lands in the dump and is recreated on restore.
+    excluded: Vec<String>,
     endpoint: Endpoint,
     database: String,
     options: MysqlBackupOptions,
@@ -154,6 +160,13 @@ pub async fn run_mysql_backup(
         .into_iter()
         .map(|s| s.name.clone())
         .collect();
+    let excluded: Vec<String> = request
+        .common
+        .selections
+        .iter()
+        .filter(|s| s.mode == crate::backup::TableMode::Exclude)
+        .map(|s| s.name.clone())
+        .collect();
 
     std::fs::create_dir_all(&request.common.output_dir)
         .map_err(|e| BackupError::Io(format!("could not create the output directory: {e}")))?;
@@ -172,6 +185,7 @@ pub async fn run_mysql_backup(
 
     let plan = DumpPlan {
         mysqldump,
+        excluded,
         endpoint,
         database: request.common.database.clone(),
         options: options.clone(),
@@ -489,6 +503,13 @@ fn schema_command(plan: &DumpPlan) -> ToolCommand {
     let mut args = connection_args(plan);
 
     args.push("--no-data".into());
+    // The schema pass names only the database, so every table's DDL is emitted
+    // unless it is refused here. Without this an excluded table is recreated
+    // on restore — empty, but present — while the manifest says it was left
+    // out entirely.
+    for table in &plan.excluded {
+        args.push(format!("--ignore-table={}.{table}", plan.database));
+    }
     if o.single_transaction {
         args.push("--single-transaction".into());
     }
@@ -618,6 +639,7 @@ mod tests {
     fn plan() -> DumpPlan {
         DumpPlan {
             recipients: Vec::new(),
+            excluded: vec!["temp".into()],
             mysqldump: ResolvedTool::resolve(
                 Tool::Mysqldump,
                 &ToolSource::Local,
@@ -763,6 +785,25 @@ mod tests {
         assert!(!rendered.contains("--single-transaction"));
         assert!(!rendered.contains("--routines"));
         assert!(!rendered.contains("--events"));
+    }
+
+    #[test]
+    fn an_excluded_table_is_kept_out_of_the_schema_pass() {
+        // The schema pass names only the database, so it emits every table's
+        // DDL. Without this an excluded table is recreated on restore — empty,
+        // but present — while the manifest lists it as left out entirely.
+        let rendered = schema_command(&plan()).display();
+        assert!(
+            rendered.contains("--ignore-table=app.temp"),
+            "excluded tables must be refused explicitly: {rendered}"
+        );
+    }
+
+    #[test]
+    fn nothing_is_ignored_when_nothing_is_excluded() {
+        let mut p = plan();
+        p.excluded.clear();
+        assert!(!schema_command(&p).display().contains("--ignore-table"));
     }
 
     #[test]

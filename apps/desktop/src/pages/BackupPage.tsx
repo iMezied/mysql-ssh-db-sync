@@ -1,39 +1,24 @@
-import { useMemo, useState } from "react";
+import { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { AlertTriangle, Database, Play, Search } from "lucide-react";
+import { Database, Play } from "lucide-react";
 
 import PageHeader from "@/components/PageHeader";
+import TableSelector from "@/components/TableSelector";
 import { api } from "@/lib/api";
-import { cn, formatBytes } from "@/lib/utils";
+import { useProgressStore } from "@/lib/jobProgress";
+import { materialise, modesFromSelections } from "@/lib/tableSelection";
 import type {
   BackupRequest,
   EngineBackupOptions,
   PgDumpFormat,
-  TableInfo,
+  TableMode,
 } from "@/bindings";
 import {
   defaultBackupOptions,
   ENGINE_NOUNS,
   supportsSchemaOnly,
 } from "@/lib/engineDefaults";
-
-type TableMode = "schema_and_data" | "schema_only" | "exclude";
-
-const MODE_LABELS: Record<TableMode, string> = {
-  schema_and_data: "Schema + data",
-  schema_only: "Schema only",
-  exclude: "Exclude",
-};
-
-const MODE_STYLES: Record<TableMode, string> = {
-  schema_and_data: "bg-blue-600 text-white",
-  schema_only: "bg-slate-700 text-slate-200",
-  exclude: "bg-slate-800 text-slate-500",
-};
-
-function keyOf(t: TableInfo): string {
-  return t.schema ? `${t.schema}.${t.name}` : t.name;
-}
 
 /**
  * Source browser and table selection.
@@ -44,11 +29,13 @@ function keyOf(t: TableInfo): string {
 export default function BackupPage() {
   const [profileId, setProfileId] = useState("");
   const [database, setDatabase] = useState("");
-  const [filter, setFilter] = useState("");
+  const [setId, setSetId] = useState("");
   const [modes, setModes] = useState<Record<string, TableMode>>({});
-  const [started, setStarted] = useState<string | null>(null);
   const [pgFormat, setPgFormat] = useState<PgDumpFormat>("custom");
   const [countRows, setCountRows] = useState(false);
+
+  const navigate = useNavigate();
+  const noteLaunch = useProgressStore((s) => s.noteLaunch);
 
   const profiles = useQuery({ queryKey: ["profiles"], queryFn: api.listProfiles });
   const backupDir = useQuery({
@@ -86,37 +73,22 @@ export default function BackupPage() {
     ? "schema_only"
     : "schema_and_data";
 
-  const availableModes = (Object.keys(MODE_LABELS) as TableMode[]).filter(
-    (m) => m !== "schema_only" || supportsSchemaOnly(engine),
-  );
+  // Saved sets for this connection, so a 109-table selection is picked once
+  // rather than rebuilt on every backup.
+  const sets = useQuery({
+    queryKey: ["sync-plans", profileId],
+    queryFn: () => api.listSyncPlans(profileId),
+    enabled: profileId !== "",
+  });
+  const chosenSet = sets.data?.find((s) => s.id === setId) ?? null;
 
-  const visible = useMemo(() => {
-    const rows = tables.data ?? [];
-    const needle = filter.trim().toLowerCase();
-    if (!needle) return rows;
-    return rows.filter((t) => keyOf(t).toLowerCase().includes(needle));
-  }, [tables.data, filter]);
-
-  const counts = useMemo(() => {
-    const rows = tables.data ?? [];
-    const modeOf = (t: TableInfo) => modes[keyOf(t)] ?? defaultMode;
-    return {
-      withData: rows.filter((t) => modeOf(t) === "schema_and_data").length,
-      schemaOnly: rows.filter((t) => modeOf(t) === "schema_only").length,
-      excluded: rows.filter((t) => modeOf(t) === "exclude").length,
-      total: rows.length,
-    };
-  }, [tables.data, modes, defaultMode]);
-
-  const nonTransactionalSelected = useMemo(
-    () =>
-      (tables.data ?? []).filter(
-        (t) =>
-          !t.transactional &&
-          (modes[keyOf(t)] ?? defaultMode) === "schema_and_data",
-      ),
-    [tables.data, modes, defaultMode],
-  );
+  // Choosing a set seeds the picker and pins the database it was written
+  // against — its table names only mean anything there.
+  useEffect(() => {
+    if (!chosenSet) return;
+    setDatabase(chosenSet.database);
+    setModes(modesFromSelections(chosenSet.selections));
+  }, [chosenSet]);
 
   const engineOptions = (): EngineBackupOptions =>
     defaultBackupOptions(engine, pgFormat);
@@ -127,14 +99,7 @@ export default function BackupPage() {
       const request: BackupRequest = {
         common: {
           database,
-          selections: rows.map((t) => ({
-            // Schema-qualified. A bare name matches in every schema for
-            // PostgreSQL, which would exclude data from a same-named table
-            // elsewhere.
-            name: keyOf(t),
-            mode: modes[keyOf(t)] ?? defaultMode,
-            where_filter: null,
-          })),
+          selections: materialise(rows, modes, defaultMode),
           output_dir: backupDir.data ?? "",
           compress: true,
           encrypt: false,
@@ -144,19 +109,17 @@ export default function BackupPage() {
       };
       return api.startBackup(profileId, request);
     },
-    onSuccess: (jobId) => setStarted(jobId),
+    // Straight to the job. A backup is minutes of work the user has every
+    // reason to watch, and the alternative — a line of text with an id in it —
+    // asked them to go and find their own run in a list of fifty.
+    onSuccess: (jobId) => {
+      noteLaunch(jobId, { title: "Backup", detail: database });
+      navigate(`/jobs/${jobId}`);
+    },
   });
 
   const canRun =
     profileId !== "" && database !== "" && (tables.data?.length ?? 0) > 0;
-
-  const setVisibleTo = (mode: TableMode) => {
-    setModes((prev) => {
-      const next = { ...prev };
-      for (const t of visible) next[keyOf(t)] = mode;
-      return next;
-    });
-  };
 
   return (
     <>
@@ -175,6 +138,7 @@ export default function BackupPage() {
               onChange={(e) => {
                 setProfileId(e.target.value);
                 setDatabase("");
+                setSetId("");
                 setModes({});
               }}
             >
@@ -188,11 +152,31 @@ export default function BackupPage() {
           </label>
 
           <label className="min-w-56 flex-1">
+            <span className="field-label">Table set</span>
+            <select
+              className="field-input"
+              value={setId}
+              disabled={!profileId}
+              onChange={(e) => {
+                setSetId(e.target.value);
+                if (e.target.value === "") setModes({});
+              }}
+            >
+              <option value="">Pick tables by hand</option>
+              {sets.data?.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.name} ({s.database})
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="min-w-56 flex-1">
             <span className="field-label">Database</span>
             <select
               className="field-input"
               value={database}
-              disabled={!profileId || databases.isLoading}
+              disabled={!profileId || databases.isLoading || !!chosenSet}
               onChange={(e) => {
                 setDatabase(e.target.value);
                 setModes({});
@@ -237,95 +221,13 @@ export default function BackupPage() {
 
         {tables.data && (
           <>
-            <div className="flex flex-wrap items-center gap-3">
-              <div className="relative min-w-64 flex-1">
-                <Search className="pointer-events-none absolute left-2.5 top-2.5 h-4 w-4 text-slate-600" />
-                <input
-                  className="field-input pl-8"
-                  placeholder={`Filter ${tables.data.length} ${nouns.tables}…`}
-                  value={filter}
-                  onChange={(e) => setFilter(e.target.value)}
-                />
-              </div>
-
-              <div className="flex gap-1.5">
-                {availableModes.map((mode) => (
-                  <button
-                    key={mode}
-                    onClick={() => setVisibleTo(mode)}
-                    className="rounded-md border border-slate-700 px-2.5 py-1.5 text-xs text-slate-300 transition hover:bg-slate-800"
-                    title={
-                      filter
-                        ? `Apply to the ${visible.length} filtered ${nouns.tables}`
-                        : `Apply to all ${nouns.tables}`
-                    }
-                  >
-                    All &rarr; {MODE_LABELS[mode]}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            <div className="flex flex-wrap gap-4 text-xs text-slate-500">
-              <span>
-                <strong className="text-blue-300">{counts.withData}</strong> with
-                data
-              </span>
-              <span>
-                <strong className="text-slate-300">{counts.schemaOnly}</strong>{" "}
-                schema only
-              </span>
-              <span>
-                <strong className="text-slate-400">{counts.excluded}</strong>{" "}
-                excluded
-              </span>
-              <span>{counts.total} total</span>
-            </div>
-
-            {engine === "mongo" && (
-              <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-3">
-                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
-                <p className="text-xs leading-relaxed text-amber-200/90">
-                  A <code>mongodump</code> of a database being written to is
-                  consistent <em>within</em> each collection, not across them.
-                  Point-in-time capture needs the oplog, which needs a replica
-                  set — on a standalone server it is not available at all.
-                </p>
-              </div>
-            )}
-
-            {nonTransactionalSelected.length > 0 && (
-              <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-3">
-                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
-                <p className="text-xs leading-relaxed text-amber-200/90">
-                  {nonTransactionalSelected.length} selected table
-                  {nonTransactionalSelected.length === 1 ? " is" : "s are"} not
-                  InnoDB ({nonTransactionalSelected.map((t) => t.name).join(", ")}
-                  ). These are not covered by{" "}
-                  <code>--single-transaction</code>, so a consistent snapshot
-                  cannot be guaranteed for them.
-                </p>
-              </div>
-            )}
-
-            <div className="panel divide-y divide-slate-800">
-              {visible.length === 0 ? (
-                <p className="p-6 text-center text-sm text-slate-500">
-                  No {nouns.tables} match “{filter}”.
-                </p>
-              ) : (
-                visible.map((t) => (
-                  <TableRow
-                    key={keyOf(t)}
-                    table={t}
-                    mode={modes[keyOf(t)] ?? defaultMode}
-                    onMode={(mode) =>
-                      setModes((prev) => ({ ...prev, [keyOf(t)]: mode }))
-                    }
-                  />
-                ))
-              )}
-            </div>
+            <TableSelector
+              tables={tables.data}
+              value={modes}
+              onChange={setModes}
+              engine={engine}
+              defaultMode={defaultMode}
+            />
 
             <div className="flex flex-wrap items-center gap-3 border-t border-slate-800 pt-4">
               <button
@@ -384,74 +286,14 @@ export default function BackupPage() {
               />
             )}
 
-            {started && (
-              <p className="text-xs text-emerald-400">
-                Backup started. Watch it on the Jobs page — job {started.slice(0, 8)}.
-              </p>
-            )}
-
             <p className="text-xs text-slate-600">
-              Saving these selections as a reusable sync plan arrives in a later
-              milestone.
+              To reuse this selection, save it on the Table sets page and pick it
+              above next time.
             </p>
           </>
         )}
       </div>
     </>
-  );
-}
-
-function TableRow({
-  table,
-  mode,
-  onMode,
-}: {
-  table: TableInfo;
-  mode: TableMode;
-  onMode: (mode: TableMode) => void;
-}) {
-  return (
-    <div className="flex items-center gap-4 px-4 py-2">
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
-          <span className="truncate font-mono text-sm text-slate-200">
-            {keyOf(table)}
-          </span>
-          {!table.transactional && table.storage_engine && (
-            <span
-              className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] uppercase text-amber-300"
-              title="Not covered by --single-transaction"
-            >
-              {table.storage_engine}
-            </span>
-          )}
-        </div>
-        <div className="mt-0.5 text-xs text-slate-600">
-          {table.estimated_rows != null
-            ? `~${table.estimated_rows.toLocaleString()} rows`
-            : "row count unknown"}
-          {" · "}
-          {formatBytes((table.data_bytes ?? 0) + (table.index_bytes ?? 0))}
-        </div>
-      </div>
-
-      <div className="flex shrink-0 gap-1">
-        {(Object.keys(MODE_LABELS) as TableMode[]).map((m) => (
-          <button
-            key={m}
-            onClick={() => onMode(m)}
-            className={cn(
-              "rounded px-2 py-1 text-[11px] transition",
-              mode === m
-                ? MODE_STYLES[m]
-                : "text-slate-500 hover:bg-slate-800 hover:text-slate-300",
-            )}
-          >
-            {MODE_LABELS[m]}
-          </button>
-        ))}
-      </div>
-    </div>
   );
 }
 

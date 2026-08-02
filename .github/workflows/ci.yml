@@ -84,6 +84,13 @@ jobs:
         run: npm run typecheck
         working-directory: apps/desktop
 
+      # `lib/tableSelection.ts` decides what a backup actually contains. A
+      # regression there still succeeds, still writes an artifact and still
+      # reports green — the loss only surfaces when someone needs the data.
+      - name: Test
+        run: npm test
+        working-directory: apps/desktop
+
       - name: Build
         run: npm run build
         working-directory: apps/desktop

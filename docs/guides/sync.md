@@ -36,6 +36,12 @@ that the plan under it was edited.
 If you already have a `tables.conf` from the legacy tooling, the app imports it
 rather than making you re-tick 200 boxes.
 
+The file names only the tables that carry data, so the import completes it
+against the source: every other table it finds is set to **schema only**, the
+way the old script behaved. That is why the button waits for the table list to
+load — and why a table the file names but the source no longer has is dropped
+rather than carried as a dead entry.
+
 ## Run it
 
 From the app's **Sync** page: pick plan, destination, target strategy, and

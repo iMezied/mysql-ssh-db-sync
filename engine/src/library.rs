@@ -6,9 +6,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
-use crate::manifest::BackupManifest;
+use crate::manifest::{ArtifactFormat, BackupManifest};
 use crate::retention::{RetentionCandidate, RetentionPlan, RetentionPolicy, plan_retention};
 use crate::types::Engine;
+use uuid::Uuid;
 
 /// One artifact, as the library lists it.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -24,6 +25,24 @@ pub struct Artifact {
     pub source_profile_name: Option<String>,
     pub table_count: Option<u32>,
     pub tables_with_data: Option<u32>,
+    /// What kind of artifact this is.
+    ///
+    /// The UI needs it to know whether part of the artifact can be restored on
+    /// its own: a `pg_dump` archive can, a flat `.sql.gz` stream cannot, and
+    /// offering the choice on one that cannot is worse than not offering it.
+    pub format: Option<ArtifactFormat>,
+    /// Every table in the artifact.
+    ///
+    /// The universe a table set is completed against at restore time — the
+    /// artifact is what can come back, not whatever the destination happens to
+    /// hold now.
+    pub tables: Vec<String>,
+    /// Which connection this was taken from.
+    ///
+    /// A table set belongs to the *source* profile, but a restore picks a
+    /// destination. Offering the destination's sets would offer sets written
+    /// against a different schema.
+    pub source_profile_id: Option<Uuid>,
     /// `None` when there is no manifest to check against.
     pub has_manifest: bool,
 }
@@ -73,6 +92,12 @@ fn describe(path: &Path) -> Option<Artifact> {
         source_profile_name: manifest.as_ref().map(|m| m.source_profile_name.clone()),
         table_count: manifest.as_ref().map(|m| m.tables.len() as u32),
         tables_with_data: manifest.as_ref().map(|m| m.tables_with_data.len() as u32),
+        format: manifest.as_ref().map(|m| m.format),
+        tables: manifest
+            .as_ref()
+            .map(|m| m.tables.clone())
+            .unwrap_or_default(),
+        source_profile_id: manifest.as_ref().map(|m| m.source_profile_id),
         has_manifest: manifest.is_some(),
     })
 }
@@ -518,6 +543,9 @@ mod tests {
             source_profile_name: Some("prod".into()),
             table_count: Some(10),
             tables_with_data: Some(8),
+            format: None,
+            tables: Vec::new(),
+            source_profile_id: None,
             has_manifest: database.is_some(),
         }
     }

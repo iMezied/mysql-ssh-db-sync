@@ -1389,7 +1389,7 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
 name = "db-sync-cli"
-version = "0.3.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1408,7 +1408,7 @@ dependencies = [
 
 [[package]]
 name = "db-sync-desktop"
-version = "0.3.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1437,7 +1437,7 @@ dependencies = [
 
 [[package]]
 name = "db-sync-engine"
-version = "0.3.0"
+version = "0.6.0"
 dependencies = [
  "age",
  "anyhow",

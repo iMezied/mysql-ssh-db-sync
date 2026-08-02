@@ -86,14 +86,29 @@ export const commands = {
 	listSyncPlans: (profileId: string) => typedError<SyncPlan[], CommandError>(__TAURI_INVOKE("list_sync_plans", { profileId })),
 	createSyncPlan: (input: SyncPlanCreate) => typedError<SyncPlan, CommandError>(__TAURI_INVOKE("create_sync_plan", { input })),
 	updateSyncPlan: (id: string, selections: TableSelection[]) => typedError<SyncPlan, CommandError>(__TAURI_INVOKE("update_sync_plan", { id, selections })),
+	/**
+	 *  Rename a table set.
+	 * 
+	 *  Separate from `update_sync_plan` because it must not bump the revision: a
+	 *  revision means "what this set backs up changed", and a typo fix changes
+	 *  nothing a schedule needs to re-examine.
+	 */
+	renameSyncPlan: (id: string, name: string) => typedError<SyncPlan, CommandError>(__TAURI_INVOKE("rename_sync_plan", { id, name })),
 	deleteSyncPlan: (id: string) => typedError<boolean, CommandError>(__TAURI_INVOKE("delete_sync_plan", { id })),
 	/**
-	 *  Parse a legacy `tables.conf` into selections.
+	 *  Turn a legacy `tables.conf` into a complete selection list.
 	 * 
 	 *  Lets an existing Bash-tool setup be carried over without retyping a couple
 	 *  of hundred table names.
+	 * 
+	 *  `available` is the source's table list, and the file cannot be honoured
+	 *  without it: the file names only what carries data, while a selection that
+	 *  stays silent about a table gives it data at run time. See
+	 *  [`plan::selections_from_tables_conf`]. The caller passes the introspection
+	 *  it has already made rather than this connecting again, so an import is still
+	 *  one click on a list the user is looking at.
 	 */
-	importTablesConf: (contents: string) => typedError<TableSelection[], CommandError>(__TAURI_INVOKE("import_tables_conf", { contents })),
+	importTablesConf: (contents: string, available: string[]) => typedError<TableSelection[], CommandError>(__TAURI_INVOKE("import_tables_conf", { contents, available })),
 	setSyncPlanMasking: (id: string, masking: MaskRule[]) => typedError<SyncPlan, CommandError>(__TAURI_INVOKE("set_sync_plan_masking", { id, masking })),
 	/**
 	 *  Show what masking would do, without running it.
@@ -317,9 +332,54 @@ export type Artifact = {
 	source_profile_name: string | null,
 	table_count: number | null,
 	tables_with_data: number | null,
+	/**
+	 *  What kind of artifact this is.
+	 * 
+	 *  The UI needs it to know whether part of the artifact can be restored on
+	 *  its own: a `pg_dump` archive can, a flat `.sql.gz` stream cannot, and
+	 *  offering the choice on one that cannot is worse than not offering it.
+	 */
+	format: ArtifactFormat | null,
+	/**
+	 *  Every table in the artifact.
+	 * 
+	 *  The universe a table set is completed against at restore time — the
+	 *  artifact is what can come back, not whatever the destination happens to
+	 *  hold now.
+	 */
+	tables: string[],
+	/**
+	 *  Which connection this was taken from.
+	 * 
+	 *  A table set belongs to the *source* profile, but a restore picks a
+	 *  destination. Offering the destination's sets would offer sets written
+	 *  against a different schema.
+	 */
+	source_profile_id: string | null,
 	/**  `None` when there is no manifest to check against. */
 	has_manifest: boolean,
 };
+
+export type ArtifactFormat = 
+/**  Single gzipped SQL stream (MySQL, and PostgreSQL `plain` format). */
+"sql_gz" | 
+/**  `pg_dump -Fc` custom archive. Supports selective and parallel restore. */
+"pg_custom" | 
+/**  `pg_dump -Fd` directory archive. Supports parallel dump and restore. */
+"pg_directory" | 
+/**  `mydumper` output directory. */
+"mydumper_dir" | 
+/**
+ *  `mongodump --archive --gzip`. A single self-describing stream holding
+ *  every selected collection, which is what makes MongoDB fit the artifact
+ *  model the rest of this application is built on: one file the client
+ *  produced, whose checksum it controls.
+ * 
+ *  `--gzip` compresses *inside* the archive rather than wrapping it, so
+ *  [`crate::backup::CommonBackupOptions::compress`] is honoured by the tool
+ *  and no second gzip layer is added.
+ */
+"mongo_archive";
 
 /**  One recorded change. */
 export type AuditEntry = {

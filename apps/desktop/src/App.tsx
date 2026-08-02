@@ -6,9 +6,11 @@ import Sidebar from "@/components/Sidebar";
 import ProfilesPage from "@/pages/ProfilesPage";
 import SshPage from "@/pages/SshPage";
 import JobsPage from "@/pages/JobsPage";
+import JobDetailPage from "@/pages/JobDetailPage";
 import BackupPage from "@/pages/BackupPage";
 import RestorePage from "@/pages/RestorePage";
 import SyncPage from "@/pages/SyncPage";
+import TableSetsPage from "@/pages/TableSetsPage";
 import SchedulesPage from "@/pages/SchedulesPage";
 import MaskingPage from "@/pages/MaskingPage";
 import LibraryPage from "@/pages/LibraryPage";
@@ -32,11 +34,13 @@ export default function App() {
           <Route path="/backup" element={<BackupPage />} />
           <Route path="/restore" element={<RestorePage />} />
           <Route path="/sync" element={<SyncPage />} />
+          <Route path="/table-sets" element={<TableSetsPage />} />
           <Route path="/schedules" element={<SchedulesPage />} />
           <Route path="/masking" element={<MaskingPage />} />
           <Route path="/library" element={<LibraryPage />} />
           <Route path="/offsite" element={<DestinationsPage />} />
           <Route path="/jobs" element={<JobsPage />} />
+          <Route path="/jobs/:jobId" element={<JobDetailPage />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="*" element={<Navigate to="/profiles" replace />} />
         </Routes>
@@ -56,10 +60,14 @@ function useJobProgressFeed() {
   const queryClient = useQueryClient();
   const record = useProgressStore((s) => s.record);
   const forget = useProgressStore((s) => s.forget);
+  const noteFinished = useProgressStore((s) => s.noteFinished);
 
   useEffect(() => {
     const progress = events.jobProgress.listen((e) => record(e.payload));
     const finished = events.jobFinished.listen((e) => {
+      // Kept for the jobs that leave no history row — an off-site push — whose
+      // only record that they ended is this event.
+      noteFinished(e.payload.job_id, e.payload.outcome);
       // The row's own outcome takes over from here, and keeping the last
       // sample would leave a 98% bar next to a green "success".
       forget(e.payload.job_id);
@@ -71,7 +79,7 @@ function useJobProgressFeed() {
       void progress.then((unlisten) => unlisten());
       void finished.then((unlisten) => unlisten());
     };
-  }, [queryClient, record, forget]);
+  }, [queryClient, record, forget, noteFinished]);
 }
 
 /**

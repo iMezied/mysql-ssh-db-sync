@@ -1,7 +1,7 @@
 {
   "name": "db-sync-desktop",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.6.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -11,7 +11,8 @@
     "tauri": "tauri",
     "bundle:cli": "node scripts/bundle-cli.mjs",
     "bundle": "npm run bundle:cli && tauri build --config src-tauri/tauri.bundle.conf.json",
-    "install:mac": "bash scripts/install-macos.sh"
+    "install:mac": "bash scripts/install-macos.sh",
+    "test": "vitest run"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.59.0",
@@ -34,6 +35,7 @@
     "postcss": "^8.4.47",
     "tailwindcss": "^3.4.14",
     "typescript": "^5.6.3",
-    "vite": "^5.4.9"
+    "vite": "^5.4.9",
+    "vitest": "^4.1.10"
   }
 }

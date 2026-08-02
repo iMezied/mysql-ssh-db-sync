@@ -225,3 +225,115 @@ async fn deleting_a_plan_still_removes_the_sync_schedules_that_ran_it() {
          had one, is untouched"
     );
 }
+
+#[tokio::test]
+async fn the_unique_name_migration_renames_collisions_instead_of_deleting_them() {
+    let (mut conn, _dir) = conn().await;
+    apply_range(&mut conn, None, "0008").await;
+
+    sqlx::query(
+        "INSERT INTO profiles (id, name, engine, environment, db_config, tool_overrides, \
+         created_at, updated_at) VALUES ('p1','prod','mysql','prod','{}','{}','t','t')",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    // Two sets sharing a name on one connection — legal until now — plus one on
+    // another connection that must be left alone.
+    for (id, profile, name) in [
+        ("pl1", "p1", "nightly"),
+        ("pl2", "p1", "nightly"),
+        ("pl3", "p1", "weekly"),
+    ] {
+        sqlx::query(
+            "INSERT INTO sync_plans (id, profile_id, name, database_name, table_selections, \
+             revision, created_at, updated_at) VALUES (?1,?2,?3,'app','[]',1,'t','t')",
+        )
+        .bind(id)
+        .bind(profile)
+        .bind(name)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+
+    // A schedule pointing at the second one, to prove the rename does not
+    // rebuild the table the foreign key depends on.
+    sqlx::query(
+        "INSERT INTO schedules (id, sync_plan_id, name, dest_profile_id, cron_expression, \
+         timezone, enabled, action_json, webhook_url, notify, catch_up, last_run_at, \
+         last_outcome, last_job_id, created_at, updated_at) \
+         VALUES ('s1','pl2','nightly sync',NULL,'0 3 * * *','utc',1,'{}',NULL,'always',1, \
+         NULL,NULL,NULL,'c','u')",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    apply_range(&mut conn, Some("0008"), "0009").await;
+
+    // Nothing was deleted. A set is a table selection somebody built by hand;
+    // resolving a name collision by dropping one would destroy real work.
+    let names: Vec<(String, String)> = sqlx::query("SELECT id, name FROM sync_plans ORDER BY id")
+        .fetch_all(&mut conn)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.get("id"), r.get("name")))
+        .collect();
+
+    assert_eq!(names.len(), 3, "no set may be dropped: {names:?}");
+    assert_eq!(names[0], ("pl1".into(), "nightly".into()), "oldest keeps it");
+    assert_eq!(names[1], ("pl2".into(), "nightly (2)".into()));
+    assert_eq!(names[2], ("pl3".into(), "weekly".into()), "untouched");
+
+    // The schedule still points where it did.
+    let plan_id: String = sqlx::query("SELECT sync_plan_id FROM schedules WHERE id = 's1'")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap()
+        .get("sync_plan_id");
+    assert_eq!(plan_id, "pl2");
+
+    // And the constraint is now live.
+    let err = sqlx::query(
+        "INSERT INTO sync_plans (id, profile_id, name, database_name, table_selections, \
+         revision, created_at, updated_at) \
+         VALUES ('pl4','p1','weekly','app','[]',1,'t','t')",
+    )
+    .execute(&mut conn)
+    .await;
+    assert!(err.is_err(), "a duplicate name must now be refused");
+}
+
+#[tokio::test]
+async fn the_unique_name_migration_leaves_a_clean_database_alone() {
+    let (mut conn, _dir) = conn().await;
+    apply_range(&mut conn, None, "0008").await;
+
+    sqlx::query(
+        "INSERT INTO profiles (id, name, engine, environment, db_config, tool_overrides, \
+         created_at, updated_at) VALUES ('p1','prod','mysql','prod','{}','{}','t','t')",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO sync_plans (id, profile_id, name, database_name, table_selections, \
+         revision, created_at, updated_at) \
+         VALUES ('pl1','p1','nightly','app','[]',1,'t','t')",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    apply_range(&mut conn, Some("0008"), "0009").await;
+
+    let name: String = sqlx::query("SELECT name FROM sync_plans WHERE id = 'pl1'")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap()
+        .get("name");
+    assert_eq!(name, "nightly", "a name with no collision must not gain a suffix");
+}

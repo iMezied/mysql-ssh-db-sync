@@ -1,21 +1,13 @@
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
+import { ChevronRight } from "lucide-react";
 
 import PageHeader from "@/components/PageHeader";
+import JobProgressStrip from "@/components/JobProgressStrip";
 import { api } from "@/lib/api";
-import {
-  cn,
-  formatBytes,
-  formatDuration,
-  formatElapsed,
-  formatTimestamp,
-} from "@/lib/utils";
-import {
-  PHASE_LABELS,
-  describeProgress,
-  remainingMs,
-  useProgressStore,
-} from "@/lib/jobProgress";
+import { cn, formatDuration, formatTimestamp } from "@/lib/utils";
+import { useTick } from "@/lib/useTick";
 import {
   events,
   type JobOutcome,
@@ -31,9 +23,6 @@ const OUTCOME_STYLES: Record<JobOutcome, string> = {
 
 /** Most recent live progress lines, newest last. */
 const LIVE_LIMIT = 200;
-
-/** How often the elapsed clock and the estimate redraw while a job runs. */
-const TICK_MS = 1_000;
 
 /**
  * How often to re-ask which jobs this process is actually running.
@@ -187,25 +176,6 @@ export default function JobsPage() {
   );
 }
 
-/**
- * A clock that only runs when something on screen depends on it.
- *
- * Left running unconditionally it would re-render the whole history list once
- * a second forever, including in the tray with no window open.
- */
-function useTick(enabled: boolean): number {
-  const [now, setNow] = useState(() => Date.now());
-
-  useEffect(() => {
-    if (!enabled) return;
-    setNow(Date.now());
-    const id = setInterval(() => setNow(Date.now()), TICK_MS);
-    return () => clearInterval(id);
-  }, [enabled]);
-
-  return now;
-}
-
 /** One row of history: finished, genuinely running, or abandoned. */
 function JobRow({
   job,
@@ -220,7 +190,13 @@ function JobRow({
   const interrupted = job.outcome === null && !live;
 
   return (
-    <div className="px-4 py-3">
+    // The whole row opens the job, rather than a "details" link at the end of
+    // it: the row *is* the job, and the thing a user wants after a run is the
+    // one they just started.
+    <Link
+      to={`/jobs/${job.id}`}
+      className="block px-4 py-3 transition hover:bg-slate-800/40"
+    >
       <div className="flex items-center gap-4">
         <span className="w-16 text-xs uppercase text-slate-400">{job.kind}</span>
         <span className="flex-1 text-xs text-slate-500">
@@ -241,9 +217,10 @@ function JobRow({
         >
           {job.outcome ?? (running ? "running" : "interrupted")}
         </span>
+        <ChevronRight className="h-3.5 w-3.5 shrink-0 text-slate-600" />
       </div>
 
-      {running && <RunningDetail jobId={job.id} />}
+      {running && <JobProgressStrip jobId={job.id} />}
 
       {interrupted && (
         <p className="mt-1.5 text-xs text-amber-300/70">
@@ -251,61 +228,6 @@ function JobRow({
           finished. Start it again.
         </p>
       )}
-    </div>
-  );
-}
-
-/** Phase, position and estimate for a job this process is running now. */
-function RunningDetail({ jobId }: { jobId: string }) {
-  const progress = useProgressStore((s) => s.byJob[jobId]);
-
-  if (!progress) {
-    return (
-      <p className="mt-1.5 text-xs text-slate-500">Waiting for the first update…</p>
-    );
-  }
-
-  const { latest } = progress;
-  const percent = latest.percent;
-  const position = describeProgress(latest, formatBytes);
-  const left = remainingMs(progress);
-
-  return (
-    <div className="mt-2 space-y-1.5">
-      <div className="flex items-baseline gap-2 text-xs">
-        <span className="font-medium text-slate-300">
-          {PHASE_LABELS[latest.phase]}
-        </span>
-        {latest.table && (
-          <span className="font-mono text-slate-400">{latest.table}</span>
-        )}
-        <span className="truncate text-slate-500">{latest.message}</span>
-      </div>
-
-      {percent != null && (
-        <div className="h-1.5 overflow-hidden rounded-full bg-slate-800">
-          <div
-            className="h-full rounded-full bg-blue-500 transition-[width] duration-500"
-            style={{ width: `${Math.min(100, Math.max(0, percent))}%` }}
-          />
-        </div>
-      )}
-
-      <div className="flex flex-wrap items-center gap-x-3 text-[11px] tabular-nums text-slate-500">
-        {percent != null && (
-          <span className="text-slate-400">{percent.toFixed(0)}%</span>
-        )}
-        {position && <span>{position}</span>}
-        {latest.bytes != null && <span>{formatBytes(latest.bytes)} written</span>}
-        {latest.rows != null && (
-          <span>{latest.rows.toLocaleString()} rows</span>
-        )}
-        {/* Prefixed with a tilde, always: it is extrapolated from throughput so
-            far, and a bare "3m 20s" reads as a promise the job cannot keep. */}
-        {left != null && (
-          <span className="text-slate-400">~{formatElapsed(left)} left</span>
-        )}
-      </div>
-    </div>
+    </Link>
   );
 }

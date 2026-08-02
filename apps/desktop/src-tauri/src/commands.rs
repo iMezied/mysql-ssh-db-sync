@@ -906,6 +906,21 @@ pub async fn update_sync_plan(
     Ok(state.store.update_sync_plan(id, selections).await?)
 }
 
+/// Rename a table set.
+///
+/// Separate from `update_sync_plan` because it must not bump the revision: a
+/// revision means "what this set backs up changed", and a typo fix changes
+/// nothing a schedule needs to re-examine.
+#[tauri::command]
+#[specta::specta]
+pub async fn rename_sync_plan(
+    state: State<'_, AppState>,
+    id: Uuid,
+    name: String,
+) -> CmdResult<SyncPlan> {
+    Ok(state.store.rename_sync_plan(id, name).await?)
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn delete_sync_plan(state: State<'_, AppState>, id: Uuid) -> CmdResult<bool> {
@@ -1086,14 +1101,32 @@ fn write_secret_file(path: &std::path::Path, secret: &str) -> std::io::Result<()
     writeln!(file, "{secret}")
 }
 
-/// Parse a legacy `tables.conf` into selections.
+/// Turn a legacy `tables.conf` into a complete selection list.
 ///
 /// Lets an existing Bash-tool setup be carried over without retyping a couple
 /// of hundred table names.
+///
+/// `available` is the source's table list, and the file cannot be honoured
+/// without it: the file names only what carries data, while a selection that
+/// stays silent about a table gives it data at run time. See
+/// [`plan::selections_from_tables_conf`]. The caller passes the introspection
+/// it has already made rather than this connecting again, so an import is still
+/// one click on a list the user is looking at.
 #[tauri::command]
 #[specta::specta]
-pub async fn import_tables_conf(contents: String) -> CmdResult<Vec<TableSelection>> {
-    Ok(plan::parse_tables_conf(&contents))
+pub async fn import_tables_conf(
+    contents: String,
+    available: Vec<String>,
+) -> CmdResult<Vec<TableSelection>> {
+    if available.is_empty() {
+        return Err(CommandError::new(
+            "no_tables",
+            "the source's table list is not loaded, so the file cannot be \
+             completed; without it every table the file omits would be backed \
+             up with its data",
+        ));
+    }
+    Ok(plan::selections_from_tables_conf(&contents, &available))
 }
 
 // ── Sync ────────────────────────────────────────────────────────────────

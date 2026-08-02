@@ -1,24 +1,26 @@
 import { useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { AlertTriangle, ArrowRight, Play } from "lucide-react";
 
 import PageHeader from "@/components/PageHeader";
 import { api } from "@/lib/api";
+import { useProgressStore } from "@/lib/jobProgress";
 import { cn } from "@/lib/utils";
 import type {
   ConnectionProfile,
   EngineBackupOptions,
   EngineRestoreOptions,
   SyncRequest,
-  TableInfo,
+  TableMode,
 } from "@/bindings";
-import { defaultBackupOptions, defaultRestoreOptions } from "@/lib/engineDefaults";
-
-type TableMode = "schema_and_data" | "schema_only" | "exclude";
-
-function keyOf(t: TableInfo): string {
-  return t.schema ? `${t.schema}.${t.name}` : t.name;
-}
+import {
+  defaultBackupOptions,
+  defaultRestoreOptions,
+  supportsSchemaOnly,
+} from "@/lib/engineDefaults";
+import TableSelector from "@/components/TableSelector";
+import { keyOf, materialise } from "@/lib/tableSelection";
 
 /**
  * Source → plan → destination, in one job.
@@ -34,7 +36,9 @@ export default function SyncPage() {
   const [prefix, setPrefix] = useState("sync");
   const [verify, setVerify] = useState(true);
   const [keepLast, setKeepLast] = useState<number | null>(null);
-  const [started, setStarted] = useState<string | null>(null);
+
+  const navigate = useNavigate();
+  const noteLaunch = useProgressStore((s) => s.noteLaunch);
 
   const profiles = useQuery({ queryKey: ["profiles"], queryFn: api.listProfiles });
   const backupDir = useQuery({
@@ -60,12 +64,19 @@ export default function SyncPage() {
   const engineMismatch =
     source && dest && source.engine !== dest.engine ? { source, dest } : null;
 
+  // `mongodump` writes a collection whole or not at all, and the engine
+  // refuses a schema-only selection for it — so the old hardcoded
+  // "schema_only" default made every MongoDB sync fail before it started.
+  const defaultMode: TableMode = supportsSchemaOnly(source?.engine ?? "mysql")
+    ? "schema_only"
+    : "schema_and_data";
+
   const withData = useMemo(
     () =>
       (tables.data ?? []).filter(
-        (t) => (modes[keyOf(t)] ?? "schema_only") === "schema_and_data",
+        (t) => (modes[keyOf(t)] ?? defaultMode) === "schema_and_data",
       ),
-    [tables.data, modes],
+    [tables.data, modes, defaultMode],
   );
 
   const engineBackupOptions = (): EngineBackupOptions =>
@@ -80,11 +91,7 @@ export default function SyncPage() {
         backup: {
           common: {
             database,
-            selections: (tables.data ?? []).map((t) => ({
-              name: keyOf(t),
-              mode: modes[keyOf(t)] ?? "schema_only",
-              where_filter: null,
-            })),
+            selections: materialise(tables.data ?? [], modes, defaultMode),
             output_dir: backupDir.data ?? "",
             compress: true,
             encrypt: false,
@@ -102,7 +109,13 @@ export default function SyncPage() {
       };
       return api.startSync(sourceId, destId, request);
     },
-    onSuccess: (jobId) => setStarted(jobId),
+    onSuccess: (jobId) => {
+      noteLaunch(jobId, {
+        title: "Sync",
+        detail: `${source?.name ?? "source"} → ${dest?.name ?? "destination"}`,
+      });
+      navigate(`/jobs/${jobId}`);
+    },
   });
 
   const ready =
@@ -186,63 +199,19 @@ export default function SyncPage() {
         {tables.data && (
           <section className="space-y-3">
             <div className="flex flex-wrap items-center gap-3">
-              <h2 className="text-sm font-medium text-slate-200">
-                Tables carrying data
-              </h2>
-              <button
-                onClick={() =>
-                  setModes(
-                    Object.fromEntries(
-                      (tables.data ?? []).map((t) => [keyOf(t), "schema_and_data"]),
-                    ),
-                  )
-                }
-                className="rounded-md border border-slate-700 px-2.5 py-1 text-xs text-slate-300 transition hover:bg-slate-800"
-              >
-                Select all
-              </button>
-              <button
-                onClick={() => setModes({})}
-                className="rounded-md border border-slate-700 px-2.5 py-1 text-xs text-slate-300 transition hover:bg-slate-800"
-              >
-                Clear
-              </button>
+              <h2 className="text-sm font-medium text-slate-200">Tables</h2>
               <span className="text-xs text-slate-500">
-                {withData.length} of {tables.data.length} with data; the rest
-                travel as schema only
+                {withData.length} of {tables.data.length} carry data
               </span>
             </div>
 
-            <div className="panel max-h-72 overflow-y-auto">
-              {tables.data.map((t) => {
-                const k = keyOf(t);
-                const selected = (modes[k] ?? "schema_only") === "schema_and_data";
-                return (
-                  <label
-                    key={k}
-                    className="flex cursor-pointer items-center gap-2.5 border-b border-slate-800 px-3 py-1.5 last:border-0 hover:bg-slate-800/40"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={selected}
-                      onChange={(e) =>
-                        setModes((prev) => ({
-                          ...prev,
-                          [k]: e.target.checked ? "schema_and_data" : "schema_only",
-                        }))
-                      }
-                      className="h-3.5 w-3.5 rounded border-slate-600 bg-slate-900"
-                    />
-                    <span className="font-mono text-xs text-slate-300">{k}</span>
-                    {!t.transactional && t.storage_engine && (
-                      <span className="rounded bg-amber-500/15 px-1 py-0.5 text-[10px] uppercase text-amber-300">
-                        {t.storage_engine}
-                      </span>
-                    )}
-                  </label>
-                );
-              })}
-            </div>
+            <TableSelector
+              tables={tables.data}
+              value={modes}
+              onChange={setModes}
+              engine={source?.engine ?? "mysql"}
+              defaultMode={defaultMode}
+            />
           </section>
         )}
 
@@ -330,12 +299,6 @@ export default function SyncPage() {
                 <Play className="h-4 w-4" />
                 {start.isPending ? "Starting…" : "Run sync"}
               </button>
-
-              {started && (
-                <span className="text-xs text-emerald-400">
-                  Started — follow it on the Jobs page (job {started.slice(0, 8)}).
-                </span>
-              )}
             </div>
 
             {start.isError && (

@@ -535,7 +535,25 @@ under a schedule is visible.
 `plan::parse_tables_conf` reads the old format, matching the original loader's
 behaviour down to taking the first whitespace-delimited token per line (the old
 script piped it through `awk '{print $1}'`) and skipping duplicates. The
-repository's own `table.conf` has 215 entries; nobody should retype those.
+repository's own `table.conf` has 236 entries; nobody should retype those.
+
+#### An import is completed against the source, not stored as the file's names
+
+Parsing is only half of what the file means. It names the tables that carry
+data and is silent about the rest, because the old script's default was
+structure-without-rows. A stored set reads the *opposite* way: `expand_selections`
+gives an unmentioned table its data, which is right for a set built in the
+editor — a table added last week belongs in tonight's backup — and inverts the
+file.
+
+Storing just the parsed names therefore turned a 236-table selection into
+"every table, with data", silently: the backup succeeds, the artifact is valid,
+and it is merely far larger than anyone asked for. `plan::selections_from_tables_conf`
+takes the source's table list and names the omitted tables `SchemaOnly`
+explicitly, so the stored set is self-describing and survives expansion
+unchanged. The rule lives in the engine rather than in the desktop page because
+it is what the file *means*; the page passes the introspection it already has,
+and the import button is disabled until that lands.
 
 `missing_from` and `unlisted_in` report drift in both directions. A plan
 outlives the schema it was written against, and silently backing up less than

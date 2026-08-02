@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
@@ -14,6 +15,7 @@ import {
 
 import PageHeader from "@/components/PageHeader";
 import { api } from "@/lib/api";
+import { useProgressStore } from "@/lib/jobProgress";
 import { cn } from "@/lib/utils";
 import { events } from "@/bindings";
 import type {
@@ -124,6 +126,8 @@ export default function SchedulesPage() {
 function ScheduleRow({ view }: { view: ScheduleView }) {
   const { schedule } = view;
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
+  const noteLaunch = useProgressStore((s) => s.noteLaunch);
   const [crontab, setCrontab] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
@@ -146,7 +150,16 @@ function ScheduleRow({ view }: { view: ScheduleView }) {
 
   const runNow = useMutation({
     mutationFn: () => api.runScheduleNow(schedule.id),
-    onSuccess: invalidate,
+    // A run started by hand is watched like any other; the scheduler's own
+    // ticks are not, which is why only this path navigates.
+    onSuccess: (jobId) => {
+      invalidate();
+      noteLaunch(jobId, {
+        title: schedule.kind === "drill" ? "Drill" : "Scheduled run",
+        detail: schedule.name,
+      });
+      navigate(`/jobs/${jobId}`);
+    },
   });
 
   const remove = useMutation({
@@ -562,7 +575,7 @@ function ScheduleForm({ onClose }: { onClose: () => void }) {
 
       {sourceId && plans.data?.length === 0 && (
         <Warning>
-          {source?.name} has no saved plans. Build one on the Sync page — a
+          {source?.name} has no table sets. Build one on the Table sets page — a
           schedule needs a named table selection so it keeps backing up the same
           thing every night.
         </Warning>

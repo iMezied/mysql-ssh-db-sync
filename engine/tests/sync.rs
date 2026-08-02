@@ -15,7 +15,7 @@ use db_sync_engine::job::JobContext;
 use db_sync_engine::mask::{MaskRule, MaskTransform};
 use db_sync_engine::ops::{self, SyncRequest};
 use db_sync_engine::tools::ToolSource;
-use db_sync_engine::plan::{SyncPlanCreate, parse_tables_conf};
+use db_sync_engine::plan::{SyncPlanCreate, selections_from_tables_conf};
 use db_sync_engine::profile::{
     ConnectionProfile, DbConfig, ProfileCreate, ToolOverrides,
 };
@@ -351,18 +351,33 @@ db_test! {
 
         // The real file shipped with the Bash tool looks like this.
         let conf = "# Orders\norders\norder_items\n\n# Users\nusers\n";
+        // Completed against what the source holds. The file names only the
+        // tables that carry data, and a stored set that stays silent about the
+        // rest has them completed as schema+data at run time — so the import
+        // has to say "schema only" out loud or it means the inverse of the file.
+        let available = vec![
+            "orders".to_string(),
+            "order_items".to_string(),
+            "users".to_string(),
+            "audit_log".to_string(),
+        ];
         let plan = store
             .create_sync_plan(SyncPlanCreate {
                 profile_id: profile.id,
                 name: "imported".into(),
                 database: "app".into(),
-                selections: parse_tables_conf(conf),
+                selections: selections_from_tables_conf(conf, &available),
             masking: Vec::new(),
         })
             .await
             .unwrap();
 
         assert_eq!(plan.tables_with_data(), vec!["orders", "order_items", "users"]);
+        assert_eq!(plan.schema_only_tables(), vec!["audit_log"]);
+        assert!(
+            plan.unlisted_in(&available).is_empty(),
+            "an imported set must cover every table, or the rest gain data at run time"
+        );
     }
 }
 

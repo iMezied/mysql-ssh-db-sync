@@ -1,9 +1,12 @@
 import { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { AlertTriangle, Play, ShieldCheck } from "lucide-react";
 
 import PageHeader from "@/components/PageHeader";
 import { api } from "@/lib/api";
+import { describeNaming } from "@/lib/jobDetails";
+import { useProgressStore } from "@/lib/jobProgress";
 import { formatBytes, formatTimestamp } from "@/lib/utils";
 import type {
   Artifact,
@@ -12,6 +15,7 @@ import type {
   TargetNaming,
 } from "@/bindings";
 import { defaultRestoreOptions } from "@/lib/engineDefaults";
+import { unlistedTables } from "@/lib/tableSelection";
 
 /**
  * Restore an artifact into a database.
@@ -58,12 +62,15 @@ const STRATEGIES: {
 export default function RestorePage() {
   const [profileId, setProfileId] = useState("");
   const [artifactPath, setArtifactPath] = useState("");
+  const [setId, setSetId] = useState("");
   const [strategy, setStrategy] = useState<Strategy>("new_timestamped");
   const [prefix, setPrefix] = useState("");
   const [targetName, setTargetName] = useState("");
   const [confirmation, setConfirmation] = useState("");
   const [verifyChecksum, setVerifyChecksum] = useState(true);
-  const [started, setStarted] = useState<string | null>(null);
+
+  const navigate = useNavigate();
+  const noteLaunch = useProgressStore((s) => s.noteLaunch);
 
   const profiles = useQuery({ queryKey: ["profiles"], queryFn: api.listProfiles });
   const artifacts = useQuery({
@@ -101,8 +108,59 @@ export default function RestorePage() {
         ? { strategy: "drop_and_recreate", name: targetName.trim() }
         : { strategy: "into_existing", name: targetName.trim() };
 
-  const engineOptions = (): EngineRestoreOptions =>
-    defaultRestoreOptions(profile?.engine ?? "mysql");
+  // Only archive formats can hand back part of themselves. A flat `.sql.gz`
+  // is a statement stream replayed start to finish, so there is nothing to
+  // pick out of it.
+  const canSubset =
+    artifact?.format === "pg_custom" ||
+    artifact?.format === "pg_directory" ||
+    artifact?.format === "mongo_archive";
+
+  // A set belongs to the connection the backup came *from*, not the one it is
+  // going to — its table names were written against that schema.
+  const sets = useQuery({
+    queryKey: ["sync-plans", artifact?.source_profile_id],
+    queryFn: () => api.listSyncPlans(artifact!.source_profile_id!),
+    enabled: !!artifact?.source_profile_id && canSubset,
+  });
+  const chosenSet = sets.data?.find((s) => s.id === setId) ?? null;
+
+  /**
+   * Which tables the chosen set wants back, completed against the artifact.
+   *
+   * The universe is `artifact.tables`, not the destination's — what can come
+   * back is decided by what was dumped.
+   */
+  const onlyTables = (): string[] => {
+    if (!chosenSet) return [];
+    const listed = chosenSet.selections
+      .filter((s) => s.mode === "schema_and_data")
+      .map((s) => s.name)
+      .filter((n) => artifact!.tables.includes(n));
+    // Tables the set never mentions carry data, same rule as a backup.
+    const unlisted = unlistedTables(
+      artifact!.tables.map((name) => ({
+        name,
+        schema: null,
+        storage_engine: null,
+        transactional: true,
+        estimated_rows: null,
+        data_bytes: null,
+        index_bytes: null,
+      })),
+      chosenSet.selections,
+    );
+    return [...listed, ...unlisted];
+  };
+
+  const engineOptions = (): EngineRestoreOptions => {
+    const base = defaultRestoreOptions(profile?.engine ?? "mysql");
+    const only = onlyTables();
+    if (only.length === 0) return base;
+    if (base.engine === "postgres") return { ...base, only_tables: only };
+    if (base.engine === "mongo") return { ...base, only_collections: only };
+    return base;
+  };
 
   const start = useMutation({
     mutationFn: () => {
@@ -115,9 +173,15 @@ export default function RestorePage() {
       };
       return api.startRestore(profileId, request);
     },
+    // The typed confirmation is cleared on the way out, so coming back to this
+    // page does not find a destructive restore one click from running again.
     onSuccess: (jobId) => {
-      setStarted(jobId);
       setConfirmation("");
+      noteLaunch(jobId, {
+        title: "Restore",
+        detail: describeNaming(naming()) ?? "",
+      });
+      navigate(`/jobs/${jobId}`);
     },
   });
 
@@ -202,6 +266,45 @@ export default function RestorePage() {
 
         {profileId && artifactPath && (
           <>
+            <section className="space-y-2">
+              <h2 className="text-sm font-medium text-slate-200">
+                Tables to restore
+              </h2>
+              {canSubset ? (
+                <>
+                  <select
+                    className="field-input max-w-md"
+                    value={setId}
+                    onChange={(e) => setSetId(e.target.value)}
+                  >
+                    <option value="">Everything in the backup</option>
+                    {sets.data?.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.name}
+                      </option>
+                    ))}
+                  </select>
+                  {/* Saying exactly what a set does here, because the obvious
+                      reading — "only these tables exist afterwards" — is
+                      wrong: pg_restore's filter applies to table *data*. */}
+                  <p className="text-xs leading-relaxed text-slate-500">
+                    The full schema is restored either way; a set only chooses
+                    whose rows come back.
+                    {sets.data?.length === 0 &&
+                      " This backup's connection has no table sets yet."}
+                  </p>
+                </>
+              ) : (
+                <p className="max-w-2xl text-xs leading-relaxed text-slate-500">
+                  This backup is a single compressed SQL stream. It has to be
+                  replayed from the first line to the last, so there is no way to
+                  pick part of it out — the whole thing is restored. A PostgreSQL
+                  custom-format or MongoDB archive backup can be restored
+                  selectively.
+                </p>
+              )}
+            </section>
+
             <section className="space-y-3">
               <h2 className="text-sm font-medium text-slate-200">Target</h2>
 
@@ -317,13 +420,6 @@ export default function RestorePage() {
                 title="Could not start the restore"
                 detail={(start.error as Error).message}
               />
-            )}
-
-            {started && (
-              <p className="text-xs text-emerald-400">
-                Restore started — job {started.slice(0, 8)}. Watch it on the Jobs
-                page.
-              </p>
             )}
 
             <p className="max-w-3xl text-xs leading-relaxed text-slate-600">

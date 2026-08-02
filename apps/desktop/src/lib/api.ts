@@ -75,8 +75,10 @@ export const api = {
   updateSyncPlan: (...args: Parameters<typeof commands.updateSyncPlan>) =>
     unwrap(commands.updateSyncPlan(...args)),
   deleteSyncPlan: (id: string) => unwrap(commands.deleteSyncPlan(id)),
-  importTablesConf: (contents: string) =>
-    unwrap(commands.importTablesConf(contents)),
+  renameSyncPlan: (id: string, name: string) =>
+    unwrap(commands.renameSyncPlan(id, name)),
+  importTablesConf: (contents: string, available: string[]) =>
+    unwrap(commands.importTablesConf(contents, available)),
   listJobs: (limit: number) => unwrap(commands.listJobs(limit)),
   listAudit: (limit: number) => unwrap(commands.listAudit(limit)),
   cancelJob: (id: string) => unwrap(commands.cancelJob(id)),

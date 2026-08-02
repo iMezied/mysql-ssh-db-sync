@@ -9,7 +9,8 @@ use std::path::PathBuf;
 
 use crate::backup::mysql::Endpoint;
 use crate::backup::{
-    BackupError, BackupRequest, run_mongo_backup, run_mysql_backup, run_postgres_backup,
+    BackupError, BackupRequest, CommonBackupOptions, TableSelection, run_mongo_backup,
+    run_mysql_backup, run_postgres_backup,
 };
 use crate::connect::{self, ConnectError};
 use crate::db::ConnectParams;
@@ -191,6 +192,25 @@ pub async fn backup(
         .await;
     let version =
         server_version(profile, &reachable.endpoint, Some(&request.common.database)).await?;
+
+    // A saved set names only the exceptions, so complete it against what the
+    // source actually holds. Before the row counts below, which read
+    // `tables_with_data` and would otherwise miss everything just added. A
+    // no-op for the app and the CLI, which both send a full list already.
+    let request = &BackupRequest {
+        common: CommonBackupOptions {
+            selections: resolve_selections(
+                profile,
+                &request.common.database,
+                &request.common.selections,
+                store,
+                ctx,
+            )
+            .await?,
+            ..request.common.clone()
+        },
+        engine: request.engine.clone(),
+    };
 
     // Resolved here rather than inside each engine so both get the same rule,
     // and so the escrow check runs before a single byte is dumped: discovering
@@ -771,6 +791,28 @@ pub async fn sync(
     // a column that does not exist, so nothing is masked — is only cheap to
     // recover from while no data has moved. Once the restore has run, the
     // remedy is dropping a database someone may already be using.
+    // Before `plan_masking`, not after. See `resolve_selections`: expanding
+    // later would let a masking rule be written off as inert and then have its
+    // table promoted to schema+data, sending real values to the destination
+    // unmasked.
+    let request = &SyncRequest {
+        backup: BackupRequest {
+            common: CommonBackupOptions {
+                selections: resolve_selections(
+                    source,
+                    &request.backup.common.database,
+                    &request.backup.common.selections,
+                    store,
+                    ctx,
+                )
+                .await?,
+                ..request.backup.common.clone()
+            },
+            engine: request.backup.engine.clone(),
+        },
+        ..request.clone()
+    };
+
     let coverage = plan_masking(source, request, store, ctx).await?;
 
     // ── Backup ──────────────────────────────────────────────────────────
@@ -971,6 +1013,96 @@ async fn plan_masking(
 }
 
 /// Read the column names of specific tables from a profile.
+/// Complete a saved selection against the tables the source actually has.
+///
+/// A saved set names exceptions; [`crate::plan::expand_selections`] fills in
+/// the rest as schema+data. This is the I/O half — it asks the source what it
+/// holds and reports drift in both directions.
+///
+/// # Where this is called from, and why the order matters
+///
+/// At the top of [`backup`] and at the top of [`sync`]. In `sync` it must run
+/// **before** [`plan_masking`], and that is a data-protection constraint, not a
+/// tidiness one: `plan_masking` decides a masking rule is inert by asking which
+/// tables carry data. Expanding afterwards would promote a table to schema+data
+/// *after* its masking rule had been written off, and the real values would
+/// reach the destination unmasked — reported only as "will not run", which
+/// reads like the table was not copied at all.
+///
+/// Idempotent, so `sync` resolving and then `backup` resolving again costs one
+/// introspection and changes nothing.
+async fn resolve_selections(
+    profile: &ConnectionProfile,
+    database: &str,
+    saved: &[TableSelection],
+    store: &Store,
+    ctx: &JobContext,
+) -> Result<Vec<TableSelection>, OpError> {
+    let reachable = reach(profile, store).await?;
+    let params = ConnectParams {
+        engine: profile.engine,
+        host: reachable.endpoint.host.clone(),
+        port: reachable.endpoint.port,
+        user: reachable.endpoint.user.clone(),
+        password: reachable.endpoint.password.clone(),
+        database: Some(database.to_string()),
+    };
+    let introspector = crate::db::connect(&params).await?;
+    let tables = introspector.list_tables(database).await?;
+    introspector.close().await;
+
+    let available: Vec<String> = tables
+        .iter()
+        .map(|t| match &t.schema {
+            Some(s) => format!("{s}.{}", t.name),
+            None => t.name.clone(),
+        })
+        .collect();
+
+    // Drift is reported, not fatal: a table dropped last week should not stop
+    // tonight's backup of everything else — but it must be visible, and until
+    // now it was not. The check this replaces compared the plan against itself.
+    let missing: Vec<String> = saved
+        .iter()
+        .filter(|s| s.mode != crate::backup::TableMode::Exclude)
+        .map(|s| s.name.clone())
+        .filter(|name| !available.contains(name))
+        .collect();
+    if !missing.is_empty() {
+        ctx.emit_warn(
+            JobPhase::Introspect,
+            format!(
+                "{} table(s) in this selection are no longer on the source and \
+                 were skipped: {}",
+                missing.len(),
+                missing.join(", ")
+            ),
+        )
+        .await;
+    }
+
+    let expanded = crate::plan::expand_selections(saved, &available);
+    let added: Vec<&str> = expanded
+        .iter()
+        .filter(|s| !saved.iter().any(|old| old.name == s.name))
+        .map(|s| s.name.as_str())
+        .collect();
+    if !added.is_empty() {
+        ctx.emit_warn(
+            JobPhase::Introspect,
+            format!(
+                "{} table(s) are not named in this selection and were included \
+                 with their data: {}",
+                added.len(),
+                added.join(", ")
+            ),
+        )
+        .await;
+    }
+
+    Ok(expanded)
+}
+
 async fn source_columns(
     profile: &ConnectionProfile,
     database: &str,
