@@ -381,6 +381,92 @@ fn search_path(binary: &str) -> Option<std::path::PathBuf> {
         .find(|candidate| is_executable(candidate))
 }
 
+/// The Docker client, whose name differs on Windows.
+const DOCKER_BIN: &str = if cfg!(windows) { "docker.exe" } else { "docker" };
+
+/// Absolute directories every Docker distribution is known to install into.
+///
+/// Docker gets its own list rather than reusing [`find_tool`]'s because none of
+/// these hold a database client, and none of `find_tool`'s hold Docker.
+const DOCKER_DIRS: &[&str] = &[
+    // Docker Desktop's system-wide symlink, and where a Linux package lands.
+    "/usr/local/bin",
+    "/usr/bin",
+    // Homebrew's `docker` CLI on Apple silicon and Intel — what Colima uses.
+    "/opt/homebrew/bin",
+    "/opt/local/bin",
+    // Docker Desktop itself, for an install whose symlink was never created
+    // (it needs an admin password, and declining it is easy to do).
+    "/Applications/Docker.app/Contents/Resources/bin",
+];
+
+/// The same, relative to the user's home directory.
+///
+/// Every modern runtime installs per-user by default, which is precisely the
+/// place a stripped-down `PATH` cannot reach.
+const DOCKER_HOME_DIRS: &[&str] = &[
+    ".docker/bin",   // Docker Desktop, user-space install
+    ".orbstack/bin", // OrbStack
+    ".rd/bin",       // Rancher Desktop
+];
+
+/// Locate the `docker` client.
+///
+/// Kept separate from [`find_tool`] because the failure it prevents is a
+/// different one, and nastier. A macOS app launched from Finder inherits
+/// `/usr/bin:/bin:/usr/sbin:/sbin` and nothing else — not the shell's `PATH` —
+/// and no Docker distribution installs its client into any of those four. The
+/// result is a machine where `docker ps` works in every terminal, containers
+/// are visibly running, and the app reports "could not start docker: No such
+/// file or directory" ten seconds into a backup, with nothing on screen
+/// suggesting the app simply could not see the binary.
+///
+/// `PATH` is still searched first: it is right whenever it has been set (the
+/// CLI, a dev build, Linux), and it honours a deliberately non-standard
+/// install that no hard-coded list could know about.
+pub fn find_docker() -> Option<std::path::PathBuf> {
+    if let Some(found) = search_path(DOCKER_BIN) {
+        return Some(found);
+    }
+
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let home_dirs = home.into_iter().flat_map(|home| {
+        DOCKER_HOME_DIRS
+            .iter()
+            .map(move |dir| home.join(dir))
+            .collect::<Vec<_>>()
+    });
+
+    DOCKER_DIRS
+        .iter()
+        .map(std::path::PathBuf::from)
+        .chain(home_dirs)
+        .map(|dir| dir.join(DOCKER_BIN))
+        .find(|candidate| is_executable(candidate))
+}
+
+/// What to tell someone whose Docker we cannot find.
+///
+/// Names the searched locations rather than saying "install Docker", because
+/// the overwhelmingly likely reader of this message has Docker installed and
+/// running — see [`find_docker`] — and being told to install it again is worse
+/// than useless.
+pub fn docker_missing_message() -> String {
+    let searched = DOCKER_DIRS
+        .iter()
+        .map(|d| (*d).to_string())
+        .chain(DOCKER_HOME_DIRS.iter().map(|d| format!("~/{d}")))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!(
+        "could not find the docker command. An app launched from Finder does not inherit \
+         your shell's PATH, so Docker working in a terminal is not enough. Searched PATH \
+         and: {searched}. If Docker lives somewhere else, switch Database tools to \
+         \"Installed on this Mac\" and point the profile at the binaries directly."
+    )
+}
+
 fn is_executable(path: &Path) -> bool {
     if !path.is_file() {
         return false;
@@ -543,6 +629,51 @@ mod tests {
             let alive = unsafe { libc::kill(grandchild, 0) } == 0;
             assert!(!alive, "grandchild {grandchild} survived the group kill");
         }
+    }
+
+    #[test]
+    fn docker_is_looked_for_by_path_not_by_name() {
+        // Machine-independent: a runner may have no Docker at all. What must
+        // hold either way is that a hit is an absolute, runnable path — a bare
+        // "docker" would mean we handed the lookup back to `PATH`, which is
+        // the bug (a Finder-launched app inherits /usr/bin:/bin:/usr/sbin:/sbin
+        // and no Docker distribution installs into any of them).
+        let Some(found) = find_docker() else { return };
+
+        assert!(found.is_absolute(), "not runnable without a PATH: {found:?}");
+        assert!(is_executable(&found), "found something unrunnable: {found:?}");
+        assert_eq!(
+            found.file_stem().and_then(|n| n.to_str()),
+            Some("docker"),
+            "found the wrong binary: {found:?}"
+        );
+    }
+
+    #[test]
+    fn the_docker_search_covers_the_runtimes_people_actually_have() {
+        // Docker Desktop's symlink, Homebrew's client, and the per-user
+        // installs OrbStack and Rancher Desktop default to. Each was a real
+        // report of "Docker is running but the app says it is not".
+        for dir in ["/usr/local/bin", "/opt/homebrew/bin"] {
+            assert!(DOCKER_DIRS.contains(&dir), "{dir} is not searched");
+        }
+        for dir in [".docker/bin", ".orbstack/bin", ".rd/bin"] {
+            assert!(DOCKER_HOME_DIRS.contains(&dir), "~/{dir} is not searched");
+        }
+    }
+
+    #[test]
+    fn the_missing_docker_message_says_where_it_looked() {
+        let msg = docker_missing_message();
+        // Naming the locations is the whole value: the reader almost certainly
+        // has Docker installed, so "install Docker" would be wrong advice.
+        assert!(msg.contains("PATH"), "{msg}");
+        assert!(msg.contains("/usr/local/bin"), "{msg}");
+        assert!(msg.contains("~/.orbstack/bin"), "{msg}");
+        assert!(
+            !msg.to_lowercase().contains("install docker"),
+            "misleading advice for a machine that already has it: {msg}"
+        );
     }
 
     #[test]

@@ -170,6 +170,22 @@ impl ToolSource {
         matches!(self, ToolSource::DockerExec { .. } | ToolSource::DockerRun { .. })
     }
 
+    /// Whether the machinery this source depends on is actually reachable.
+    ///
+    /// Checked before a job starts rather than left to the first spawn. The
+    /// Docker sources fail at spawn time otherwise, which on a large database
+    /// is a minute of connecting, tunnelling and introspecting spent to earn
+    /// the right to fail on a `stat` — and the message that comes back is
+    /// `No such file or directory (os error 2)`, which does not name Docker,
+    /// does not name the setting that chose it, and is wrong about what is
+    /// missing.
+    pub fn preflight(&self) -> Result<(), String> {
+        if self.is_docker() && crate::exec::find_docker().is_none() {
+            return Err(crate::exec::docker_missing_message());
+        }
+        Ok(())
+    }
+
     /// Rewrite a hostname so a containerised tool reaches the same server.
     ///
     /// This is the whole reason tunnelled backups need special handling: an SSH
@@ -386,7 +402,7 @@ impl ResolvedTool {
                 args.extend(self.forwarded_env());
                 args.push(container.clone());
                 args.push(program.clone());
-                ToolCommand::new("docker").args(args)
+                docker_command().args(args)
             }
             Location::DockerRun { image, program } => {
                 let mut args = vec![
@@ -405,7 +421,7 @@ impl ResolvedTool {
                 args.extend(self.mount_args());
                 args.push(image.clone());
                 args.push(program.clone());
-                ToolCommand::new("docker").args(args)
+                docker_command().args(args)
             }
         }
     }
@@ -460,6 +476,24 @@ impl ResolvedTool {
             Location::DockerRun { image, program } => format!("docker run {image} {program}"),
         }
     }
+}
+
+/// A command that runs the Docker client, found rather than left to `PATH`.
+///
+/// Resolved per command instead of once at [`ResolvedTool::resolve`] time: it
+/// is a handful of `stat` calls against a process that runs for minutes, and
+/// resolving late means installing Docker while the app is open takes effect
+/// without a restart.
+///
+/// Falls back to the bare name when nothing is found, so the failure stays a
+/// spawn error rather than a panic. Reaching that fallback in a job means
+/// [`ToolSource::preflight`] was not called, and the message will be the poor
+/// one that preflight exists to replace.
+fn docker_command() -> crate::exec::ToolCommand {
+    let program = crate::exec::find_docker()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "docker".to_string());
+    crate::exec::ToolCommand::new(program)
 }
 
 fn in_container_path(bin_dir: Option<&str>, binary: &str) -> String {
@@ -533,27 +567,142 @@ pub struct DockerContainer {
 
 /// List running containers.
 ///
-/// An empty list and an error are deliberately different: "Docker is not
-/// installed" and "Docker is running but you have nothing up" need different
-/// advice, and collapsing them into one produces the unhelpful "no containers
-/// found" for a machine that has no Docker at all.
+/// Three outcomes, deliberately distinct: the client is not where we can see
+/// it, the client answered with nothing running, and the client answered with
+/// containers. "Docker is not installed", "Docker is installed but this app
+/// cannot find it" and "Docker is up but empty" want completely different
+/// advice, and collapsing them produces the unhelpful "no containers found"
+/// for a machine with a running database container in it.
 pub fn docker_containers() -> Result<Vec<DockerContainer>, String> {
-    let out = crate::exec::ToolCommand::new("docker")
-        .args(["ps", "--format", "{{.Names}}\t{{.Image}}"])
+    let docker = crate::exec::find_docker().ok_or_else(crate::exec::docker_missing_message)?;
+    let program = docker.display().to_string();
+
+    let listed = crate::exec::ToolCommand::new(program.clone())
+        .args(["ps", "--format", "{{.ID}}\t{{.Names}}\t{{.Image}}"])
         .output_text()
         .map_err(|e| format!("could not ask Docker what is running: {e}"))?;
 
-    Ok(out
-        .lines()
-        .filter_map(|line| {
-            let (name, image) = line.split_once('\t')?;
-            let name = name.trim();
-            (!name.is_empty()).then(|| DockerContainer {
-                name: name.to_string(),
-                image: image.trim().to_string(),
-            })
+    let mut rows = parse_ps(&listed);
+
+    // Only when `docker ps` gave up on naming one. In a healthy install this
+    // is never true, and the second round trip never happens.
+    if rows.iter().any(|r| !is_image_reference(&r.image)) {
+        let created_from = inspect_created_from(&program, &rows);
+        for row in &mut rows {
+            row.image = pick_image(row, &created_from);
+        }
+    }
+
+    Ok(rows
+        .into_iter()
+        .map(|r| DockerContainer {
+            name: r.name,
+            image: r.image,
         })
         .collect())
+}
+
+/// The best label available for one container's image.
+///
+/// `docker ps`'s answer wins whenever it is usable — it describes the image
+/// that is *running*. `Config.Image` is the rescue, and only the rescue: it
+/// records what was asked for at creation, which is right for a moved tag and
+/// wrong for a container started from a bare ID.
+///
+/// `created_from` carries full IDs against the abbreviated ones `docker ps`
+/// prints, so they are matched by prefix. No match leaves the ID showing,
+/// which is merely unhelpful — borrowing another container's image would be
+/// actively misleading.
+fn pick_image(row: &Listed, created_from: &[(String, String)]) -> String {
+    if is_image_reference(&row.image) {
+        return row.image.clone();
+    }
+
+    created_from
+        .iter()
+        .find(|(id, _)| !row.id.is_empty() && id.starts_with(&row.id))
+        .map(|(_, image)| image.trim())
+        .filter(|image| is_image_reference(image))
+        .unwrap_or(&row.image)
+        .to_string()
+}
+
+/// One row of `docker ps`, before the image has been made presentable.
+struct Listed {
+    id: String,
+    name: String,
+    image: String,
+}
+
+fn parse_ps(text: &str) -> Vec<Listed> {
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let id = fields.next()?.trim();
+            let name = fields.next()?.trim();
+            let image = fields.next()?.trim();
+            (!name.is_empty()).then(|| Listed {
+                id: id.to_string(),
+                name: name.to_string(),
+                image: image.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Ask Docker what reference each container was created from.
+///
+/// Returns pairs rather than a map because the IDs come back in full and go in
+/// abbreviated, so they are matched by prefix.
+///
+/// Failure is not propagated: this is a cosmetic improvement to a label, and a
+/// container that stopped between the two calls makes `docker inspect` exit
+/// non-zero. Losing the whole container list over that would trade a slightly
+/// ugly name for an unusable picker.
+fn inspect_created_from(program: &str, rows: &[Listed]) -> Vec<(String, String)> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+
+    let mut args = vec![
+        "inspect".to_string(),
+        "--format".to_string(),
+        "{{.Id}}\t{{.Config.Image}}".to_string(),
+    ];
+    args.extend(rows.iter().map(|r| r.id.clone()));
+
+    let Ok(out) = crate::exec::ToolCommand::new(program.to_string())
+        .args(args)
+        .output_text()
+    else {
+        return Vec::new();
+    };
+
+    out.lines()
+        .filter_map(|line| {
+            let (id, image) = line.split_once('\t')?;
+            Some((id.trim().to_string(), image.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Whether a string names an image in a way a human can act on.
+///
+/// `docker ps` prints a bare image ID whenever the running image no longer
+/// carries a tag — which happens to anyone who has re-pulled one. `docker pull
+/// mysql:8` moves the tag onto the newly fetched image and leaves the running
+/// container's image dangling, so the picker offers `d2c60b1b225c` where it
+/// means `mysql:8`. The container is fine and its clients still work; only the
+/// label is useless, and it is useless exactly when there are several
+/// containers to tell apart.
+///
+/// A reference always carries a tag, a digest or a registry path. An ID is hex
+/// and nothing else, so that is the whole test.
+fn is_image_reference(image: &str) -> bool {
+    let image = image.trim();
+    !image.is_empty()
+        && !image.starts_with("sha256:")
+        && !image.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Install a formula with Homebrew, returning its output.
@@ -740,6 +889,63 @@ mod source_tests {
         ResolvedTool::resolve(tool, source, None).expect("docker sources always resolve")
     }
 
+    /// The command line with the Docker client reduced to its bare name.
+    ///
+    /// The real command carries an absolute path — that is the point of
+    /// [`crate::exec::find_docker`] — and it differs per machine and is absent
+    /// on a runner with no Docker at all. Asserting on the raw string would
+    /// make these tests about where Docker happens to be installed rather than
+    /// about the arguments, which is what they are actually checking.
+    fn cmdline(tool: &ResolvedTool) -> String {
+        let rendered = tool.command().display();
+        let (program, rest) = rendered.split_once(' ').unwrap_or((&rendered, ""));
+        // `file_stem`, not `file_name`: Windows spells it `docker.exe`.
+        let name = Path::new(program)
+            .file_stem()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| program.to_string());
+        format!("{name} {rest}").trim_end().to_string()
+    }
+
+    #[test]
+    fn a_container_source_runs_docker_by_absolute_path() {
+        // The regression this exists for: `Command::new("docker")` resolves
+        // through the inherited PATH, which for an app started from Finder is
+        // /usr/bin:/bin:/usr/sbin:/sbin — four directories no Docker
+        // distribution installs into. Every containerised dump died on
+        // "No such file or directory" on a machine with containers running.
+        let Some(expected) = crate::exec::find_docker() else {
+            return; // No Docker here; `preflight` is what covers that case.
+        };
+
+        for source in [exec_source(), run_source()] {
+            let rendered = resolved(Tool::Mysqldump, &source).command().display();
+            assert!(
+                rendered.starts_with(&expected.display().to_string()),
+                "PATH would have to be right for this to run: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_local_source_never_needs_docker() {
+        assert!(ToolSource::Local.preflight().is_ok());
+    }
+
+    #[test]
+    fn a_container_source_preflight_matches_what_can_be_found() {
+        // Both directions, so this stays honest on a machine with Docker and
+        // on one without: preflight passes exactly when the client is there.
+        let have_docker = crate::exec::find_docker().is_some();
+        for source in [exec_source(), run_source()] {
+            let verdict = source.preflight();
+            assert_eq!(verdict.is_ok(), have_docker, "{source:?} → {verdict:?}");
+            if let Err(msg) = verdict {
+                assert!(msg.contains("docker"), "must name what is missing: {msg}");
+            }
+        }
+    }
+
     #[test]
     fn local_is_the_default_so_existing_installs_do_not_change() {
         assert_eq!(ToolSource::default(), ToolSource::Local);
@@ -776,7 +982,7 @@ mod source_tests {
 
     #[test]
     fn docker_run_adds_the_host_gateway_and_forwards_the_password_by_name() {
-        let line = resolved(Tool::Mysqldump, &run_source()).command().display();
+        let line = cmdline(&resolved(Tool::Mysqldump, &run_source()));
 
         assert!(line.starts_with("docker run --rm -i"), "got: {line}");
         assert!(
@@ -793,7 +999,7 @@ mod source_tests {
 
     #[test]
     fn docker_exec_targets_the_named_container() {
-        let line = resolved(Tool::PgDump, &exec_source()).command().display();
+        let line = cmdline(&resolved(Tool::PgDump, &exec_source()));
         assert!(line.starts_with("docker exec -i"), "got: {line}");
         assert!(line.contains("-e PGPASSWORD"), "got: {line}");
         assert!(line.ends_with("mysql8 pg_dump"), "got: {line}");
@@ -803,7 +1009,7 @@ mod source_tests {
     fn mongo_tools_forward_no_password_variable() {
         // They take credentials in the URI or in arguments, so forwarding a
         // variable would be cargo-culted noise on every command line.
-        let line = resolved(Tool::Mongodump, &run_source()).command().display();
+        let line = cmdline(&resolved(Tool::Mongodump, &run_source()));
         assert!(!line.contains(" -e "), "got: {line}");
         assert!(line.ends_with("mysql:8 mongodump"), "got: {line}");
     }
@@ -814,7 +1020,7 @@ mod source_tests {
             container: "c".into(),
             bin_dir: Some("/usr/local/mysql/bin/".into()),
         };
-        let line = resolved(Tool::Mysqldump, &source).command().display();
+        let line = cmdline(&resolved(Tool::Mysqldump, &source));
         assert!(line.ends_with("c /usr/local/mysql/bin/mysqldump"), "got: {line}");
     }
 
@@ -824,7 +1030,7 @@ mod source_tests {
             container: "c".into(),
             bin_dir: Some("  ".into()),
         };
-        let line = resolved(Tool::Mysqldump, &source).command().display();
+        let line = cmdline(&resolved(Tool::Mysqldump, &source));
         assert!(line.ends_with("c mysqldump"), "got: {line}");
     }
 
@@ -863,6 +1069,97 @@ mod source_tests {
                 _ => assert!(tool.password_env().is_some(), "{tool:?}"),
             }
         }
+    }
+
+    // ── The container picker's labels ───────────────────────────────────
+
+    #[test]
+    fn a_tag_is_a_usable_label_and_a_bare_id_is_not() {
+        for reference in [
+            "mysql:8",
+            "postgres:18",
+            "mongodb/mongodb-community-server:7.0-ubuntu2204",
+            "public.ecr.aws/supabase/postgres:17.6.1.140",
+            // Pinned by digest: long and ugly, but it does name an image.
+            "mysql@sha256:d2c60b1b225c6d7845f0abdb596fc35c2d4122bcad6ec2195",
+        ] {
+            assert!(is_image_reference(reference), "{reference} is a reference");
+        }
+
+        for id in [
+            "d2c60b1b225c",
+            "8485e4e11b29",
+            "sha256:d2c60b1b225c6d7845f0abdb596fc35c2d4122bcad6ec219588035a118f75d93",
+            "",
+            "   ",
+        ] {
+            assert!(!is_image_reference(id), "{id} tells the user nothing");
+        }
+    }
+
+    #[test]
+    fn ps_rows_are_parsed_and_headerless_junk_is_dropped() {
+        let out = "8485e4e11b29\tmysql8\td2c60b1b225c\n\
+                   f26a885ce420\tpostgres-db\tpostgres:16\n\
+                   \n\
+                   malformed-line-with-no-tabs\n";
+        let rows = parse_ps(out);
+
+        assert_eq!(rows.len(), 2, "a malformed line must not become a container");
+        assert_eq!(rows[0].id, "8485e4e11b29");
+        assert_eq!(rows[0].name, "mysql8");
+        assert_eq!(rows[1].image, "postgres:16");
+    }
+
+    #[test]
+    fn a_container_name_is_never_invented_from_a_blank_field() {
+        assert!(parse_ps("abc123\t\tmysql:8\n").is_empty());
+    }
+
+    #[test]
+    fn a_dangling_image_falls_back_to_what_the_container_was_created_from() {
+        // The real case: `docker pull mysql:8` moved the tag to a new image,
+        // so the running container's image lost its only tag and `docker ps`
+        // reports the ID. `Config.Image` still remembers `mysql:8`.
+        let ps = parse_ps("8485e4e11b29\tmysql8\td2c60b1b225c\n");
+        let inspected = vec![(
+            "8485e4e11b29a0f3c6d1e2b7c8a94f05d3e6b1a2c7f80d9e4b3a6c5f2e1d0b9a8".to_string(),
+            "mysql:8".to_string(),
+        )];
+
+        let chosen = pick_image(&ps[0], &inspected);
+        assert_eq!(chosen, "mysql:8", "the ID was the only thing wrong with it");
+    }
+
+    #[test]
+    fn a_tag_that_docker_ps_already_resolved_is_left_alone() {
+        // The opposite mistake: a container started by ID has `Config.Image`
+        // set to that ID, while `docker ps` resolved a perfectly good tag.
+        // Preferring `Config.Image` unconditionally would make this worse.
+        let ps = parse_ps("f26a885ce420\tpostgres-db\tpostgres:16\n");
+        let inspected = vec![(
+            "f26a885ce4201234567890abcdef1234567890abcdef1234567890abcdef1234".to_string(),
+            "3a82e1f56c8f".to_string(),
+        )];
+
+        assert_eq!(pick_image(&ps[0], &inspected), "postgres:16");
+    }
+
+    #[test]
+    fn an_unmatched_or_useless_inspection_leaves_the_id_showing() {
+        // Degrading to today's behaviour is correct here: an ID is a poor
+        // label, but inventing one for the wrong container would be worse.
+        let ps = parse_ps("8485e4e11b29\tmysql8\td2c60b1b225c\n");
+
+        assert_eq!(pick_image(&ps[0], &[]), "d2c60b1b225c");
+        assert_eq!(
+            pick_image(
+                &ps[0],
+                &[("0000000000000000".to_string(), "mysql:8".to_string())]
+            ),
+            "d2c60b1b225c",
+            "a different container's image must not be borrowed"
+        );
     }
 
     #[test]

@@ -81,6 +81,12 @@ pub enum OpError {
          strategy — either create it first, or restore into a new database instead"
     )]
     TargetMissing { target: String },
+    // Not `ToolMissing`: the client tools may be perfectly fine and the thing
+    // that is supposed to run them is what is absent. Carries its own message
+    // because "install it or set an override on the profile" is the wrong
+    // advice for a runtime chosen in app settings.
+    #[error("{0}")]
+    ToolSourceUnavailable(String),
 }
 
 /// A tunnel plus the local endpoint the tools should talk to.
@@ -162,6 +168,13 @@ pub async fn backup(
     // row counts are in — on a 109-table database that is over a minute spent
     // to learn something a stat(2) knew before any of it started. Same
     // reasoning as the escrow check below, applied to the earlier failure.
+    //
+    // The runtime before the tool: with a container source, `resolve` below
+    // cannot fail — there is no filesystem to check — so a missing `docker`
+    // sails past it and surfaces much later as a spawn error naming neither
+    // Docker nor the setting that selected it.
+    tools.preflight().map_err(OpError::ToolSourceUnavailable)?;
+
     let (dump_tool, override_path) = dump_tool_for(profile);
     if ResolvedTool::resolve(dump_tool, tools, override_path).is_none() {
         return Err(BackupError::ToolMissing {
@@ -279,6 +292,10 @@ pub async fn restore(
     tools: &ToolSource,
     ctx: &JobContext,
 ) -> Result<String, OpError> {
+    // Before the connection, for the same reason as in `backup`: a restore
+    // that cannot start its client should say so instead of tunnelling first.
+    tools.preflight().map_err(OpError::ToolSourceUnavailable)?;
+
     ctx.emit(JobPhase::SshConnect, "connecting to the destination")
         .await;
     let reachable = reach(profile, store).await?;

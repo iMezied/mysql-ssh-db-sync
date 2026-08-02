@@ -626,7 +626,13 @@ function DatabaseToolsSection() {
           <ExecSourceFields
             source={source}
             containers={containers.data ?? []}
-            error={containers.error ? String(containers.error) : null}
+            error={
+              containers.error instanceof Error
+                ? containers.error.message
+                : containers.error
+                  ? String(containers.error)
+                  : null
+            }
             onChange={(next) => saveSource.mutate(next)}
           />
         )}
@@ -711,10 +717,15 @@ function ExecSourceFields({
             </option>
           ))}
         </select>
-        {/* An empty list and an unreachable Docker need different advice. */}
+        {/* An empty list and an unreachable Docker need different advice —
+            and the engine's message is the specific one, naming where it
+            looked. Guessing "is it installed and running?" was actively
+            wrong for the case this most often is: Docker up, containers
+            running, and the app started from Finder without a PATH that
+            reaches the client. */}
         {error ? (
-          <span className="mt-1 block text-xs text-amber-300/90">
-            Docker did not answer. Is it installed and running?
+          <span className="mt-1 block text-xs leading-relaxed text-amber-300/90">
+            {error}
           </span>
         ) : containers.length === 0 ? (
           <span className="mt-1 block text-xs text-slate-500">
