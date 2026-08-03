@@ -80,6 +80,7 @@ export const api = {
   importTablesConf: (contents: string, available: string[]) =>
     unwrap(commands.importTablesConf(contents, available)),
   listJobs: (limit: number) => unwrap(commands.listJobs(limit)),
+  listJobSteps: (jobId: string) => unwrap(commands.listJobSteps(jobId)),
   listAudit: (limit: number) => unwrap(commands.listAudit(limit)),
   cancelJob: (id: string) => unwrap(commands.cancelJob(id)),
   activeJobIds: () => unwrap(commands.activeJobIds()),

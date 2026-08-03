@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowLeft } from "lucide-react";
@@ -7,16 +7,39 @@ import PageHeader from "@/components/PageHeader";
 import JobProgressStrip from "@/components/JobProgressStrip";
 import { api } from "@/lib/api";
 import { KIND_LABELS, logLines, summariseOptions } from "@/lib/jobDetails";
+import {
+  STEP_KIND_LABELS,
+  type StepStatus,
+  stepDurationMs,
+  stepStatus,
+  stepSummary,
+  worthShowing,
+} from "@/lib/jobSteps";
 import { useProgressStore } from "@/lib/jobProgress";
 import { useTick } from "@/lib/useTick";
-import { cn, formatDuration, formatTimestamp } from "@/lib/utils";
-import type { JobOutcome, JobRecord, ProgressEvent } from "@/bindings";
+import { cn, formatElapsed, formatDuration, formatTimestamp } from "@/lib/utils";
+import type { JobOutcome, JobRecord, JobStep, ProgressEvent } from "@/bindings";
 
 const OUTCOME_STYLES: Record<JobOutcome, string> = {
   success: "bg-emerald-500/15 text-emerald-300",
   failed: "bg-red-500/15 text-red-300",
   cancelled: "bg-slate-500/15 text-slate-400",
 };
+
+const STEP_STYLES: Record<StepStatus, string> = {
+  success: "bg-emerald-500/15 text-emerald-300",
+  failed: "bg-red-500/15 text-red-300",
+  cancelled: "bg-slate-500/15 text-slate-400",
+  skipped: "bg-slate-500/15 text-slate-500",
+  running: "bg-blue-500/15 text-blue-300",
+  pending: "bg-slate-800 text-slate-500",
+};
+
+/**
+ * Slower than the event stream on purpose. Steps change a handful of times in
+ * a run; the live detail inside one arrives on `JobProgress` already.
+ */
+const STEPS_POLL_MS = 2_000;
 
 /**
  * Deep enough to cover a job reached from the history list, which shows fifty.
@@ -61,6 +84,17 @@ export default function JobDetailPage() {
   });
   const running = outcome == null && (active.data?.includes(jobId) ?? false);
   const now = useTick(running);
+
+  const steps = useQuery({
+    queryKey: ["job-steps", jobId],
+    queryFn: () => api.listJobSteps(jobId),
+    refetchInterval: running ? STEPS_POLL_MS : false,
+  });
+
+  // Clicking a step narrows the timeline to it. Null is "show everything",
+  // which is where a six-step run has to start — the reader does not yet know
+  // which part they care about.
+  const [focused, setFocused] = useState<number | null>(null);
 
   const startedAt = job?.started_at ?? launched?.startedAt ?? null;
   const title = job ? KIND_LABELS[job.kind] : (launched?.title ?? "Job");
@@ -155,10 +189,23 @@ export default function JobDetailPage() {
 
             {job && <JobFacts job={job} />}
 
+            {worthShowing(steps.data ?? []) && (
+              <StepList
+                steps={steps.data ?? []}
+                now={now}
+                focused={focused}
+                onFocus={(index) =>
+                  setFocused((current) => (current === index ? null : index))
+                }
+              />
+            )}
+
             <Timeline
               lines={lines ?? []}
               stored={logLines(job?.log)}
               follow={running}
+              focused={focused}
+              onClearFocus={() => setFocused(null)}
             />
           </>
         )}
@@ -206,6 +253,104 @@ function JobFacts({ job }: { job: JobRecord }) {
 }
 
 /**
+ * The shape of a composite run: what it set out to do, and how far it got.
+ *
+ * Every step is planned before the first one starts, so a run that died at the
+ * restore shows the verification it never reached as skipped rather than
+ * leaving the reader to infer it from a log that stops.
+ */
+function StepList({
+  steps,
+  now,
+  focused,
+  onFocus,
+}: {
+  steps: JobStep[];
+  now: number;
+  focused: number | null;
+  onFocus: (index: number) => void;
+}) {
+  return (
+    <section>
+      <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
+        Steps
+      </h2>
+      <div className="panel divide-y divide-slate-800">
+        {steps.map((step) => {
+          const status = stepStatus(step);
+          const ms = stepDurationMs(step, now);
+          const summary = stepSummary(step);
+          const isFocused = focused === step.index;
+
+          return (
+            <button
+              key={step.index}
+              type="button"
+              onClick={() => onFocus(step.index)}
+              className={cn(
+                "flex w-full items-baseline gap-3 px-4 py-2.5 text-left transition hover:bg-slate-800/40",
+                isFocused && "bg-blue-600/10",
+              )}
+            >
+              <span className="w-4 shrink-0 tabular-nums text-xs text-slate-600">
+                {step.index}
+              </span>
+
+              <span className="min-w-0 flex-1">
+                <span className="flex flex-wrap items-baseline gap-x-2">
+                  <span
+                    className={cn(
+                      "text-sm",
+                      status === "pending" || status === "skipped"
+                        ? "text-slate-500"
+                        : "text-slate-200",
+                    )}
+                  >
+                    {step.label}
+                  </span>
+                  <span className="text-[11px] uppercase tracking-wide text-slate-600">
+                    {STEP_KIND_LABELS[step.kind]}
+                  </span>
+                </span>
+                {summary && (
+                  <span
+                    className={cn(
+                      "mt-0.5 block break-words text-xs",
+                      status === "failed" ? "text-red-300/80" : "text-slate-500",
+                    )}
+                  >
+                    {summary}
+                  </span>
+                )}
+              </span>
+
+              {ms != null && (
+                <span className="shrink-0 text-xs tabular-nums text-slate-500">
+                  {formatElapsed(ms)}
+                </span>
+              )}
+              <span
+                className={cn(
+                  "shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase",
+                  STEP_STYLES[status],
+                )}
+              >
+                {status}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+      <p className="mt-1.5 text-[11px] text-slate-600">
+        {focused == null
+          ? "Select a step to narrow the timeline to it."
+          : `Timeline is showing step ${focused} only.`}
+      </p>
+    </section>
+  );
+}
+
+/**
  * What the job has said so far, oldest first.
  *
  * Live events when there are any, and the stored log otherwise: a job from a
@@ -216,14 +361,35 @@ function Timeline({
   lines,
   stored,
   follow,
+  focused,
+  onClearFocus,
 }: {
   lines: ProgressEvent[];
   stored: string[];
   follow: boolean;
+  focused: number | null;
+  onClearFocus: () => void;
 }) {
   const box = useRef<HTMLDivElement>(null);
-  const live = lines;
-  const count = live.length > 0 ? live.length : stored.length;
+
+  // Which source to read is decided before filtering, not after. Narrowing to
+  // a step the live stream has not reached yet would otherwise fall through to
+  // the stored log and swap the whole panel to a different source mid-run.
+  const useLive = lines.length > 0;
+  const live = useLive
+    ? focused == null
+      ? lines
+      : lines.filter((e) => e.step === focused)
+    : [];
+  // The stored log is matched on the `[2/5]` marker `to_log_line` writes: a job
+  // from a previous session has no structured events left, only that text.
+  const shown = useLive
+    ? []
+    : focused == null
+      ? stored
+      : stored.filter((line) => line.includes(`[${focused}/`));
+  const count = live.length + shown.length;
+  const emptyBecauseFiltered = focused != null && (useLive || stored.length > 0);
 
   // Pinned to the newest line while the job runs. Scrolls the panel itself
   // rather than the page: `scrollIntoView` here would drag the whole window
@@ -236,8 +402,17 @@ function Timeline({
 
   return (
     <section>
-      <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
+      <h2 className="mb-2 flex items-baseline gap-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
         Timeline
+        {focused != null && (
+          <button
+            type="button"
+            onClick={onClearFocus}
+            className="rounded border border-slate-700 px-1.5 py-0.5 text-[10px] font-medium normal-case tracking-normal text-slate-400 transition hover:bg-slate-800"
+          >
+            step {focused} only — show all
+          </button>
+        )}
       </h2>
       <div
         ref={box}
@@ -245,9 +420,11 @@ function Timeline({
       >
         {count === 0 ? (
           <p className="text-slate-600">
-            {follow
-              ? "Nothing yet — the first line arrives as soon as the job starts work."
-              : "This job left no log."}
+            {emptyBecauseFiltered
+              ? `Step ${focused} has said nothing yet.`
+              : follow
+                ? "Nothing yet — the first line arrives as soon as the job starts work."
+                : "This job left no log."}
           </p>
         ) : live.length > 0 ? (
           live.map((e, i) => (
@@ -255,6 +432,13 @@ function Timeline({
               <span className="shrink-0 text-slate-600">
                 {new Date(e.ts).toLocaleTimeString()}
               </span>
+              {/* Only while showing every step — inside a filtered view the
+                  number is the same on every line. */}
+              {focused == null && e.step != null && (
+                <span className="w-6 shrink-0 text-right text-slate-700">
+                  {e.step}
+                </span>
+              )}
               <span
                 className={cn(
                   "w-12 shrink-0",
@@ -274,7 +458,7 @@ function Timeline({
             </div>
           ))
         ) : (
-          stored.map((line, i) => (
+          shown.map((line, i) => (
             <div
               key={i}
               className={cn(

@@ -337,3 +337,61 @@ async fn the_unique_name_migration_leaves_a_clean_database_alone() {
         .get("name");
     assert_eq!(name, "nightly", "a name with no collision must not gain a suffix");
 }
+
+#[tokio::test]
+async fn the_job_steps_migration_leaves_existing_history_untouched() {
+    // 0010 only adds a table, but it arrives at a database whose whole value is
+    // its job history. A CREATE that collided with an existing name, or SQL
+    // that failed halfway, would take the history with it.
+    let (mut conn, _dir) = conn().await;
+    apply_range(&mut conn, None, "0009").await;
+
+    sqlx::query(
+        "INSERT INTO profiles (id, name, engine, environment, db_config, tool_overrides, \
+         created_at, updated_at) VALUES ('p1','prod','mysql','prod','{}','{}','t','t')",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO job_history (id, kind, source_profile_id, started_at, outcome, \
+         options_json, log) VALUES ('j1','sync','p1','2026-07-01T03:00:00Z','success','{}','ran')",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    apply_range(&mut conn, Some("0009"), "0010").await;
+
+    let outcome: String = sqlx::query("SELECT outcome FROM job_history WHERE id = 'j1'")
+        .fetch_one(&mut conn)
+        .await
+        .expect("the history row must survive")
+        .get("outcome");
+    assert_eq!(outcome, "success");
+}
+
+#[tokio::test]
+async fn a_step_outlives_a_job_that_was_never_recorded() {
+    // No foreign key, on purpose: the engine ops are callable without a history
+    // row and every integration test drives them that way. If this starts
+    // failing, a diagnostic write has become able to abort a real restore.
+    let (mut conn, _dir) = conn().await;
+    apply_range(&mut conn, None, "0010").await;
+
+    sqlx::query(
+        "INSERT INTO job_steps (job_id, idx, kind, label) \
+         VALUES ('no-such-job',1,'backup','Back up shop')",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("a step for an unrecorded job is legal");
+
+    let detail: String =
+        sqlx::query("SELECT detail_json FROM job_steps WHERE job_id = 'no-such-job'")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap()
+            .get("detail_json");
+    assert_eq!(detail, "{}", "a planned step starts with nothing to say");
+}

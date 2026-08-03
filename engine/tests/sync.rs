@@ -11,7 +11,7 @@ use db_sync_engine::backup::{
     BackupRequest, CommonBackupOptions, EngineBackupOptions, MysqlBackupOptions, TableSelection,
 };
 use db_sync_engine::sshconn::{SshAuth, SshConfig, SshConnectionCreate, SshEndpoint};
-use db_sync_engine::job::JobContext;
+use db_sync_engine::job::{JobContext, JobOutcome};
 use db_sync_engine::mask::{MaskRule, MaskTransform};
 use db_sync_engine::ops::{self, SyncRequest};
 use db_sync_engine::tools::ToolSource;
@@ -23,6 +23,7 @@ use db_sync_engine::restore::{EngineRestoreOptions, MysqlRestoreOptions, TargetN
 use db_sync_engine::retention::RetentionPolicy;
 use db_sync_engine::secrets::{self, SecretKind};
 use db_sync_engine::ssh::{AcceptAllHostKeys, RusshTunnelProvider, SshCredentials, TunnelProvider};
+use db_sync_engine::step::{JobStepKind, JobStepOutcome};
 use db_sync_engine::store::Store;
 use db_sync_engine::types::{Engine, EnvironmentTag};
 use tokio::net::TcpStream;
@@ -106,8 +107,24 @@ fn ssh_config() -> SshConfig {
     }
 }
 
-/// Save the fixture SSH server as a reusable connection.
+/// Save the fixture SSH server as a reusable connection, or reuse it.
+///
+/// Reusable is the point: every test here builds a source *and* a destination
+/// on one store, and both tunnel through the same fixture server — which is
+/// what a saved connection is for. Creating it unconditionally hit the unique
+/// name index the moment the second profile was made, so the whole suite failed
+/// at setup before reaching a single assertion.
 async fn saved_ssh(store: &Store, name: &str) -> uuid::Uuid {
+    if let Some(existing) = store
+        .list_ssh_connections()
+        .await
+        .expect("list ssh connections")
+        .into_iter()
+        .find(|c| c.name == name)
+    {
+        return existing.id;
+    }
+
     store
         .create_ssh_connection(SshConnectionCreate {
             name: name.into(),
@@ -775,6 +792,175 @@ db_test! {
         assert!(
             databases_starting_with("mkpre").await.is_empty(),
             "and nothing should have been restored"
+        );
+    }
+}
+
+// ── Step recording ──────────────────────────────────────────────────────
+
+db_test! {
+    #[ignore = "requires an unlocked OS keychain"]
+    async fn a_syncs_steps_are_written_down_before_any_of_them_runs() {
+        // The point of planning up front: a run that dies early still leaves a
+        // record of what it was going to do. This one is made to die at the
+        // first step, which is the case a plan written as it went would lose.
+        require_containers!();
+        let (store, _dir) = temp_store().await;
+        let out = tempfile::tempdir().unwrap();
+
+        let source = profile(&store, "st-src", Engine::Mysql, "root", "testroot").await;
+        let dest = profile(&store, "st-dst", Engine::Mysql, "dbsync", "testpass").await;
+        let _cleanup = Cleanup(vec![source.id, dest.id]);
+
+        let ctx = JobContext::new(Uuid::new_v4());
+        ops::record_start(
+            &store,
+            &ctx,
+            db_sync_engine::events::JobKind::Sync,
+            source.id,
+            Some(dest.id),
+            "{}".into(),
+        )
+        .await
+        .unwrap();
+
+        let request = SyncRequest {
+            backup: backup_request(out.path().to_path_buf()),
+            naming: TargetNaming::DropAndRecreate { name: "st_copy".into() },
+            restore: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
+            verify: true,
+            deep_verify: false,
+            masking: Vec::new(),
+            retention: Some(db_sync_engine::retention::RetentionPolicy {
+                keep_last: Some(3),
+                max_age_days: None,
+            }),
+            typed_confirmation: Some("st_copy".into()),
+        };
+
+        // A dump tool that is not there is the cheapest way to fail the first
+        // step; any failure would do. What matters is where the record lands.
+        let err = ops::sync(
+            &source,
+            &dest,
+            &request,
+            &store,
+            &ToolSource::DockerExec {
+                container: "no-such-container".into(),
+                bin_dir: Some("/nowhere".into()),
+            },
+            &ctx,
+        )
+        .await
+        .expect_err("a sync with no usable client tools cannot succeed");
+
+        ctx.emit_error(db_sync_engine::events::JobPhase::Done, err.to_string()).await;
+        ops::record_finish(&store, &ctx, JobOutcome::Failed, None)
+            .await
+            .unwrap();
+
+        let steps = store.list_job_steps(ctx.job_id).await.unwrap();
+        let shape: Vec<_> = steps.iter().map(|s| (s.index, s.kind)).collect();
+        assert_eq!(
+            shape,
+            vec![
+                (1, JobStepKind::Backup),
+                (2, JobStepKind::Offsite),
+                (3, JobStepKind::Restore),
+                (4, JobStepKind::Verify),
+                (5, JobStepKind::Retention),
+            ],
+            "the whole plan is written before the first step runs, and masking \
+             is absent because this request has no rules"
+        );
+
+        assert_eq!(steps[0].outcome, Some(JobStepOutcome::Failed));
+        assert!(
+            steps[0].detail.error.is_some(),
+            "the failed step must name the reason: {:?}",
+            steps[0]
+        );
+        for later in &steps[1..] {
+            assert_eq!(
+                later.outcome,
+                Some(JobStepOutcome::Skipped),
+                "step {} never ran and must not read as anything else",
+                later.index
+            );
+            assert!(later.started_at.is_none());
+        }
+
+        // And the same structure reached the durable log, which is all a job
+        // read back after a restart has.
+        let job = store.get_job(ctx.job_id).await.unwrap().expect("history row");
+        assert!(
+            job.log.contains("[1/5]"),
+            "the step marker belongs in the log too:\n{}",
+            job.log
+        );
+    }
+}
+
+db_test! {
+    #[ignore = "requires an unlocked OS keychain"]
+    async fn a_finished_sync_records_what_each_step_produced() {
+        require_containers!();
+        let (store, _dir) = temp_store().await;
+        let out = tempfile::tempdir().unwrap();
+
+        let source = profile(&store, "sd-src", Engine::Mysql, "root", "testroot").await;
+        let dest = profile(&store, "sd-dst", Engine::Mysql, "dbsync", "testpass").await;
+        let _cleanup = Cleanup(vec![source.id, dest.id]);
+
+        let ctx = JobContext::new(Uuid::new_v4());
+        let request = SyncRequest {
+            backup: backup_request(out.path().to_path_buf()),
+            naming: TargetNaming::NewTimestamped { prefix: "sd".into() },
+            restore: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
+            verify: true,
+            deep_verify: false,
+            masking: Vec::new(),
+            retention: None,
+            typed_confirmation: None,
+        };
+
+        let outcome = ops::sync(&source, &dest, &request, &store, &ToolSource::Local, &ctx)
+            .await
+            .expect("sync should succeed");
+
+        let steps = store.list_job_steps(ctx.job_id).await.unwrap();
+        assert_eq!(
+            steps.iter().map(|s| s.kind).collect::<Vec<_>>(),
+            vec![
+                JobStepKind::Backup,
+                JobStepKind::Offsite,
+                JobStepKind::Restore,
+                JobStepKind::Verify,
+            ],
+        );
+        assert!(
+            steps.iter().all(|s| s.outcome == Some(JobStepOutcome::Success)),
+            "every step ran: {steps:#?}"
+        );
+        assert!(
+            steps.iter().all(|s| s.started_at.is_some() && s.finished_at.is_some()),
+            "a finished step must be able to report how long it took"
+        );
+
+        // Each step names what it actually produced, so the page can say more
+        // than "done" beside it.
+        assert_eq!(
+            steps[0].detail.artifact.as_deref(),
+            Some(outcome.artifact_path.as_str())
+        );
+        assert_eq!(
+            steps[2].detail.database.as_deref(),
+            Some(outcome.target_database.as_str())
+        );
+        assert!(
+            steps[3].detail.tables_checked.is_some_and(|n| n > 0),
+            "the verify step records how much it compared: {:?}",
+            steps[3].detail
         );
     }
 }

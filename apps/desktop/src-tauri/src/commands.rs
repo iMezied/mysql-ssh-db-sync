@@ -32,6 +32,7 @@ use db_sync_engine::schedule::{Schedule, ScheduleCreate, ScheduleUpdate};
 use db_sync_engine::secrets::{self, SecretKind};
 use db_sync_engine::sshconn::{SshConnection, SshConnectionCreate, SshConnectionUpdate};
 use db_sync_engine::settings::{self, AppSettings};
+use db_sync_engine::step::JobStep;
 use db_sync_engine::store::StoreError;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
@@ -596,6 +597,16 @@ pub async fn list_jobs(state: State<'_, AppState>, limit: u32) -> CmdResult<Vec<
         .store
         .list_jobs(i64::from(limit.clamp(1, 500)))
         .await?)
+}
+
+/// The steps one job is made of, in order.
+///
+/// Empty for a single-step job — a plain backup or restore has no shape worth
+/// drawing — and for anything that ran before this was recorded.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_job_steps(state: State<'_, AppState>, job_id: Uuid) -> CmdResult<Vec<JobStep>> {
+    Ok(state.store.list_job_steps(job_id).await?)
 }
 
 /// Cancel a running job.

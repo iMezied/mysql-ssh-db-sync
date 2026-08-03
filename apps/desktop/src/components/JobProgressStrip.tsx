@@ -30,6 +30,15 @@ export default function JobProgressStrip({ jobId }: { jobId: string }) {
   return (
     <div className="mt-2 space-y-1.5">
       <div className="flex items-baseline gap-2 text-xs">
+        {/* Only for a job that has more than one step. On a plain backup
+            "Step 1 of 1" is noise dressed up as information. */}
+        {latest.step != null &&
+          latest.step_total != null &&
+          latest.step_total > 1 && (
+            <span className="shrink-0 tabular-nums text-slate-500">
+              Step {latest.step} of {latest.step_total}
+            </span>
+          )}
         <span className="font-medium text-slate-300">
           {PHASE_LABELS[latest.phase]}
         </span>

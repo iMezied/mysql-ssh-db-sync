@@ -57,6 +57,7 @@ fn app_with(store: Store, store_path: PathBuf) -> MockApp {
             db_sync_desktop::commands::update_ssh_connection,
             db_sync_desktop::commands::delete_ssh_connection,
             db_sync_desktop::commands::update_profile,
+            db_sync_desktop::commands::list_job_steps,
         ])
         .build(mock_context(noop_assets()))
         .expect("mock app should build");
@@ -712,4 +713,73 @@ fn a_destination_round_trips_over_ipc_without_its_secret() {
         .unwrap(),
         "deleting the destination must take its credential with it"
     );
+}
+
+#[tokio::test]
+async fn a_jobs_steps_come_back_in_order_with_their_state() {
+    use db_sync_engine::step::{JobStepKind, JobStepOutcome};
+
+    let (store, path, _dir, _plan) = seeded().await;
+    let job = uuid::Uuid::new_v4();
+
+    store
+        .plan_job_steps(
+            job,
+            &[
+                (JobStepKind::Backup, "Back up shop".into()),
+                (JobStepKind::Restore, "Replace shop_copy".into()),
+                (JobStepKind::Verify, "Compare against the source".into()),
+            ],
+        )
+        .await
+        .unwrap();
+    store.begin_job_step(job, 1).await.unwrap();
+    store
+        .finish_job_step(job, 1, JobStepOutcome::Success, &Default::default())
+        .await
+        .unwrap();
+    store.begin_job_step(job, 2).await.unwrap();
+    store
+        .close_open_steps(job, JobStepOutcome::Failed, Some("shop_copy is in use"))
+        .await
+        .unwrap();
+
+    let app = app_with(store, path);
+    let steps = invoke(
+        &app,
+        "list_job_steps",
+        // camelCase on the wire: the layer Tauri generates is what this suite
+        // exists to exercise, and `job_id` here would silently arrive as None.
+        serde_json::json!({ "jobId": job.to_string() }),
+    );
+
+    let steps = steps.as_array().expect("an array of steps");
+    assert_eq!(steps.len(), 3);
+    assert_eq!(steps[0]["index"], 1, "ordered by index, not by insertion");
+    assert_eq!(steps[0]["outcome"], "success");
+    assert_eq!(steps[1]["outcome"], "failed");
+    assert_eq!(
+        steps[1]["detail"]["error"], "shop_copy is in use",
+        "the failed step names the reason: {}",
+        steps[1]
+    );
+    assert_eq!(
+        steps[2]["outcome"], "skipped",
+        "a step the run never reached is not a success"
+    );
+}
+
+#[tokio::test]
+async fn a_job_with_no_recorded_steps_returns_an_empty_list() {
+    // Every job from before this existed, and every single-step job. An error
+    // here would make the detail page fail rather than simply show no steps.
+    let (store, path, _dir, _plan) = seeded().await;
+    let app = app_with(store, path);
+
+    let steps = invoke(
+        &app,
+        "list_job_steps",
+        serde_json::json!({ "jobId": uuid::Uuid::new_v4().to_string() }),
+    );
+    assert_eq!(steps.as_array().expect("an array").len(), 0);
 }

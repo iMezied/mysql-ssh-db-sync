@@ -91,6 +91,13 @@ pub struct ProgressEvent {
     #[specta(type = Option<f64>)]
     pub rows: Option<u64>,
     pub percent: Option<f64>,
+    /// Which step of a composite job produced this, 1-based.
+    ///
+    /// Never set at a call site. [`crate::job::JobContext`] stamps it from the
+    /// step it is currently inside, so a single-step job leaves it `None` and
+    /// the fifty places that build an event stay unaware that steps exist.
+    pub step: Option<u32>,
+    pub step_total: Option<u32>,
 }
 
 impl ProgressEvent {
@@ -108,6 +115,8 @@ impl ProgressEvent {
             bytes: None,
             rows: None,
             percent: None,
+            step: None,
+            step_total: None,
         }
     }
 
@@ -156,6 +165,11 @@ impl ProgressEvent {
     }
 
     /// Render as a single log line for the durable job log.
+    ///
+    /// The step marker goes in the text, not only in the structured fields: a
+    /// job read back from a previous session has no event stream left, only
+    /// this. Without it, the log of a six-step run is one undifferentiated
+    /// wall and the step breakdown stops at the app restart.
     pub fn to_log_line(&self) -> String {
         let level = match self.level {
             LogLevel::Debug => "DEBUG",
@@ -163,19 +177,25 @@ impl ProgressEvent {
             LogLevel::Warn => "WARN",
             LogLevel::Error => "ERROR",
         };
+        let step = match (self.step, self.step_total) {
+            (Some(i), Some(n)) => format!(" [{i}/{n}]"),
+            _ => String::new(),
+        };
         match &self.table {
             Some(t) => format!(
-                "{} [{}] {:?} ({}) {}",
+                "{} [{}]{} {:?} ({}) {}",
                 self.ts.to_rfc3339(),
                 level,
+                step,
                 self.phase,
                 t,
                 self.message
             ),
             None => format!(
-                "{} [{}] {:?} {}",
+                "{} [{}]{} {:?} {}",
                 self.ts.to_rfc3339(),
                 level,
+                step,
                 self.phase,
                 self.message
             ),
@@ -230,6 +250,23 @@ mod tests {
             .with_bytes(9_000);
         assert_eq!(e.done, Some(3));
         assert_eq!(e.bytes, Some(9_000));
+    }
+
+    #[test]
+    fn a_step_marker_reaches_the_durable_log() {
+        // The structured fields are lost with the event stream; this is what a
+        // job read back after a restart still has.
+        let mut e = ProgressEvent::new(Uuid::nil(), JobPhase::Restore, "replaying");
+        e.step = Some(2);
+        e.step_total = Some(5);
+        assert!(e.to_log_line().contains("[2/5]"));
+    }
+
+    #[test]
+    fn a_job_with_no_steps_logs_exactly_as_before() {
+        let e = ProgressEvent::new(Uuid::nil(), JobPhase::DumpData, "dumping");
+        let line = e.to_log_line();
+        assert!(line.contains("[INFO] DumpData dumping"), "{line}");
     }
 
     #[test]

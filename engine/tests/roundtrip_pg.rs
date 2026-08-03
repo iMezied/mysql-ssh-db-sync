@@ -101,8 +101,24 @@ fn ssh_config() -> SshConfig {
     }
 }
 
-/// Save the fixture SSH server as a reusable connection.
+/// Save the fixture SSH server as a reusable connection, or reuse it.
+///
+/// Reusable is the point: a test that builds more than one profile on one store
+/// has both of them tunnelling through the same fixture server, which is what a
+/// saved connection is for. Creating it unconditionally hit the unique name
+/// index on the second profile, so the test failed at setup before reaching a
+/// single assertion.
 async fn saved_ssh(store: &Store, name: &str) -> uuid::Uuid {
+    if let Some(existing) = store
+        .list_ssh_connections()
+        .await
+        .expect("list ssh connections")
+        .into_iter()
+        .find(|c| c.name == name)
+    {
+        return existing.id;
+    }
+
     store
         .create_ssh_connection(SshConnectionCreate {
             name: name.into(),

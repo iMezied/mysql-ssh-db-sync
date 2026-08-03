@@ -144,6 +144,7 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             commands::check_artifact,
             commands::delete_artifact,
             commands::list_jobs,
+            commands::list_job_steps,
             commands::cancel_job,
             commands::active_job_ids,
             commands::app_info,

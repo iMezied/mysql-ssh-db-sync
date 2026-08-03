@@ -26,6 +26,7 @@ use crate::restore::{
 use crate::retention::RetentionPolicy;
 use crate::secrets::{self, SecretKind};
 use crate::ssh::TunnelHandle;
+use crate::step::{JobStepDetail, JobStepKind, JobStepOutcome, StepPlan, StepRecorder};
 use crate::store::Store;
 use crate::types::Engine;
 use crate::verify::{self, VerificationReport};
@@ -666,12 +667,31 @@ pub async fn record_start(
 }
 
 /// Record a job's terminal state, including its full log.
+///
+/// Also settles any steps the run left open. Doing it here rather than inside
+/// each operation is what makes step recording free of control flow: a
+/// six-step sync has a dozen `?` early returns, and every one of them ends up
+/// at this function.
 pub async fn record_finish(
     store: &Store,
     ctx: &JobContext,
     outcome: JobOutcome,
     artifact: Option<String>,
 ) -> Result<(), OpError> {
+    if outcome != JobOutcome::Success {
+        let step_outcome = match outcome {
+            JobOutcome::Cancelled => JobStepOutcome::Cancelled,
+            _ => JobStepOutcome::Failed,
+        };
+        // The message the user was already shown, attached to the step it
+        // happened in — so a failed run names the part that failed rather than
+        // leaving the reader to scan the log for the red line.
+        let error = ctx.last_error().await;
+        store
+            .close_open_steps(ctx.job_id, step_outcome, error.as_deref())
+            .await?;
+    }
+
     store
         .finish_job(ctx.job_id, outcome, artifact, ctx.log_snapshot().await)
         .await?;
@@ -762,6 +782,47 @@ impl SyncOutcome {
     }
 }
 
+/// Label a restore step by what it will do to the destination, not by the
+/// strategy's name. "Replace shop" is the sentence somebody needs to read
+/// before it happens; "drop_and_recreate" is not.
+fn describe_target(naming: &TargetNaming) -> String {
+    match naming {
+        TargetNaming::NewTimestamped { prefix } => {
+            format!("Restore into a new {prefix}_… database")
+        }
+        TargetNaming::DropAndRecreate { name } => format!("Replace {name}"),
+        TargetNaming::IntoExisting { name } => format!("Restore into the existing {name}"),
+    }
+}
+
+/// Summarise an off-site push for the step beside it.
+///
+/// A push that failed still finishes its step — the sync continues, and the
+/// outcome is what records that a second copy does not exist. The note has to
+/// say so, or a green step would claim a copy that is not there.
+fn describe_offsite(results: &[PushResult]) -> JobStepDetail {
+    if results.is_empty() {
+        return JobStepDetail::default().note("no off-site destination is set up");
+    }
+
+    let failed = results.iter().filter(|r| !r.succeeded()).count();
+    let detail = JobStepDetail::default().note(format!(
+        "{} of {} destination(s) copied",
+        results.len() - failed,
+        results.len()
+    ));
+    match failed {
+        0 => detail,
+        _ => JobStepDetail {
+            error: results
+                .iter()
+                .find_map(|r| r.error.clone())
+                .or_else(|| Some("an off-site copy failed".into())),
+            ..detail
+        },
+    }
+}
+
 /// Run a full source-to-destination sync.
 ///
 /// Backup, restore, verify, retain — one job, one history record, cancellable
@@ -815,8 +876,34 @@ pub async fn sync(
 
     let coverage = plan_masking(source, request, store, ctx).await?;
 
+    // The shape of this run, written down before any of it happens. Every
+    // conditional below is already decided by here — `coverage` is the last
+    // unknown — so the plan is exact rather than optimistic, and a run that
+    // dies at the restore leaves "masking: skipped" rather than silence.
+    let mut plan = StepPlan::new()
+        .add(
+            JobStepKind::Backup,
+            format!("Back up {}", request.backup.common.database),
+        )
+        .add(JobStepKind::Offsite, "Copy off-site")
+        .add(JobStepKind::Restore, describe_target(&request.naming));
+    if coverage.is_some() {
+        plan = plan.add(JobStepKind::Mask, "Mask the destination");
+    }
+    if request.verify {
+        plan = plan.add(JobStepKind::Verify, "Compare against the source");
+    }
+    if request.retention.is_some() {
+        plan = plan.add(JobStepKind::Retention, "Apply retention");
+    }
+    let steps = StepRecorder::start(store, ctx, plan).await;
+
     // ── Backup ──────────────────────────────────────────────────────────
+    steps.begin(JobStepKind::Backup).await;
     let artifact = backup(source, &request.backup, store, tools, ctx).await?;
+    steps
+        .done(JobStepDetail::artifact(artifact.display().to_string()))
+        .await;
     ctx.bail_if_cancelled().map_err(|_| OpError::Cancelled)?;
 
     // ── Off-site copy ───────────────────────────────────────────────────
@@ -825,7 +912,9 @@ pub async fn sync(
     // that survives losing this machine should not be waiting behind a restore
     // that might fail. A failure here does not stop the sync — it is recorded
     // and surfaces in the outcome.
+    steps.begin(JobStepKind::Offsite).await;
     let offsite = push_offsite(&artifact, store, ctx).await?;
+    steps.done(describe_offsite(&offsite)).await;
 
     // ── Restore ─────────────────────────────────────────────────────────
     let restore_request = RestoreRequest {
@@ -836,7 +925,9 @@ pub async fn sync(
         typed_confirmation: request.typed_confirmation.clone(),
     };
 
+    steps.begin(JobStepKind::Restore).await;
     let target = restore(dest, &restore_request, store, tools, ctx).await?;
+    steps.done(JobStepDetail::database(&target)).await;
     ctx.bail_if_cancelled().map_err(|_| OpError::Cancelled)?;
 
     // ── Mask ────────────────────────────────────────────────────────────
@@ -845,12 +936,24 @@ pub async fn sync(
     // between the restore landing and this finishing, the destination holds
     // real data.
     let masking = match &coverage {
-        Some(coverage) => Some(mask_destination(dest, &target, coverage, store, ctx).await?),
+        Some(coverage) => {
+            steps.begin(JobStepKind::Mask).await;
+            let report = mask_destination(dest, &target, coverage, store, ctx).await?;
+            steps
+                .done(JobStepDetail::default().note(format!(
+                    "{} column{} masked",
+                    report.columns.len(),
+                    if report.columns.len() == 1 { "" } else { "s" }
+                )))
+                .await;
+            Some(report)
+        }
         None => None,
     };
 
     // ── Verify ──────────────────────────────────────────────────────────
     let verification = if request.verify {
+        steps.begin(JobStepKind::Verify).await;
         let with_data: Vec<String> = request
             .backup
             .common
@@ -867,26 +970,42 @@ pub async fn sync(
             .map(|s| s.name.clone())
             .collect();
 
-        Some(
-            verify_restore(
-                VerifyRequest {
-                    source_profile: source,
-                    dest_profile: dest,
-                    source_database: &request.backup.common.database,
-                    dest_database: &target,
-                    tables_with_data: &with_data,
-                    schema_only: &schema_only,
-                    deep: request.deep_verify,
-                    masked_tables: &coverage
-                        .as_ref()
-                        .map(MaskingCoverage::tables)
-                        .unwrap_or_default(),
-                },
-                store,
-                ctx,
-            )
-            .await?,
+        let report = verify_restore(
+            VerifyRequest {
+                source_profile: source,
+                dest_profile: dest,
+                source_database: &request.backup.common.database,
+                dest_database: &target,
+                tables_with_data: &with_data,
+                schema_only: &schema_only,
+                deep: request.deep_verify,
+                masked_tables: &coverage
+                    .as_ref()
+                    .map(MaskingCoverage::tables)
+                    .unwrap_or_default(),
+            },
+            store,
+            ctx,
         )
+        .await?;
+
+        // A verification that ran and failed is a finished step, not a failed
+        // one: the check did its job. The job's own outcome is what carries
+        // the bad news, and the caller decides that below.
+        steps
+            .done(
+                JobStepDetail {
+                    tables_checked: Some(report.tables_checked as u32),
+                    ..JobStepDetail::default()
+                }
+                .note(if report.passed() {
+                    "every table matched".to_string()
+                } else {
+                    format!("{} table(s) did not match", report.failures)
+                }),
+            )
+            .await;
+        Some(report)
     } else {
         None
     };
@@ -901,7 +1020,14 @@ pub async fn sync(
     let copied = offsite.iter().all(PushResult::succeeded);
     let removed = match &request.retention {
         Some(policy) if verified && copied => {
-            apply_retention(&request.backup.common.output_dir, *policy, ctx).await
+            steps.begin(JobStepKind::Retention).await;
+            let removed = apply_retention(&request.backup.common.output_dir, *policy, ctx).await;
+            steps
+                .done(
+                    JobStepDetail::default().note(format!("{} artifact(s) removed", removed.len())),
+                )
+                .await;
+            removed
         }
         Some(_) => {
             let reason = if verified {
@@ -914,6 +1040,12 @@ pub async fn sync(
                 format!("{reason}; keeping every existing backup"),
             )
             .await;
+            steps
+                .skip(
+                    JobStepKind::Retention,
+                    format!("{reason}; every existing backup kept"),
+                )
+                .await;
             Vec::new()
         }
         None => Vec::new(),
@@ -1859,6 +1991,21 @@ pub async fn drill(
     )
     .await;
 
+    // Planned only once the artifact is known, so the restore step can name
+    // the file it is proving rather than saying "restore".
+    let steps = StepRecorder::start(
+        store,
+        ctx,
+        StepPlan::new()
+            .add(
+                JobStepKind::Restore,
+                format!("Restore {} to a scratch database", artifact.filename),
+            )
+            .add(JobStepKind::Verify, "Check it against its manifest")
+            .add(JobStepKind::Cleanup, "Drop the scratch database"),
+    )
+    .await;
+
     // The name is generated here and nowhere else. See DRILL_PREFIX.
     let restore_request = RestoreRequest {
         artifact_path: artifact_path.clone(),
@@ -1872,10 +2019,26 @@ pub async fn drill(
         typed_confirmation: None,
     };
 
+    steps.begin(JobStepKind::Restore).await;
     let scratch = restore(dest, &restore_request, store, tools, ctx).await?;
+    steps.done(JobStepDetail::database(&scratch)).await;
 
+    steps.begin(JobStepKind::Verify).await;
     let report =
         check_against_manifest(dest, &manifest, &scratch, request.deep_verify, store, ctx).await?;
+    steps
+        .done(
+            JobStepDetail {
+                tables_checked: Some(report.tables_checked as u32),
+                ..JobStepDetail::default()
+            }
+            .note(if report.passed() {
+                "the backup restores and holds what it claims".to_string()
+            } else {
+                format!("{} table(s) did not match the manifest", report.failures)
+            }),
+        )
+        .await;
 
     // Clean up unless the drill failed and the user asked to keep the evidence.
     let keep = !report.passed() && request.keep_on_failure;
@@ -1885,8 +2048,16 @@ pub async fn drill(
             format!("drill failed; leaving {scratch} in place for inspection"),
         )
         .await;
+        steps
+            .skip(
+                JobStepKind::Cleanup,
+                format!("{scratch} left in place for inspection"),
+            )
+            .await;
     } else {
+        steps.begin(JobStepKind::Cleanup).await;
         drop_scratch_database(dest, &scratch, store, ctx).await?;
+        steps.done(JobStepDetail::database(&scratch)).await;
     }
 
     Ok(DrillOutcome {

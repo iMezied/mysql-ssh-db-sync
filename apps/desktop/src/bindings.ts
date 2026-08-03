@@ -141,6 +141,13 @@ export const commands = {
 	deleteArtifact: (path: string) => typedError<null, CommandError>(__TAURI_INVOKE("delete_artifact", { path })),
 	listJobs: (limit: number) => typedError<JobRecord[], CommandError>(__TAURI_INVOKE("list_jobs", { limit })),
 	/**
+	 *  The steps one job is made of, in order.
+	 * 
+	 *  Empty for a single-step job — a plain backup or restore has no shape worth
+	 *  drawing — and for anything that ran before this was recorded.
+	 */
+	listJobSteps: (jobId: string) => typedError<JobStep[], CommandError>(__TAURI_INVOKE("list_job_steps", { jobId })),
+	/**
 	 *  Cancel a running job.
 	 * 
 	 *  This signals the job's `CancellationToken`, which propagates into its child
@@ -792,6 +799,66 @@ export type JobRecord = {
 	log: string,
 };
 
+/**  One planned or completed step of a job. */
+export type JobStep = {
+	job_id: string,
+	/**  1-based, because it is read as "step 2 of 5". */
+	index: number,
+	kind: JobStepKind,
+	/**
+	 *  Human label decided when the step was planned, so it can name the
+	 *  actual database or destination rather than repeating the kind.
+	 */
+	label: string,
+	/**  `None` while the step is still pending. */
+	started_at: string | null,
+	finished_at: string | null,
+	/**  `None` means pending if `started_at` is also none, running otherwise. */
+	outcome: JobStepOutcome | null,
+	detail: JobStepDetail,
+};
+
+/**
+ *  What one step produced, in the few terms worth showing next to it.
+ * 
+ *  Every field is optional and defaulted. It is stored in an opaque JSON
+ *  column, so a field added later still reads back against rows written before
+ *  it existed — and a blob that cannot be parsed at all degrades to this
+ *  default rather than making the job page fail to load.
+ * 
+ *  No `skip_serializing_if`, deliberately. It would make the serialised and
+ *  deserialised shapes differ, and specta answers that by exporting two
+ *  TypeScript types with a union over them — so the page consuming this would
+ *  name `JobStep_Serialize`. A few null fields in a tiny blob is the cheaper
+ *  side of that trade.
+ */
+export type JobStepDetail = {
+	/**  Path of the artifact this step wrote or read. */
+	artifact?: string | null,
+	/**  Database this step wrote to. */
+	database?: string | null,
+	tables_checked?: number | null,
+	/**  Why this step failed, as it was reported to the user. */
+	error?: string | null,
+	/**
+	 *  Anything else worth one line — "3 artifacts removed", "2 of 2 copies
+	 *  pushed", "verification found 1 mismatch".
+	 */
+	notes?: string[],
+};
+
+/**  What a step does. A closed set, so the UI can label every one it meets. */
+export type JobStepKind = "backup" | "restore" | "verify" | "mask" | "offsite" | "retention" | "drill" | "cleanup";
+
+/**
+ *  How a step ended.
+ * 
+ *  Distinct from [`crate::job::JobOutcome`] because of `Skipped`, which is the
+ *  whole reason these rows are planned up front: a step the run never reached
+ *  is not a success, not a failure, and not still running.
+ */
+export type JobStepOutcome = "success" | "failed" | "skipped" | "cancelled";
+
 /**
  *  What the UI is allowed to know about the backup key.
  * 
@@ -1113,6 +1180,15 @@ export type ProgressEvent = {
 	bytes: number | null,
 	rows: number | null,
 	percent: number | null,
+	/**
+	 *  Which step of a composite job produced this, 1-based.
+	 * 
+	 *  Never set at a call site. [`crate::job::JobContext`] stamps it from the
+	 *  step it is currently inside, so a single-step job leaves it `None` and
+	 *  the fifty places that build an event stay unaware that steps exist.
+	 */
+	step: number | null,
+	step_total: number | null,
 };
 
 /**

@@ -1041,3 +1041,133 @@ async fn the_audit_limit_is_respected_and_never_zero() {
     // which is a different claim from "you asked for none".
     assert_eq!(store.list_audit(0).await.unwrap().len(), 1);
 }
+
+// ── Job steps ───────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_planned_step_is_pending_until_it_begins() {
+    use db_sync_engine::step::{JobStepDetail, JobStepKind, JobStepOutcome};
+
+    let (store, _dir) = store().await;
+    let job = Uuid::new_v4();
+
+    store
+        .plan_job_steps(
+            job,
+            &[
+                (JobStepKind::Backup, "Back up shop".into()),
+                (JobStepKind::Restore, "Restore into shop_copy".into()),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let steps = store.list_job_steps(job).await.unwrap();
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[0].index, 1, "indices are 1-based and ordered");
+    assert!(steps[0].started_at.is_none());
+    assert!(steps[0].outcome.is_none());
+    assert!(!steps[0].is_running(), "planned is not running");
+
+    store.begin_job_step(job, 1).await.unwrap();
+    let steps = store.list_job_steps(job).await.unwrap();
+    assert!(steps[0].is_running());
+
+    store
+        .finish_job_step(
+            job,
+            1,
+            JobStepOutcome::Success,
+            &JobStepDetail::artifact("/tmp/shop.sql.gz"),
+        )
+        .await
+        .unwrap();
+    let steps = store.list_job_steps(job).await.unwrap();
+    assert_eq!(steps[0].outcome, Some(JobStepOutcome::Success));
+    assert_eq!(
+        steps[0].detail.artifact.as_deref(),
+        Some("/tmp/shop.sql.gz")
+    );
+    assert!(steps[0].finished_at.is_some());
+}
+
+#[tokio::test]
+async fn closing_a_failed_job_blames_the_running_step_and_skips_the_rest() {
+    use db_sync_engine::step::{JobStepKind, JobStepOutcome};
+
+    let (store, _dir) = store().await;
+    let job = Uuid::new_v4();
+
+    store
+        .plan_job_steps(
+            job,
+            &[
+                (JobStepKind::Backup, "Back up shop".into()),
+                (JobStepKind::Restore, "Restore into shop_copy".into()),
+                (JobStepKind::Verify, "Compare row counts".into()),
+            ],
+        )
+        .await
+        .unwrap();
+
+    store.begin_job_step(job, 1).await.unwrap();
+    store
+        .finish_job_step(job, 1, JobStepOutcome::Success, &Default::default())
+        .await
+        .unwrap();
+    store.begin_job_step(job, 2).await.unwrap();
+
+    store
+        .close_open_steps(
+            job,
+            JobStepOutcome::Failed,
+            Some("target database is not empty"),
+        )
+        .await
+        .unwrap();
+
+    let steps = store.list_job_steps(job).await.unwrap();
+    assert_eq!(
+        steps[0].outcome,
+        Some(JobStepOutcome::Success),
+        "already settled"
+    );
+    assert_eq!(steps[1].outcome, Some(JobStepOutcome::Failed));
+    assert_eq!(
+        steps[1].detail.error.as_deref(),
+        Some("target database is not empty"),
+        "the failed step carries the reason"
+    );
+    assert_eq!(steps[2].outcome, Some(JobStepOutcome::Skipped));
+    assert!(
+        steps[2].finished_at.is_none(),
+        "a step that never began has no duration"
+    );
+}
+
+#[tokio::test]
+async fn replanning_a_job_replaces_its_steps_rather_than_interleaving_them() {
+    use db_sync_engine::step::JobStepKind;
+
+    let (store, _dir) = store().await;
+    let job = Uuid::new_v4();
+
+    store
+        .plan_job_steps(job, &[(JobStepKind::Backup, "first plan".into())])
+        .await
+        .unwrap();
+    store
+        .plan_job_steps(
+            job,
+            &[
+                (JobStepKind::Backup, "second plan".into()),
+                (JobStepKind::Verify, "and a check".into()),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let steps = store.list_job_steps(job).await.unwrap();
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[0].label, "second plan");
+}

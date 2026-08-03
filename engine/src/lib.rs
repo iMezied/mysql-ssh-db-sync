@@ -8,7 +8,7 @@
 //!   * [`types`], [`profile`], [`sshconn`] — shared vocabulary.
 //!   * [`store`] — SQLite persistence, shared by GUI and CLI.
 //!   * [`secrets`] — OS keychain. Never crosses into the webview.
-//!   * [`events`], [`job`] — progress reporting and cancellation.
+//!   * [`events`], [`job`], [`step`] — progress reporting and cancellation.
 //!   * [`ssh`], [`db`], [`tools`] — connectivity and external binaries.
 //!   * [`backup`], [`restore`], [`verify`], [`retention`] — operations.
 
@@ -42,6 +42,7 @@ pub mod settings;
 pub mod share;
 pub mod ssh;
 pub mod sshconn;
+pub mod step;
 pub mod store;
 pub mod tools;
 pub mod types;

@@ -52,6 +52,15 @@ pub struct JobRecord {
     pub log: String,
 }
 
+/// Which step of a composite job is currently running.
+///
+/// `index` is 1-based, because it is read by a human as "step 2 of 5".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepMark {
+    pub index: u32,
+    pub total: u32,
+}
+
 /// Handle passed into every long-running operation.
 ///
 /// Cloning is cheap and shares cancellation state, so child tasks observe the
@@ -62,28 +71,56 @@ pub struct JobContext {
     pub event_tx: EventSender,
     cancel: CancellationToken,
     log: Arc<Mutex<String>>,
+    /// Stamped onto every event emitted while it is set. Shared with clones so
+    /// a child task spawned inside a step reports the same step.
+    step: Arc<Mutex<Option<StepMark>>>,
+    /// The most recent error message, kept so the shell can attribute a
+    /// failure to the step it happened in without threading the error back
+    /// through every early return.
+    last_error: Arc<Mutex<Option<String>>>,
 }
 
 impl JobContext {
     pub fn new(job_id: Uuid) -> Self {
         let (tx, _rx) = create_event_channel(EVENT_CHANNEL_CAPACITY);
-        Self {
-            job_id,
-            event_tx: tx,
-            cancel: CancellationToken::new(),
-            log: Arc::new(Mutex::new(String::new())),
-        }
+        Self::build(job_id, tx)
     }
 
     /// Build a context that publishes onto an existing fan-out channel, so the
     /// desktop app can bridge every job through one subscription.
     pub fn with_sender(job_id: Uuid, event_tx: EventSender) -> Self {
+        Self::build(job_id, event_tx)
+    }
+
+    fn build(job_id: Uuid, event_tx: EventSender) -> Self {
         Self {
             job_id,
             event_tx,
             cancel: CancellationToken::new(),
             log: Arc::new(Mutex::new(String::new())),
+            step: Arc::new(Mutex::new(None)),
+            last_error: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Mark every subsequent event as belonging to this step.
+    pub async fn enter_step(&self, mark: StepMark) {
+        *self.step.lock().await = Some(mark);
+    }
+
+    /// Stop attributing events to a step. Work that happens between steps —
+    /// setup, teardown — should not be blamed on the one that just finished.
+    pub async fn leave_step(&self) {
+        *self.step.lock().await = None;
+    }
+
+    pub async fn current_step(&self) -> Option<StepMark> {
+        *self.step.lock().await
+    }
+
+    /// The last message passed to [`Self::emit_error`], if any.
+    pub async fn last_error(&self) -> Option<String> {
+        self.last_error.lock().await.clone()
     }
 
     pub fn subscribe(&self) -> crate::events::EventReceiver {
@@ -121,6 +158,8 @@ impl JobContext {
     }
 
     pub async fn emit_error(&self, phase: JobPhase, message: impl Into<String>) {
+        let message = message.into();
+        *self.last_error.lock().await = Some(message.clone());
         self.emit_event(
             ProgressEvent::new(self.job_id, phase, message).with_level(LogLevel::Error),
         )
@@ -132,7 +171,11 @@ impl JobContext {
     /// Order matters: a dropped broadcast message must not also lose the log
     /// line. A send error means "nobody is listening right now", which is
     /// normal and not a failure.
-    pub async fn emit_event(&self, event: ProgressEvent) {
+    pub async fn emit_event(&self, mut event: ProgressEvent) {
+        if let Some(mark) = *self.step.lock().await {
+            event.step = Some(mark.index);
+            event.step_total = Some(mark.total);
+        }
         {
             let mut log = self.log.lock().await;
             log.push_str(&event.to_log_line());
@@ -238,6 +281,56 @@ mod tests {
         assert!(log.contains("starting"));
         assert!(log.contains("table skipped"));
         assert!(log.contains("WARN"));
+    }
+
+    #[tokio::test]
+    async fn events_are_stamped_with_the_step_they_happened_in() {
+        let ctx = JobContext::new(Uuid::new_v4());
+        let mut rx = ctx.subscribe();
+
+        ctx.emit(JobPhase::Initializing, "before any step").await;
+        ctx.enter_step(StepMark { index: 2, total: 5 }).await;
+        ctx.emit(JobPhase::Restore, "inside").await;
+        ctx.leave_step().await;
+        ctx.emit(JobPhase::Done, "after").await;
+
+        let before = rx.recv().await.unwrap();
+        assert_eq!(before.step, None, "work outside a step belongs to no step");
+
+        let inside = rx.recv().await.unwrap();
+        assert_eq!(inside.step, Some(2));
+        assert_eq!(inside.step_total, Some(5));
+
+        let after = rx.recv().await.unwrap();
+        assert_eq!(after.step, None, "leaving must actually clear the mark");
+    }
+
+    #[tokio::test]
+    async fn a_clone_reports_the_same_step() {
+        // Dumps forward progress from a spawned worker holding a clone. If the
+        // mark did not travel, every per-table line would lose its step.
+        let ctx = JobContext::new(Uuid::new_v4());
+        let child = ctx.clone();
+        ctx.enter_step(StepMark { index: 1, total: 3 }).await;
+        assert_eq!(
+            child.current_step().await,
+            Some(StepMark { index: 1, total: 3 })
+        );
+    }
+
+    #[tokio::test]
+    async fn the_last_error_is_remembered_for_the_step_that_failed() {
+        let ctx = JobContext::new(Uuid::new_v4());
+        assert_eq!(ctx.last_error().await, None);
+        ctx.emit_warn(JobPhase::DumpData, "a warning is not an error")
+            .await;
+        assert_eq!(ctx.last_error().await, None);
+        ctx.emit_error(JobPhase::Restore, "target database is not empty")
+            .await;
+        assert_eq!(
+            ctx.last_error().await.as_deref(),
+            Some("target database is not empty")
+        );
     }
 
     #[tokio::test]

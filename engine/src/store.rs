@@ -24,6 +24,7 @@ use crate::sshconn::{
     ResolvedSsh, SshConfig, SshConnection, SshConnectionCreate, SshConnectionError,
     SshConnectionUpdate, SshEndpoint,
 };
+use crate::step::{JobStep, JobStepDetail, JobStepKind, JobStepOutcome};
 use crate::types::{Engine, EnvironmentTag};
 
 #[derive(Debug, thiserror::Error)]
@@ -339,6 +340,128 @@ impl Store {
         row.map(row_to_job).transpose()
     }
 
+    // ── Job steps ───────────────────────────────────────────────────────
+
+    /// Write down every step a job intends to run, before the first one starts.
+    ///
+    /// Replaces any existing plan for the job, so a re-run of the same id — the
+    /// scheduler's `run_now` on a schedule that is already recorded — does not
+    /// interleave two plans.
+    pub async fn plan_job_steps(
+        &self,
+        job_id: Uuid,
+        steps: &[(JobStepKind, String)],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query("DELETE FROM job_steps WHERE job_id = ?1")
+            .bind(job_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+
+        for (i, (kind, label)) in steps.iter().enumerate() {
+            sqlx::query("INSERT INTO job_steps (job_id, idx, kind, label) VALUES (?1, ?2, ?3, ?4)")
+                .bind(job_id.to_string())
+                .bind(i as i64 + 1)
+                .bind(kind.as_str())
+                .bind(label)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn begin_job_step(&self, job_id: Uuid, index: u32) -> Result<()> {
+        sqlx::query("UPDATE job_steps SET started_at = ?3 WHERE job_id = ?1 AND idx = ?2")
+            .bind(job_id.to_string())
+            .bind(i64::from(index))
+            .bind(Utc::now().to_rfc3339())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn finish_job_step(
+        &self,
+        job_id: Uuid,
+        index: u32,
+        outcome: JobStepOutcome,
+        detail: &JobStepDetail,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE job_steps SET finished_at = ?3, outcome = ?4, detail_json = ?5 \
+             WHERE job_id = ?1 AND idx = ?2",
+        )
+        .bind(job_id.to_string())
+        .bind(i64::from(index))
+        .bind(Utc::now().to_rfc3339())
+        .bind(outcome.as_str())
+        .bind(serde_json::to_string(detail).unwrap_or_else(|_| "{}".into()))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Settle every step a finished job left open.
+    ///
+    /// The one that was running takes `outcome` and the job's error message;
+    /// the ones never reached are `skipped`. Called from
+    /// [`crate::ops::record_finish`] rather than from each operation, so an
+    /// early return through `?` anywhere in a six-step sync is covered without
+    /// the operations having to know these rows exist.
+    pub async fn close_open_steps(
+        &self,
+        job_id: Uuid,
+        outcome: JobStepOutcome,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+
+        // A step that started but never finished is the one that failed.
+        let detail = serde_json::to_string(&JobStepDetail {
+            error: error.map(str::to_owned),
+            ..JobStepDetail::default()
+        })
+        .unwrap_or_else(|_| "{}".into());
+
+        sqlx::query(
+            "UPDATE job_steps SET finished_at = ?2, outcome = ?3, detail_json = ?4 \
+             WHERE job_id = ?1 AND outcome IS NULL AND started_at IS NOT NULL",
+        )
+        .bind(job_id.to_string())
+        .bind(&now)
+        .bind(outcome.as_str())
+        .bind(detail)
+        .execute(&self.pool)
+        .await?;
+
+        // Everything after it never ran. No finished_at: it did not end,
+        // it never began, and a duration of zero would imply otherwise.
+        sqlx::query(
+            "UPDATE job_steps SET outcome = ?2 \
+             WHERE job_id = ?1 AND outcome IS NULL AND started_at IS NULL",
+        )
+        .bind(job_id.to_string())
+        .bind(JobStepOutcome::Skipped.as_str())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn list_job_steps(&self, job_id: Uuid) -> Result<Vec<JobStep>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {JOB_STEP_COLUMNS} FROM job_steps WHERE job_id = ?1 ORDER BY idx"
+        ))
+        .bind(job_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(row_to_job_step).collect()
+    }
+
     // ── Known hosts ─────────────────────────────────────────────────────
 
     pub async fn get_known_host(&self, host_port: &str) -> Result<Option<(String, String)>> {
@@ -467,6 +590,38 @@ fn row_to_profile(row: sqlx::sqlite::SqliteRow) -> Result<ConnectionProfile> {
             .map_err(|e| corrupt("tool_overrides", e))?,
         created_at: parse_ts(&row.get::<String, _>("created_at"), "created_at")?,
         updated_at: parse_ts(&row.get::<String, _>("updated_at"), "updated_at")?,
+    })
+}
+
+/// Every column [`row_to_job_step`] reads, in one place so the query above
+/// cannot drift apart from it.
+const JOB_STEP_COLUMNS: &str =
+    "job_id, idx, kind, label, started_at, finished_at, outcome, detail_json";
+
+fn row_to_job_step(row: sqlx::sqlite::SqliteRow) -> Result<JobStep> {
+    let kind_raw: String = row.get("kind");
+    let started_raw: Option<String> = row.get("started_at");
+    let finished_raw: Option<String> = row.get("finished_at");
+    let outcome_raw: Option<String> = row.get("outcome");
+    let detail_raw: String = row.get("detail_json");
+
+    Ok(JobStep {
+        job_id: parse_uuid(&row.get::<String, _>("job_id"), "job_id")?,
+        index: row.get::<i64, _>("idx") as u32,
+        kind: JobStepKind::parse(&kind_raw)
+            .ok_or_else(|| corrupt("kind", anyhow::anyhow!("unknown step kind {kind_raw:?}")))?,
+        label: row.get("label"),
+        started_at: started_raw
+            .map(|s| parse_ts(&s, "started_at"))
+            .transpose()?,
+        finished_at: finished_raw
+            .map(|s| parse_ts(&s, "finished_at"))
+            .transpose()?,
+        outcome: outcome_raw.as_deref().and_then(JobStepOutcome::parse),
+        // Unlike every other JSON column here, an unreadable blob is not
+        // corruption worth failing on: this is the annotation beside a step,
+        // and losing it must not stop the job page from rendering the step.
+        detail: serde_json::from_str(&detail_raw).unwrap_or_default(),
     })
 }
 
