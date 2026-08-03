@@ -10,6 +10,7 @@ import JobDetailPage from "@/pages/JobDetailPage";
 import BackupPage from "@/pages/BackupPage";
 import RestorePage from "@/pages/RestorePage";
 import SyncPage from "@/pages/SyncPage";
+import PipelinesPage from "@/pages/PipelinesPage";
 import TableSetsPage from "@/pages/TableSetsPage";
 import SchedulesPage from "@/pages/SchedulesPage";
 import MaskingPage from "@/pages/MaskingPage";
@@ -39,7 +40,8 @@ export default function App() {
           <Route path="/masking" element={<MaskingPage />} />
           <Route path="/library" element={<LibraryPage />} />
           <Route path="/offsite" element={<DestinationsPage />} />
-          <Route path="/jobs" element={<JobsPage />} />
+          <Route path="/pipelines" element={<PipelinesPage />} />
+        <Route path="/jobs" element={<JobsPage />} />
           <Route path="/jobs/:jobId" element={<JobDetailPage />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="*" element={<Navigate to="/profiles" replace />} />

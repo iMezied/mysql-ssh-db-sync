@@ -14,6 +14,7 @@ import {
   Server,
   Settings,
   UploadCloud,
+  Workflow,
 } from "lucide-react";
 
 import { cn } from "@/lib/utils";
@@ -29,6 +30,7 @@ const links = [
   { to: "/masking", label: "Masking", icon: EyeOff },
   { to: "/library", label: "Library", icon: Archive },
   { to: "/offsite", label: "Off-site", icon: CloudUpload },
+  { to: "/pipelines", label: "Pipelines", icon: Workflow },
   { to: "/jobs", label: "Jobs", icon: ListChecks },
   { to: "/settings", label: "Settings", icon: Settings },
 ] as const;
