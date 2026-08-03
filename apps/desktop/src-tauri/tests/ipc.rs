@@ -58,6 +58,11 @@ fn app_with(store: Store, store_path: PathBuf) -> MockApp {
             db_sync_desktop::commands::delete_ssh_connection,
             db_sync_desktop::commands::update_profile,
             db_sync_desktop::commands::list_job_steps,
+            db_sync_desktop::commands::list_pipelines,
+            db_sync_desktop::commands::create_pipeline,
+            db_sync_desktop::commands::update_pipeline,
+            db_sync_desktop::commands::arm_pipeline,
+            db_sync_desktop::commands::delete_pipeline,
         ])
         .build(mock_context(noop_assets()))
         .expect("mock app should build");
@@ -782,4 +787,155 @@ async fn a_job_with_no_recorded_steps_returns_an_empty_list() {
         serde_json::json!({ "jobId": uuid::Uuid::new_v4().to_string() }),
     );
     assert_eq!(steps.as_array().expect("an array").len(), 0);
+}
+
+// ── Pipelines ───────────────────────────────────────────────────────────
+
+/// A backup-then-replace chain, serialised from the real types.
+///
+/// Built rather than hand-written: the engine option structs have required
+/// fields, and JSON typed out here would drift from them silently until a test
+/// started failing for a reason that had nothing to do with what it checks.
+fn pipeline_steps(profile: uuid::Uuid, target: &str) -> serde_json::Value {
+    use db_sync_engine::backup::{EngineBackupOptions, MysqlBackupOptions};
+    use db_sync_engine::pipeline::{ArtifactSource, PipelineStep};
+    use db_sync_engine::restore::{EngineRestoreOptions, MysqlRestoreOptions, TargetNaming};
+
+    serde_json::to_value(vec![
+        PipelineStep::Backup {
+            profile_id: profile,
+            database: "app".into(),
+            plan_id: None,
+            selections: Vec::new(),
+            output_dir: None,
+            compress: true,
+            encrypt: false,
+            record_row_counts: false,
+            engine: EngineBackupOptions::Mysql(MysqlBackupOptions::default()),
+        },
+        PipelineStep::Restore {
+            profile_id: profile,
+            source: ArtifactSource::PreviousStep,
+            naming: TargetNaming::DropAndRecreate {
+                name: target.into(),
+            },
+            engine: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
+            verify_checksum: true,
+        },
+    ])
+    .expect("steps serialise")
+}
+
+/// Just the nth step of that chain, for the cases that need an invalid or a
+/// non-destructive pipeline.
+fn only_step(steps: &serde_json::Value, index: usize) -> serde_json::Value {
+    serde_json::json!([steps.as_array().unwrap()[index].clone()])
+}
+
+#[tokio::test]
+async fn a_pipeline_round_trips_over_ipc_and_arming_needs_the_name_typed_back() {
+    let (store, path, _dir, _plan) = seeded().await;
+    let profile = store.list_profiles().await.unwrap()[0].id;
+    let app = app_with(store, path);
+
+    let created = invoke(
+        &app,
+        "create_pipeline",
+        serde_json::json!({
+            "input": { "name": "refresh staging", "steps": pipeline_steps(profile, "staging") }
+        }),
+    );
+    assert_eq!(created["name"], "refresh staging", "got {created}");
+    assert_eq!(
+        created["unattended_ack"],
+        serde_json::Value::Null,
+        "a new pipeline is never authorised to run unattended"
+    );
+    let id = created["id"].as_str().unwrap().to_string();
+
+    // A typo authorises nothing. This is the check the whole arming design
+    // rests on, driven through the boundary the app actually calls.
+    let refused = invoke_err(
+        &app,
+        "arm_pipeline",
+        serde_json::json!({ "id": id, "typed": "stagng" }),
+    );
+    assert_eq!(refused["kind"], "invalid", "got {refused}");
+
+    let armed = invoke(
+        &app,
+        "arm_pipeline",
+        serde_json::json!({ "id": id, "typed": "staging" }),
+    );
+    assert_eq!(armed["unattended_ack"], "staging");
+
+    // Re-pointing the destructive step revokes it: permission was for
+    // `staging`, not for this pipeline.
+    let edited = invoke(
+        &app,
+        "update_pipeline",
+        serde_json::json!({
+            "id": id,
+            "patch": { "name": null, "steps": pipeline_steps(profile, "production") }
+        }),
+    );
+    assert_eq!(
+        edited["unattended_ack"],
+        serde_json::Value::Null,
+        "an edit must not carry authorisation over to a different database"
+    );
+
+    assert_eq!(
+        invoke(&app, "delete_pipeline", serde_json::json!({ "id": id })),
+        true
+    );
+    assert_eq!(
+        invoke(&app, "list_pipelines", serde_json::json!({}))
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+}
+
+#[tokio::test]
+async fn an_unrunnable_pipeline_is_refused_at_the_boundary_with_a_reason() {
+    // A restore consuming an artifact no earlier step produces. The message has
+    // to name the step, because it goes straight in front of the user.
+    let (store, path, _dir, _plan) = seeded().await;
+    let profile = store.list_profiles().await.unwrap()[0].id;
+    let app = app_with(store, path);
+
+    let only_restore = only_step(&pipeline_steps(profile, "staging"), 1);
+
+    let err = invoke_err(
+        &app,
+        "create_pipeline",
+        serde_json::json!({ "input": { "name": "broken", "steps": only_restore } }),
+    );
+    assert_eq!(err["kind"], "invalid", "got {err}");
+    assert!(
+        err["message"].as_str().is_some_and(|m| m.contains("step 1")),
+        "the refusal must say which step: {err}"
+    );
+}
+
+#[tokio::test]
+async fn arming_a_pipeline_that_destroys_nothing_is_refused() {
+    let (store, path, _dir, _plan) = seeded().await;
+    let profile = store.list_profiles().await.unwrap()[0].id;
+    let app = app_with(store, path);
+
+    let only_backup = only_step(&pipeline_steps(profile, "staging"), 0);
+
+    let created = invoke(
+        &app,
+        "create_pipeline",
+        serde_json::json!({ "input": { "name": "just a backup", "steps": only_backup } }),
+    );
+    let err = invoke_err(
+        &app,
+        "arm_pipeline",
+        serde_json::json!({ "id": created["id"], "typed": "app" }),
+    );
+    assert_eq!(err["kind"], "invalid", "got {err}");
 }

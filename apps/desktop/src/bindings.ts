@@ -147,6 +147,43 @@ export const commands = {
 	 *  drawing — and for anything that ran before this was recorded.
 	 */
 	listJobSteps: (jobId: string) => typedError<JobStep[], CommandError>(__TAURI_INVOKE("list_job_steps", { jobId })),
+	listPipelines: () => typedError<Pipeline[], CommandError>(__TAURI_INVOKE("list_pipelines")),
+	getPipeline: (id: string) => typedError<{
+	id: string,
+	name: string,
+	steps: PipelineStep[],
+	/**
+	 *  The destructive signature a human typed back when arming this pipeline
+	 *  for unattended use, or `None` if it has never been armed.
+	 * 
+	 *  Compared against the current signature rather than trusted: see
+	 *  [`Pipeline::is_armed`].
+	 */
+	unattended_ack?: string | null,
+	created_at: string,
+	updated_at: string,
+} | null, CommandError>(__TAURI_INVOKE("get_pipeline", { id })),
+	/**  Create a pipeline. Refused unless the whole chain is runnable. */
+	createPipeline: (input: PipelineCreate) => typedError<Pipeline, CommandError>(__TAURI_INVOKE("create_pipeline", { input })),
+	updatePipeline: (id: string, patch: PipelineUpdate) => typedError<Pipeline, CommandError>(__TAURI_INVOKE("update_pipeline", { id, patch })),
+	/**
+	 *  Authorise a destructive pipeline to run with nobody present, or withdraw it.
+	 * 
+	 *  `typed` is the target names as the user typed them back, newline-separated
+	 *  when there is more than one. The engine compares it against what the
+	 *  pipeline currently drops, so a typo authorises nothing.
+	 */
+	armPipeline: (id: string, typed: string | null) => typedError<Pipeline, CommandError>(__TAURI_INVOKE("arm_pipeline", { id, typed })),
+	deletePipeline: (id: string) => typedError<boolean, CommandError>(__TAURI_INVOKE("delete_pipeline", { id })),
+	/**
+	 *  Start a saved pipeline and return its job id immediately.
+	 * 
+	 *  `typed_confirmations` carries one name per destructive step, in the order
+	 *  those steps appear. They are not checked here: each is handed to the restore
+	 *  it belongs to and validated by the engine, which is the same check a
+	 *  hand-built restore goes through.
+	 */
+	startPipeline: (id: string, typedConfirmations: string[]) => typedError<string, CommandError>(__TAURI_INVOKE("start_pipeline", { id, typedConfirmations })),
 	/**
 	 *  Cancel a running job.
 	 * 
@@ -387,6 +424,15 @@ export type ArtifactFormat =
  *  and no second gzip layer is added.
  */
 "mongo_archive";
+
+/**  Where a restore step gets the artifact it replays. */
+export type ArtifactSource = 
+/**  Whatever the most recent backup step in this pipeline wrote. */
+{ from: "previous_step" } | 
+/**  The newest artifact in a directory, the way a drill picks one. */
+{ from: "newest_in_directory"; dir: string } | 
+/**  One named file. */
+{ from: "path"; path: string };
 
 /**  One recorded change. */
 export type AuditEntry = {
@@ -1067,6 +1113,63 @@ export type PgDumpFormat =
 "directory" | 
 /**  `-Fp`. Plain SQL; no selective restore. */
 "plain";
+
+/**  A saved chain of actions. */
+export type Pipeline = {
+	id: string,
+	name: string,
+	steps: PipelineStep[],
+	/**
+	 *  The destructive signature a human typed back when arming this pipeline
+	 *  for unattended use, or `None` if it has never been armed.
+	 * 
+	 *  Compared against the current signature rather than trusted: see
+	 *  [`Pipeline::is_armed`].
+	 */
+	unattended_ack?: string | null,
+	created_at: string,
+	updated_at: string,
+};
+
+export type PipelineCreate = {
+	name: string,
+	steps: PipelineStep[],
+};
+
+/**
+ *  One action in a pipeline.
+ * 
+ *  Internally tagged, so a step gains a field without invalidating the stored
+ *  JSON of every pipeline written before it. Every added field is
+ *  `#[serde(default)]` for the same reason, and because an unattended run must
+ *  not acquire a new cost on upgrade.
+ */
+export type PipelineStep = { kind: "backup"; profile_id: string; database: string; 
+/**
+ *  A saved table set. When set, its selections are used and
+ *  `selections` is ignored — the set is the thing being maintained.
+ */
+plan_id?: string | null; selections?: TableSelection[]; 
+/**  Defaults to the app's backup directory when absent. */
+output_dir?: string | null; compress?: boolean; encrypt?: boolean; record_row_counts?: boolean; engine: EngineBackupOptions } | { kind: "restore"; profile_id: string; source?: ArtifactSource; naming: TargetNaming; engine: EngineRestoreOptions; verify_checksum?: boolean } | 
+/**  Compare the restored database against the source it came from. */
+{ kind: "verify"; deep?: boolean } | 
+/**  Mask columns on the database the previous restore wrote. */
+{ kind: "mask"; rules?: MaskRule[] } | 
+/**  Copy the artifact to every enabled off-site destination. */
+{ kind: "push_offsite" } | 
+/**  Prune the backup directory the artifact was written to. */
+{ kind: "retention"; policy: RetentionPolicy } | 
+/**
+ *  Prove the newest artifact restores, into a scratch database that is
+ *  dropped afterwards.
+ */
+{ kind: "drill"; profile_id: string; artifact_dir?: string | null; deep?: boolean; keep_on_failure?: boolean };
+
+export type PipelineUpdate = {
+	name?: string | null,
+	steps?: PipelineStep[] | null,
+};
 
 export type PostgresBackupOptions = {
 	format: PgDumpFormat,

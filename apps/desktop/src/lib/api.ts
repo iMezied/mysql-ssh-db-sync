@@ -81,6 +81,19 @@ export const api = {
     unwrap(commands.importTablesConf(contents, available)),
   listJobs: (limit: number) => unwrap(commands.listJobs(limit)),
   listJobSteps: (jobId: string) => unwrap(commands.listJobSteps(jobId)),
+
+  listPipelines: () => unwrap(commands.listPipelines()),
+  getPipeline: (id: string) => unwrap(commands.getPipeline(id)),
+  createPipeline: (...args: Parameters<typeof commands.createPipeline>) =>
+    unwrap(commands.createPipeline(...args)),
+  updatePipeline: (...args: Parameters<typeof commands.updatePipeline>) =>
+    unwrap(commands.updatePipeline(...args)),
+  /** `typed` is the target names typed back, or null to withdraw. */
+  armPipeline: (id: string, typed: string | null) =>
+    unwrap(commands.armPipeline(id, typed)),
+  deletePipeline: (id: string) => unwrap(commands.deletePipeline(id)),
+  startPipeline: (id: string, typedConfirmations: string[]) =>
+    unwrap(commands.startPipeline(id, typedConfirmations)),
   listAudit: (limit: number) => unwrap(commands.listAudit(limit)),
   cancelJob: (id: string) => unwrap(commands.cancelJob(id)),
   activeJobIds: () => unwrap(commands.activeJobIds()),

@@ -189,6 +189,13 @@ enum Command {
     /// It does not touch the backup artifact, which still holds the real data.
     #[command(subcommand)]
     Mask(MaskCommand),
+    /// Run a saved chain of actions.
+    ///
+    /// Pipelines are built in the app, not here — the option surface is large,
+    /// and a second construction path is a second place for the destructive
+    /// target check to be forgotten. The same reasoning as schedules.
+    #[command(subcommand)]
+    Pipeline(PipelineCommand),
     /// Manage the backup encryption key.
     #[command(subcommand)]
     Key(KeyCommand),
@@ -362,6 +369,35 @@ enum TransformArg {
     Null,
     /// Every row set to `--value`, NULLs included.
     Constant,
+}
+
+#[derive(Subcommand)]
+enum PipelineCommand {
+    /// List saved pipelines.
+    List,
+    /// Show what one pipeline will do, step by step.
+    Show {
+        /// Id, or a unique prefix of the pipeline's name.
+        pipeline: String,
+    },
+    /// Run a pipeline now.
+    ///
+    /// Exits non-zero when any step failed or a check did not pass, so cron
+    /// and CI notice a chain that has quietly stopped working.
+    Run {
+        /// Id, or a unique prefix of the pipeline's name.
+        pipeline: String,
+        /// The name of a database this pipeline replaces, typed back.
+        ///
+        /// Repeat once per destructive step, in the order they appear.
+        /// Checked by the engine, not here, so the app and the command line
+        /// enforce it identically.
+        #[arg(long = "confirm")]
+        confirm: Vec<String>,
+        /// Where a backup step writes when it names no directory of its own.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -619,6 +655,12 @@ async fn main() -> Result<()> {
         } => {
             let store = open_store(&store_path).await?;
             let result = run_drill(&store, &profile, dir, deep, keep_on_failure, cli.json).await;
+            store.close().await;
+            result?;
+        }
+        Command::Pipeline(cmd) => {
+            let store = open_store(&store_path).await?;
+            let result = run_pipeline_command(&store, cmd, cli.json).await;
             store.close().await;
             result?;
         }
@@ -1354,6 +1396,232 @@ async fn open_store(path: &std::path::Path) -> Result<Store> {
 }
 
 /// Find a profile by id or by a unique prefix of its name.
+// ── Pipelines ───────────────────────────────────────────────────────────
+
+async fn run_pipeline_command(store: &Store, cmd: PipelineCommand, json: bool) -> Result<()> {
+    match cmd {
+        PipelineCommand::List => {
+            let pipelines = store.list_pipelines().await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&pipelines)?);
+                return Ok(());
+            }
+            if pipelines.is_empty() {
+                eprintln!("no pipelines yet; build one in the app");
+                return Ok(());
+            }
+            for p in &pipelines {
+                let mut notes = vec![format!("{} step(s)", p.steps.len())];
+                if let Some(targets) = p.destructive_signature() {
+                    notes.push(format!("replaces {}", targets.replace('\n', ", ")));
+                }
+                if p.is_armed() {
+                    notes.push("armed for unattended runs".into());
+                }
+                println!("{}  {}", p.name, notes.join(" · "));
+            }
+            Ok(())
+        }
+
+        PipelineCommand::Show { pipeline } => {
+            let pipeline = resolve_pipeline(store, &pipeline).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&pipeline)?);
+                return Ok(());
+            }
+
+            let profiles = store.list_profiles().await?;
+            println!("{}", pipeline.name);
+            for (i, step) in pipeline.steps.iter().enumerate() {
+                println!("  {}. {}", i + 1, step.label(&profiles));
+            }
+            // Say what a run would need before somebody discovers it mid-cron.
+            if let Some(targets) = pipeline.destructive_signature() {
+                println!();
+                println!(
+                    "replaces {} — needs --confirm, or arming in the app to run unattended",
+                    targets.replace('\n', ", ")
+                );
+            }
+            if let Err(e) = pipeline.validate_against(&profiles) {
+                println!();
+                println!("will not run: {e}");
+            }
+            Ok(())
+        }
+
+        PipelineCommand::Run {
+            pipeline,
+            confirm,
+            dir,
+        } => run_pipeline_now(store, &pipeline, confirm, dir, json).await,
+    }
+}
+
+async fn run_pipeline_now(
+    store: &Store,
+    needle: &str,
+    confirm: Vec<String>,
+    dir: Option<PathBuf>,
+    json: bool,
+) -> Result<()> {
+    let pipeline = resolve_pipeline(store, needle).await?;
+
+    // A destructive pipeline run headlessly with nothing typed and no standing
+    // authorisation is refused here rather than by the engine, so the message
+    // can name the two ways out. The engine still checks independently.
+    if confirm.is_empty()
+        && let Some(targets) = pipeline.destructive_signature()
+    {
+        match pipeline.unattended_ack.as_deref() {
+            Some(ack) if ack == targets => {}
+            _ => bail!(
+                "{:?} replaces {}. Pass --confirm with each name, or arm it in \
+                 the app to let it run unattended",
+                pipeline.name,
+                targets.replace('\n', ", ")
+            ),
+        }
+    }
+
+    // An armed pipeline supplies its own confirmations: the names in the
+    // acknowledgment are exactly the ones a human already typed back.
+    let typed_confirmations = match confirm.is_empty() {
+        false => confirm,
+        true => pipeline
+            .unattended_ack
+            .as_deref()
+            .map(|ack| ack.lines().map(str::to_string).collect())
+            .unwrap_or_default(),
+    };
+
+    let default_output_dir = match dir {
+        Some(d) => d,
+        None => db_sync_engine::paths::app_data_dir()
+            .context("could not determine the backup directory")?
+            .join("backups"),
+    };
+
+    let (event_tx, rx) = create_event_channel(EVENT_CHANNEL_CAPACITY);
+    if json {
+        tokio::spawn(stream_channel_as_json(rx));
+    } else {
+        tokio::spawn(stream_channel_as_text(rx));
+    }
+
+    let ctx = JobContext::with_sender(Uuid::new_v4(), event_tx);
+    let source = pipeline
+        .steps
+        .iter()
+        .find_map(|s| s.profile_id())
+        .context("this pipeline touches no connection")?;
+    let dest = pipeline.steps.iter().rev().find_map(|s| s.profile_id());
+
+    db_sync_engine::ops::record_start(
+        store,
+        &ctx,
+        db_sync_engine::events::JobKind::Sync,
+        source,
+        dest,
+        serde_json::json!({ "pipeline": pipeline.name, "steps": pipeline.steps.len() })
+            .to_string(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let outcome = db_sync_engine::ops::run_pipeline(
+        &pipeline,
+        &db_sync_engine::ops::PipelineRunRequest {
+            typed_confirmations,
+            default_output_dir,
+        },
+        store,
+        &store.tool_source().await,
+        &ctx,
+    )
+    .await;
+
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            ctx.emit_error(db_sync_engine::events::JobPhase::Done, e.to_string())
+                .await;
+            let _ = db_sync_engine::ops::record_finish(
+                store,
+                &ctx,
+                db_sync_engine::job::JobOutcome::Failed,
+                None,
+            )
+            .await;
+            bail!("{e}");
+        }
+    };
+
+    let succeeded = outcome.fully_succeeded();
+    let _ = db_sync_engine::ops::record_finish(
+        store,
+        &ctx,
+        match succeeded {
+            true => db_sync_engine::job::JobOutcome::Success,
+            false => db_sync_engine::job::JobOutcome::Failed,
+        },
+        outcome.artifacts.last().cloned(),
+    )
+    .await;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&outcome)?);
+    } else {
+        eprintln!();
+        for step in store.list_job_steps(ctx.job_id).await? {
+            eprintln!(
+                "  {}. {} — {}",
+                step.index,
+                step.label,
+                step.outcome
+                    .map(|o| o.as_str())
+                    .unwrap_or("did not finish")
+            );
+        }
+    }
+
+    // The exit code is the whole point of running this from cron.
+    if !succeeded {
+        bail!("the pipeline ran but not every step did what it claimed");
+    }
+    Ok(())
+}
+
+/// Resolve a pipeline by id or by a unique prefix of its name.
+///
+/// The same shape as [`resolve_profile`]: an ambiguous prefix is refused rather
+/// than guessed, because guessing here could start a chain that drops a
+/// database.
+async fn resolve_pipeline(
+    store: &Store,
+    needle: &str,
+) -> Result<db_sync_engine::pipeline::Pipeline> {
+    if let Ok(id) = Uuid::parse_str(needle) {
+        return Ok(store.require_pipeline(id).await?);
+    }
+
+    let all = store.list_pipelines().await?;
+    let lowered = needle.to_lowercase();
+    let matches: Vec<_> = all
+        .iter()
+        .filter(|p| p.name.to_lowercase().starts_with(&lowered))
+        .collect();
+
+    match matches.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => bail!("no pipeline matches {needle:?}; `dbsync pipeline list` shows them"),
+        many => {
+            let names: Vec<&str> = many.iter().map(|p| p.name.as_str()).collect();
+            bail!("{needle:?} matches several pipelines: {}", names.join(", "))
+        }
+    }
+}
+
 async fn resolve_profile(store: &Store, needle: &str) -> Result<db_sync_engine::ConnectionProfile> {
     if let Ok(id) = Uuid::parse_str(needle) {
         return Ok(store.require_profile(id).await?);

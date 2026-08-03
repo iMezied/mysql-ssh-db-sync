@@ -25,6 +25,7 @@ use db_sync_engine::tools::{DockerContainer, ToolSource, ToolStatus};
 use db_sync_engine::library::{self, Artifact, IntegrityCheck};
 use db_sync_engine::mask::MaskRule;
 use db_sync_engine::ops::{self, SyncRequest};
+use db_sync_engine::pipeline::{Pipeline, PipelineCreate, PipelineUpdate};
 use db_sync_engine::plan::{self, SyncPlan, SyncPlanCreate};
 use db_sync_engine::profile::{ConnectionProfile, ProfileCreate, ProfileUpdate};
 use db_sync_engine::restore::RestoreRequest;
@@ -609,6 +610,245 @@ pub async fn list_jobs(state: State<'_, AppState>, limit: u32) -> CmdResult<Vec<
 #[specta::specta]
 pub async fn list_job_steps(state: State<'_, AppState>, job_id: Uuid) -> CmdResult<Vec<JobStep>> {
     Ok(state.store.list_job_steps(job_id).await?)
+}
+
+// ── Pipelines ───────────────────────────────────────────────────────────
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_pipelines(state: State<'_, AppState>) -> CmdResult<Vec<Pipeline>> {
+    Ok(state.store.list_pipelines().await?)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn get_pipeline(state: State<'_, AppState>, id: Uuid) -> CmdResult<Option<Pipeline>> {
+    Ok(state.store.get_pipeline(id).await?)
+}
+
+/// Create a pipeline. Refused unless the whole chain is runnable.
+#[tauri::command]
+#[specta::specta]
+pub async fn create_pipeline(
+    state: State<'_, AppState>,
+    input: PipelineCreate,
+) -> CmdResult<Pipeline> {
+    let pipeline = state.store.create_pipeline(input).await?;
+    state
+        .store
+        .audit(
+            AuditAction::PipelineCreated,
+            &pipeline.name,
+            describe_pipeline(&pipeline),
+        )
+        .await;
+    Ok(pipeline)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn update_pipeline(
+    state: State<'_, AppState>,
+    id: Uuid,
+    patch: PipelineUpdate,
+) -> CmdResult<Pipeline> {
+    let before = state.store.get_pipeline(id).await?;
+    let after = state.store.update_pipeline(id, patch).await?;
+
+    // Worth recording specifically: an edit that revokes an unattended
+    // authorisation is the change somebody will be looking for later.
+    let disarmed = before.is_some_and(|b| b.unattended_ack.is_some())
+        && after.unattended_ack.is_none();
+    state
+        .store
+        .audit(
+            AuditAction::PipelineUpdated,
+            &after.name,
+            match disarmed {
+                true => format!(
+                    "{}; no longer authorised to run unattended",
+                    describe_pipeline(&after)
+                ),
+                false => describe_pipeline(&after),
+            },
+        )
+        .await;
+    Ok(after)
+}
+
+/// Authorise a destructive pipeline to run with nobody present, or withdraw it.
+///
+/// `typed` is the target names as the user typed them back, newline-separated
+/// when there is more than one. The engine compares it against what the
+/// pipeline currently drops, so a typo authorises nothing.
+#[tauri::command]
+#[specta::specta]
+pub async fn arm_pipeline(
+    state: State<'_, AppState>,
+    id: Uuid,
+    typed: Option<String>,
+) -> CmdResult<Pipeline> {
+    let pipeline = state.store.arm_pipeline(id, typed.as_deref()).await?;
+    state
+        .store
+        .audit(
+            AuditAction::PipelineArmed,
+            &pipeline.name,
+            match &pipeline.unattended_ack {
+                Some(targets) => format!("may now drop {} unattended", targets.replace('\n', ", ")),
+                None => "unattended authorisation withdrawn".to_string(),
+            },
+        )
+        .await;
+    Ok(pipeline)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_pipeline(state: State<'_, AppState>, id: Uuid) -> CmdResult<bool> {
+    let pipeline = state.store.get_pipeline(id).await?;
+    let deleted = state.store.delete_pipeline(id).await?;
+    if let (true, Some(pipeline)) = (deleted, pipeline) {
+        state
+            .store
+            .audit(
+                AuditAction::PipelineDeleted,
+                &pipeline.name,
+                describe_pipeline(&pipeline),
+            )
+            .await;
+    }
+    Ok(deleted)
+}
+
+/// Start a saved pipeline and return its job id immediately.
+///
+/// `typed_confirmations` carries one name per destructive step, in the order
+/// those steps appear. They are not checked here: each is handed to the restore
+/// it belongs to and validated by the engine, which is the same check a
+/// hand-built restore goes through.
+#[tauri::command]
+#[specta::specta]
+pub async fn start_pipeline(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: Uuid,
+    typed_confirmations: Vec<String>,
+) -> CmdResult<Uuid> {
+    let pipeline = state.store.require_pipeline(id).await?;
+    let profiles = state.store.list_profiles().await?;
+    // Fail before a job appears in history, the way start_backup does.
+    pipeline
+        .validate_against(&profiles)
+        .map_err(|e| CommandError::new("invalid", e.to_string()))?;
+
+    // History records what a *connection* did, so the job is attributed to the
+    // first step that names one. A pipeline of pure retention names none.
+    let source = pipeline
+        .steps
+        .iter()
+        .find_map(|s| s.profile_id())
+        .ok_or_else(|| {
+            CommandError::new("invalid", "this pipeline touches no connection")
+        })?;
+    let dest = pipeline
+        .steps
+        .iter()
+        .rev()
+        .find_map(|s| s.profile_id());
+
+    let request = ops::PipelineRunRequest {
+        typed_confirmations,
+        default_output_dir: default_backup_dir(),
+    };
+
+    let job_id = Uuid::new_v4();
+    let ctx = JobContext::with_sender(job_id, state.event_tx.clone());
+    state.jobs.register(&ctx).await;
+
+    let options_json = serde_json::to_string(&PipelineJobOptions {
+        pipeline: pipeline.name.clone(),
+        steps: pipeline.steps.len(),
+    })
+    .unwrap_or_else(|_| "{}".into());
+    ops::record_start(
+        &state.store,
+        &ctx,
+        JobKind::Sync,
+        source,
+        dest,
+        options_json,
+    )
+    .await
+    .map_err(|e| CommandError::new("storage", e.to_string()))?;
+
+    let store = state.store.clone();
+    let jobs = state.jobs.clone();
+
+    tauri::async_runtime::spawn(async move {
+        let tools = store.tool_source().await;
+        let result = ops::run_pipeline(&pipeline, &request, &store, &tools, &ctx).await;
+
+        let (outcome, artifact) = match &result {
+            // A chain that restored but failed its own verification is not a
+            // success: the question asked of the history is "did it work".
+            Ok(done) if done.fully_succeeded() => {
+                (JobOutcome::Success, done.artifacts.last().cloned())
+            }
+            Ok(done) => {
+                ctx.emit_error(
+                    JobPhase::Done,
+                    "the pipeline ran but not every step did what it claimed",
+                )
+                .await;
+                (JobOutcome::Failed, done.artifacts.last().cloned())
+            }
+            Err(e) => {
+                ctx.emit_error(JobPhase::Done, e.to_string()).await;
+                let outcome = if ctx.is_cancelled() {
+                    JobOutcome::Cancelled
+                } else {
+                    JobOutcome::Failed
+                };
+                (outcome, None)
+            }
+        };
+
+        let _ = ops::record_finish(&store, &ctx, outcome, artifact).await;
+        jobs.unregister(job_id).await;
+
+        let _ = JobFinished {
+            job_id: job_id.to_string(),
+            outcome: outcome.as_str().to_string(),
+        }
+        .emit(&app);
+    });
+
+    Ok(job_id)
+}
+
+/// What the job history records about a pipeline run.
+///
+/// The whole definition would be a large blob nobody reads back; the name and
+/// the shape are what a person scanning history wants.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+struct PipelineJobOptions {
+    pipeline: String,
+    steps: usize,
+}
+
+/// One line saying what a pipeline does, for the audit trail.
+fn describe_pipeline(pipeline: &Pipeline) -> String {
+    let shape = pipeline
+        .steps
+        .iter()
+        .map(|s| s.kind().as_str())
+        .collect::<Vec<_>>()
+        .join(" → ");
+    match pipeline.destructive_signature() {
+        Some(targets) => format!("{shape}; replaces {}", targets.replace('\n', ", ")),
+        None => shape,
+    }
 }
 
 /// Cancel a running job.

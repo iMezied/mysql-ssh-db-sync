@@ -66,6 +66,13 @@ pub enum AuditAction {
     ConfigImported,
     /// An artifact was deleted from the library by hand.
     ArtifactDeleted,
+    PipelineCreated,
+    PipelineUpdated,
+    PipelineDeleted,
+    /// A pipeline that can drop a database was authorised to run with nobody
+    /// present, or that authorisation was withdrawn. The entry a security
+    /// reviewer looks for first.
+    PipelineArmed,
 }
 
 impl AuditAction {
@@ -88,6 +95,10 @@ impl AuditAction {
             AuditAction::BackupKeyImported => "backup_key.imported",
             AuditAction::ConfigImported => "config.imported",
             AuditAction::ArtifactDeleted => "artifact.deleted",
+            AuditAction::PipelineCreated => "pipeline.created",
+            AuditAction::PipelineUpdated => "pipeline.updated",
+            AuditAction::PipelineDeleted => "pipeline.deleted",
+            AuditAction::PipelineArmed => "pipeline.armed",
         }
     }
 
@@ -111,6 +122,11 @@ impl AuditAction {
             AuditAction::DestinationDeleted => "off-site copies stop being made",
             AuditAction::ScheduleDeleted => "an unattended job stops running",
             AuditAction::ArtifactDeleted => "a backup was removed by hand",
+            AuditAction::PipelineUpdated => "a saved chain now does something else than it did",
+            AuditAction::PipelineDeleted => "a saved chain stops being runnable",
+            AuditAction::PipelineArmed => {
+                "a chain that can drop a database may now run with nobody present"
+            }
             _ => "",
         }
     }
