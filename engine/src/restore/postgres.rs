@@ -13,14 +13,13 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
-use super::{EngineRestoreOptions, PostgresRestoreOptions, RestoreError, RestoreRequest};
+use super::{EngineRestoreOptions, PostgresRestoreOptions, RestoreError, RestoreRun};
 use crate::backup::mysql::Endpoint;
 use crate::events::JobPhase;
 use crate::exec::{ChildHandle, ToolCommand, wait_checked};
-use crate::tools::{MountMode,ResolvedTool, Tool, ToolSource};
+use crate::tools::{MountMode,ResolvedTool, Tool};
 use crate::job::JobContext;
 use crate::manifest::{ArtifactFormat, BackupManifest};
-use crate::profile::ConnectionProfile;
 
 enum RestoreProgress {
     Phase(JobPhase, String),
@@ -28,13 +27,17 @@ enum RestoreProgress {
 
 /// Run a PostgreSQL restore, returning the database written to.
 pub async fn run_postgres_restore(
-    profile: &ConnectionProfile,
-    request: &RestoreRequest,
-    endpoint: Endpoint,
-    // Where the client binaries come from: this machine, or a container.
-    tools: &ToolSource,
+    run: RestoreRun<'_>,
     ctx: &JobContext,
 ) -> Result<String, RestoreError> {
+    let RestoreRun {
+        profile,
+        request,
+        target,
+        endpoint,
+        tools,
+    } = run;
+
     let manifest = BackupManifest::read(&request.artifact_path).ok();
     request.validate(profile, manifest.as_ref())?;
 
@@ -95,7 +98,6 @@ pub async fn run_postgres_restore(
         }
     }
 
-    let target = request.naming.resolve(chrono::Utc::now());
     ctx.emit(
         JobPhase::Restore,
         format!(
@@ -503,6 +505,7 @@ pub fn toc_line_wanted(line: &str, only_tables: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::ToolSource;
 
     /// A tool pinned to a path that exists, so these fixtures never depend on
     /// whether the client happens to be installed on the machine running the

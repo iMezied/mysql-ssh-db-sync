@@ -45,7 +45,49 @@ impl TargetNaming {
             }
         }
     }
+
+    /// Resolve to a name the server is not already using.
+    ///
+    /// Only `NewTimestamped` moves. Its timestamp has one-second resolution, so
+    /// two restores starting in the same second ask for the same database —
+    /// two schedules due at the same minute, a pipeline run beside a manual
+    /// one, or somebody restoring an artifact twice to compare. The first wins
+    /// and the second used to fail on a name, having done nothing wrong.
+    ///
+    /// Walking to the next free second is what a person would do anyway, and it
+    /// keeps the `{prefix}_{stamp}` shape: nothing that reads these names —
+    /// [`crate::ops::is_drill_database`] most of all, which decides what a
+    /// drill is allowed to drop — has to learn a second one. The name is a few
+    /// seconds ahead of the clock, which is the cost, and it is a name rather
+    /// than a record of when the job ran.
+    ///
+    /// `None` means a whole [`NAMING_WINDOW_SECS`]-second run of names is
+    /// taken. That is not a collision to route around; it is the caller's cue
+    /// to report the collision it was always going to report.
+    ///
+    /// The fixed strategies come back unchanged, existing or not:
+    /// `DropAndRecreate` means *that* database, and `IntoExisting` needs it to
+    /// already be there. Deciding those is the caller's job.
+    pub fn resolve_free(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        taken: &[String],
+    ) -> Option<String> {
+        if !matches!(self, TargetNaming::NewTimestamped { .. }) {
+            return Some(self.resolve(now));
+        }
+        (0..NAMING_WINDOW_SECS)
+            .map(|seconds| self.resolve(now + chrono::Duration::seconds(seconds)))
+            .find(|name| !taken.iter().any(|t| t == name))
+    }
 }
+
+/// How far [`TargetNaming::resolve_free`] will walk to find an unused name.
+///
+/// A minute of one-second names. Long enough that every realistic burst — a
+/// handful of restores kicked off together — lands, short enough that a
+/// destination genuinely full of these still gets told so.
+const NAMING_WINDOW_SECS: i64 = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct MysqlRestoreOptions {
@@ -167,6 +209,28 @@ pub struct RestoreRequest {
     pub verify_checksum: bool,
     /// Typed confirmation supplied by the user for a destructive restore.
     pub typed_confirmation: Option<String>,
+}
+
+/// What `ops::restore` has settled by the time it knows which engine will run.
+///
+/// One struct for the same reason as [`crate::backup::BackupRun`]: all three
+/// engine entry points take exactly this set, and `target` arriving as a fourth
+/// borrow beside `request` and `tools` is precisely the transposition that
+/// comment warns about.
+pub struct RestoreRun<'a> {
+    pub profile: &'a ConnectionProfile,
+    pub request: &'a RestoreRequest,
+    /// The database to write to, already resolved.
+    ///
+    /// Resolved once, by the caller, and *not* recomputed here — see
+    /// [`TargetNaming::resolve_free`]. A worker that called `resolve` again
+    /// would be naming its database from a clock that has moved on since the
+    /// name was checked.
+    pub target: String,
+    /// Already resolved — with a tunnel this is its local end.
+    pub endpoint: crate::backup::mysql::Endpoint,
+    /// Where the client binaries come from: this machine, or a container.
+    pub tools: &'a crate::tools::ToolSource,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -373,6 +437,90 @@ mod tests {
         };
         let t = Utc.with_ymd_and_hms(2026, 3, 15, 14, 30, 22).unwrap();
         assert_eq!(n.resolve(t), "restore_20260315_143022");
+    }
+
+    #[test]
+    fn a_free_generated_name_is_the_plain_timestamp() {
+        // The overwhelmingly common case, and the one whose name must not get
+        // uglier to serve the rare one.
+        let n = TargetNaming::NewTimestamped {
+            prefix: "restore".into(),
+        };
+        let t = Utc.with_ymd_and_hms(2026, 3, 15, 14, 30, 22).unwrap();
+        assert_eq!(
+            n.resolve_free(t, &["something_else".into()]),
+            Some("restore_20260315_143022".into())
+        );
+    }
+
+    #[test]
+    fn a_taken_generated_name_walks_to_the_next_free_second() {
+        let n = TargetNaming::NewTimestamped {
+            prefix: "restore".into(),
+        };
+        let t = Utc.with_ymd_and_hms(2026, 3, 15, 14, 30, 22).unwrap();
+        let taken = vec![
+            "restore_20260315_143022".into(),
+            "restore_20260315_143023".into(),
+        ];
+        assert_eq!(
+            n.resolve_free(t, &taken),
+            Some("restore_20260315_143024".into())
+        );
+    }
+
+    #[test]
+    fn walking_keeps_the_shape_a_drill_name_is_recognised_by() {
+        // `ops::is_drill_database` parses `{prefix}_{stamp}`, and it is what
+        // decides whether a drill may drop its own scratch database. A name it
+        // cannot parse is one nothing will ever clean up, so the walk must not
+        // invent a third component.
+        let n = TargetNaming::NewTimestamped {
+            prefix: crate::ops::DRILL_PREFIX.into(),
+        };
+        let t = Utc.with_ymd_and_hms(2026, 7, 26, 3, 0, 0).unwrap();
+        let first = n.resolve_free(t, &[]).unwrap();
+        let second = n.resolve_free(t, std::slice::from_ref(&first)).unwrap();
+
+        assert_ne!(first, second);
+        assert!(crate::ops::is_drill_database(&first));
+        assert!(crate::ops::is_drill_database(&second));
+    }
+
+    #[test]
+    fn a_full_window_of_names_is_a_collision_to_report() {
+        // Walking is for the burst that would otherwise fail on a name. A
+        // destination genuinely full of these is not that, and saying so beats
+        // walking somewhere arbitrary.
+        let n = TargetNaming::NewTimestamped {
+            prefix: "restore".into(),
+        };
+        let t = Utc.with_ymd_and_hms(2026, 3, 15, 14, 30, 22).unwrap();
+        let taken: Vec<String> = (0..NAMING_WINDOW_SECS)
+            .map(|s| n.resolve(t + chrono::Duration::seconds(s)))
+            .collect();
+        assert_eq!(n.resolve_free(t, &taken), None);
+    }
+
+    #[test]
+    fn a_fixed_name_never_moves() {
+        // `DropAndRecreate` means that database and `IntoExisting` needs it to
+        // be there, so "already taken" is the normal case for both, not a
+        // reason to pick a different one.
+        let t = Utc.with_ymd_and_hms(2026, 3, 15, 14, 30, 22).unwrap();
+        for naming in [
+            TargetNaming::DropAndRecreate {
+                name: "staging_app".into(),
+            },
+            TargetNaming::IntoExisting {
+                name: "staging_app".into(),
+            },
+        ] {
+            assert_eq!(
+                naming.resolve_free(t, &["staging_app".into()]),
+                Some("staging_app".into())
+            );
+        }
     }
 
     #[test]

@@ -697,7 +697,7 @@ db_test! {
         use db_sync_engine::manifest::{ArtifactFormat, BackupManifest};
         use db_sync_engine::restore::{
             run_mongo_restore, EngineRestoreOptions, MongoRestoreOptions, RestoreRequest,
-            TargetNaming,
+            RestoreRun, TargetNaming,
         };
 
         let profile = mongo_profile(dump, restore);
@@ -774,11 +774,16 @@ db_test! {
             typed_confirmation: None,
         };
 
+        // Calling the worker directly means resolving the name here, the way
+        // `ops::restore` does before handing it over.
         let target = run_mongo_restore(
-            &profile,
-            &restore_request,
-            endpoint(),
-            &ToolSource::Local,
+            RestoreRun {
+                profile: &profile,
+                request: &restore_request,
+                target: restore_request.naming.resolve(chrono::Utc::now()),
+                endpoint: endpoint(),
+                tools: &ToolSource::Local,
+            },
             &ctx,
         )
             .await

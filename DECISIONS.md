@@ -1357,7 +1357,9 @@ mistakes by name:
 
 - **A generated name that already exists.** The timestamp has one-second
   resolution, so two restores in the same second collide. The second one is not
-  wrong; it needs a moment, and the error says so.
+  wrong; it needs a moment, and the error says so. *(Superseded — it is now
+  given that moment instead of being told to come back. See "A restore that
+  collides on a name is given the next one" below.)*
 - **`IntoExisting` naming a database that is not there.** Nothing creates it for
   that strategy, so the dump streams at nothing.
 
@@ -1945,3 +1947,82 @@ Each of the three mount sites was run for real against the fixtures:
 
 The middle one is the whole point: before the mount it would have exited 0 and
 produced nothing.
+
+## A restore that collides on a name is given the next one
+
+Found by a flaky test, not by a user.
+`an_encrypted_backup_round_trips_and_is_unreadable_without_the_key` failed three
+times in eight runs. It restores an
+artifact, swaps the installation key, and restores again expecting a decrypt
+error — reusing one `RestoreRequest`, so both restores shared the prefix
+`enc_restore`. When they landed in the same second, the second failed with
+"already exists" instead, and the assertion that the message names the cause
+fired. The test asserted decryption and was being answered by naming.
+
+The test now gives the second restore its own prefix: nothing about a target's
+name should be able to decide the outcome of a test about decryption. That is
+the whole fix for the flake. The rest of this entry is the defect the flake was
+standing on.
+
+### The same sharp edge in the product
+
+M8 gave drill scratch names six hex characters after two nightly drills at 04:00
+collided. Restore targets never got the same treatment, and they have the same
+one-second resolution. Two restores in the same second is not exotic: two
+schedules due at the same minute, a pipeline run beside a manual one, or
+somebody restoring an artifact twice to compare. The pre-flight turned that into
+a clear error, which is better than a raw `CREATE DATABASE` failure — but a
+clear error is still an unattended job that did not run, which is exactly the
+argument M8 already accepted for drills.
+
+### Why not the drill's six hex characters
+
+Two reasons, and the first is decisive.
+
+**`resolve` is called more than once per restore.** The pre-flight resolved a
+name, and then the engine worker resolved it *again* independently. Anything
+random in `resolve` makes those two answers differ, so the name that was checked
+would never be the name that was created. That is also a real pre-existing race
+without any entropy at all — a second ticking between the two calls has the
+worker create a database the check never looked at. So the name is now resolved
+**once**, in `ops::restore`, and handed to the worker in a `RestoreRun` struct
+(mirroring `BackupRun`, whose comment names the hazard of passing borrows like
+this positionally). The workers no longer call `resolve`.
+
+**Hex would break `is_drill_database`.** It parses `{prefix}_{stamp}` and
+`{prefix}_{discriminator}_{stamp}`, and it is what decides whether a drill may
+drop its own scratch database. A third component makes a drill's database
+unrecognisable — not data loss, but litter that nothing will ever clean up. The
+guard is deliberately strict, and widening it to admit a shape only restores
+produce would weaken the thing that makes an unattended drill safe.
+
+### What it does instead
+
+`TargetNaming::resolve_free` walks forward a second at a time to the first name
+the server is not already using, up to a minute. The name keeps its
+`{prefix}_{stamp}` shape, so nothing that reads these names — `is_drill_database`
+most of all — has to learn a second one. Walking is what a person would do
+anyway, and it costs no extra round trip: the answer comes from the database
+list the pre-flight had already fetched. The job log says when a name moved, so
+a database stamped a few seconds after its job started is not a small mystery in
+the history.
+
+The cost is that the name is a few seconds ahead of the clock. It is a name, not
+a record of when the job ran, and the history holds the latter.
+
+A full minute of taken names is still `TargetCollision`. That is not a burst to
+route around, and picking some arbitrary name further out would be worse than
+saying so.
+
+### What is still true
+
+The check remains advisory. Two restores resolving concurrently can still choose
+the same name between the list and the `CREATE`, and the plain `CREATE DATABASE`
+— never `IF NOT EXISTS` — is what actually stops one merging into the other. A
+destination that will not list its databases still gets a warning and the plain
+name, unchanged.
+
+`a_generated_name_that_already_exists_is_refused_not_merged_into` became
+`..._is_never_merged_into`. It already tolerated both outcomes, because the
+second could tick underneath it; what it pins is the invariant that survives the
+change, which is that a restore never writes into a database it did not create.

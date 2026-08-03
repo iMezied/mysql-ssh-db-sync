@@ -20,8 +20,8 @@ use crate::job::{JobContext, JobOutcome, JobRecord};
 use crate::mask::{self, MaskError, MaskRule, MaskingCoverage, MaskingReport};
 use crate::profile::ConnectionProfile;
 use crate::restore::{
-    EngineRestoreOptions, RestoreError, RestoreRequest, TargetNaming, run_mysql_restore,
-    run_mongo_restore, run_postgres_restore,
+    EngineRestoreOptions, RestoreError, RestoreRequest, RestoreRun, TargetNaming,
+    run_mysql_restore, run_mongo_restore, run_postgres_restore,
 };
 use crate::retention::RetentionPolicy;
 use crate::secrets::{self, SecretKind};
@@ -295,20 +295,27 @@ pub async fn restore(
         .await;
     let reachable = reach(profile, store).await?;
 
-    check_target_exists(profile, request, &reachable.endpoint, ctx).await?;
+    // Once, here — not again inside the worker. Two calls to `resolve` either
+    // side of a tick name two different databases, so the name that was checked
+    // has to be the name that is created.
+    let target = resolve_target(profile, request, &reachable.endpoint, ctx).await?;
 
-    let endpoint = reachable.endpoint.clone();
+    let run = RestoreRun {
+        profile,
+        request,
+        target,
+        endpoint: reachable.endpoint.clone(),
+        tools,
+    };
     let target = match profile.engine {
-        Engine::Mysql => run_mysql_restore(profile, request, endpoint, tools, ctx).await?,
-        Engine::Postgres => {
-            run_postgres_restore(profile, request, endpoint, tools, ctx).await?
-        }
-        Engine::Mongo => run_mongo_restore(profile, request, endpoint, tools, ctx).await?,
+        Engine::Mysql => run_mysql_restore(run, ctx).await?,
+        Engine::Postgres => run_postgres_restore(run, ctx).await?,
+        Engine::Mongo => run_mongo_restore(run, ctx).await?,
     };
     Ok(target)
 }
 
-/// Refuse a target the restore cannot use, before either tool is started.
+/// Settle which database this restore writes to, before either tool is started.
 ///
 /// # Why this is not left to the database
 ///
@@ -319,23 +326,32 @@ pub async fn restore(
 /// the real reason on a separate stderr line, which is a poor thing to read at
 /// 3am and a poor thing to show in a job list.
 ///
-/// The two cases are opposite and both are ordinary mistakes:
+/// The two ordinary mistakes get opposite treatment, because only one of them
+/// is a mistake:
 ///
 ///   * `NewTimestamped` resolving onto a name that already exists. The
 ///     timestamp has one-second resolution, so two restores in the same second
-///     collide — and the second one is not wrong, it just needs a moment.
+///     collide — and the second one is not wrong, it just needs a moment. It is
+///     given that moment here rather than being sent away to ask again; see
+///     [`TargetNaming::resolve_free`].
 ///   * `IntoExisting` naming a database that is not there. Nothing creates it,
-///     so the dump streams at nothing.
+///     so the dump streams at nothing. That one is refused.
 ///
-/// A failure here costs one introspection round trip on a connection that has
-/// already been opened.
-async fn check_target_exists(
+/// This costs one introspection round trip on a connection that has already
+/// been opened, and the walk to a free name costs nothing further: it is
+/// answered from the list already fetched.
+///
+/// The check stays advisory. Two restores resolving concurrently can still pick
+/// the same name between this list and the `CREATE`, which is exactly what the
+/// plain `CREATE DATABASE` above is there to catch.
+async fn resolve_target(
     profile: &ConnectionProfile,
     request: &RestoreRequest,
     endpoint: &Endpoint,
     ctx: &JobContext,
-) -> Result<(), OpError> {
-    let target = request.naming.resolve(chrono::Utc::now());
+) -> Result<String, OpError> {
+    let now = chrono::Utc::now();
+    let target = request.naming.resolve(now);
 
     let params = ConnectParams {
         engine: profile.engine,
@@ -360,17 +376,39 @@ async fn check_target_exists(
             "could not list databases, so the target was not checked in advance",
         )
         .await;
-        return Ok(());
+        return Ok(target);
     };
-    let exists = databases.iter().any(|d| d.name == target);
+    let taken: Vec<String> = databases.into_iter().map(|d| d.name).collect();
 
-    match &request.naming {
-        TargetNaming::NewTimestamped { .. } if exists => Err(OpError::TargetCollision { target }),
-        TargetNaming::IntoExisting { name } if !exists => Err(OpError::TargetMissing {
+    if let TargetNaming::IntoExisting { name } = &request.naming
+        && !taken.contains(name)
+    {
+        return Err(OpError::TargetMissing {
             target: name.clone(),
-        }),
-        _ => Ok(()),
+        });
     }
+
+    let resolved = request
+        .naming
+        .resolve_free(now, &taken)
+        .ok_or(OpError::TargetCollision { target })?;
+
+    // Say so when the name moved. A database stamped a few seconds after the
+    // job started is otherwise a small mystery in the history.
+    if let TargetNaming::NewTimestamped { .. } = &request.naming
+        && resolved != request.naming.resolve(now)
+    {
+        ctx.emit(
+            JobPhase::Introspect,
+            format!(
+                "{} already exists, so this restore goes into {resolved}",
+                request.naming.resolve(now)
+            ),
+        )
+        .await;
+    }
+
+    Ok(resolved)
 }
 
 /// What to compare, and where.

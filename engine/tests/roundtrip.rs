@@ -916,6 +916,28 @@ db_test! {
 
 // ── Encryption at rest ──────────────────────────────────────────────────
 
+/// Drop every database whose name begins with `prefix`.
+///
+/// By prefix rather than by name because a restore that *failed* still created
+/// its database, and its name is not returned to the caller — a test asserting
+/// a failure has nothing to pass to `DROP`. Sweeping the prefix also clears
+/// what an earlier run left behind when an assertion panicked before its
+/// cleanup, so a container does not silently fill up with these.
+async fn drop_databases_starting_with(prefix: &str) {
+    let listed = query_scalar(
+        "mysql",
+        &format!(
+            "SELECT schema_name FROM information_schema.schemata \
+             WHERE schema_name LIKE '{prefix}\\_%'"
+        ),
+    )
+    .await;
+
+    for name in listed.lines().map(str::trim).filter(|n| !n.is_empty()) {
+        let _ = query_scalar("mysql", &format!("DROP DATABASE IF EXISTS `{name}`;")).await;
+    }
+}
+
 db_test! {
     #[ignore = "requires an unlocked OS keychain"]
     async fn an_encrypted_backup_round_trips_and_is_unreadable_without_the_key() {
@@ -996,7 +1018,18 @@ db_test! {
         .await
         .unwrap();
 
-        let err = ops::restore(&dest, &restore, &store, &ToolSource::Local, &ctx)
+        // A prefix of its own. Sharing the first restore's prefix meant both
+        // could resolve to the same name within a second, and then this restore
+        // failed because the database already existed — which reads exactly
+        // like the refusal being asserted, and passed for the wrong reason.
+        // What is under test here is decryption, so nothing about the target's
+        // name may be able to decide the outcome.
+        let without_key = RestoreRequest {
+            naming: TargetNaming::NewTimestamped { prefix: "enc_restore_nokey".into() },
+            ..restore.clone()
+        };
+
+        let err = ops::restore(&dest, &without_key, &store, &ToolSource::Local, &ctx)
             .await
             .expect_err("a foreign key must not decrypt this artifact");
         let message = err.to_string();
@@ -1013,13 +1046,11 @@ db_test! {
         .await
         .unwrap();
 
-        let _ = tokio::process::Command::new("docker")
-            .args([
-                "exec", "db-sync-mysql-1", "mysql", "-uroot", "-ptestroot",
-                "-e", &format!("DROP DATABASE IF EXISTS `{target}`"),
-            ])
-            .output()
-            .await;
+        // Both restores, not just the one whose name came back. The failed one
+        // gets far enough to create its database before decryption gives out —
+        // the wrong key is only discovered mid-stream — and its name is never
+        // returned to anyone who could drop it.
+        drop_databases_starting_with("enc_restore").await;
     }
 }
 
@@ -1309,12 +1340,14 @@ db_test! {
 
 db_test! {
     #[ignore = "requires an unlocked OS keychain"]
-    async fn a_generated_name_that_already_exists_is_refused_not_merged_into() {
+    async fn a_generated_name_that_already_exists_is_never_merged_into() {
         // The timestamp has one-second resolution, so two restores in the same
         // second resolve to the same name. Writing into the first one's
-        // database would silently merge two restores; this pins that it is
-        // refused, and that the message explains a collision rather than
-        // reporting a generic CREATE failure.
+        // database would silently merge two restores, and that is the thing
+        // this pins — not which way out is taken. The restore now walks to the
+        // next free second rather than refusing, so the pass is an `Ok` naming
+        // a different database; a refusal still has to explain the collision
+        // rather than report a generic CREATE failure.
         require_containers!();
         let (store, _dir) = temp_store().await;
         let out = tempfile::tempdir().unwrap();
@@ -1356,11 +1389,12 @@ db_test! {
 
         let _ = query_scalar("mysql", &format!("DROP DATABASE IF EXISTS `{occupied}`;")).await;
 
-        // The second can tick between resolving the name above and resolving it
-        // again inside the restore, which is the same one-second granularity
-        // this test is about. A restore that landed on a free name is a pass,
-        // not a flake — what must never happen is silently reusing the
-        // occupied one.
+        // The expected outcome is now `Ok` into a name a second or two later.
+        // `Err` is still allowed rather than asserted away: it is what a
+        // destination whose database list cannot be read falls back to, and
+        // that path must stay a clear collision rather than a raw CREATE
+        // failure. Either way, what must never happen is silently reusing the
+        // occupied database.
         match err {
             Err(e) => {
                 let message = e.to_string();

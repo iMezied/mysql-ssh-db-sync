@@ -12,14 +12,13 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
-use super::{EngineRestoreOptions, MysqlRestoreOptions, RestoreError, RestoreRequest};
+use super::{EngineRestoreOptions, MysqlRestoreOptions, RestoreError, RestoreRun};
 use crate::backup::mysql::Endpoint;
 use crate::events::JobPhase;
 use crate::exec::{ChildHandle, ToolCommand, wait_checked};
-use crate::tools::{ResolvedTool, Tool, ToolSource};
+use crate::tools::{ResolvedTool, Tool};
 use crate::job::JobContext;
 use crate::manifest::BackupManifest;
-use crate::profile::ConnectionProfile;
 
 /// Progress from the blocking restore worker.
 enum RestoreProgress {
@@ -32,13 +31,17 @@ const PROGRESS_EVERY: u64 = 4 * 1024 * 1024;
 
 /// Run a MySQL restore, returning the database that was written to.
 pub async fn run_mysql_restore(
-    profile: &ConnectionProfile,
-    request: &RestoreRequest,
-    endpoint: Endpoint,
-    // Where the client binaries come from: this machine, or a container.
-    tools: &ToolSource,
+    run: RestoreRun<'_>,
     ctx: &JobContext,
 ) -> Result<String, RestoreError> {
+    let RestoreRun {
+        profile,
+        request,
+        target,
+        endpoint,
+        tools,
+    } = run;
+
     let manifest = BackupManifest::read(&request.artifact_path).ok();
     request.validate(profile, manifest.as_ref())?;
 
@@ -107,8 +110,6 @@ pub async fn run_mysql_restore(
             .await;
         }
     }
-
-    let target = request.naming.resolve(chrono::Utc::now());
 
     ctx.emit(
         JobPhase::Restore,
@@ -447,6 +448,7 @@ pub fn manifest_path_for(artifact: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::ToolSource;
 
     /// A tool pinned to a path that exists, so these fixtures never depend on
     /// whether the client happens to be installed on the machine running the
