@@ -12,6 +12,7 @@ use db_sync_engine::destination::{
 use db_sync_engine::events::JobKind;
 use db_sync_engine::job::{JobOutcome, JobRecord};
 use db_sync_engine::mask::{MaskRule, MaskTransform};
+use db_sync_engine::pipeline::{PipelineCreate, PipelineStep, PipelineUpdate};
 use db_sync_engine::plan::SyncPlanCreate;
 use db_sync_engine::profile::{DbConfig, ProfileCreate, ProfileUpdate, ToolOverrides};
 use db_sync_engine::sshconn::{SshAuth, SshConnectionCreate, SshEndpoint};
@@ -1170,4 +1171,199 @@ async fn replanning_a_job_replaces_its_steps_rather_than_interleaving_them() {
     let steps = store.list_job_steps(job).await.unwrap();
     assert_eq!(steps.len(), 2);
     assert_eq!(steps[0].label, "second plan");
+}
+
+// ── Pipelines ───────────────────────────────────────────────────────────
+
+fn backup_then_replace(target: &str) -> Vec<PipelineStep> {
+    use db_sync_engine::backup::{EngineBackupOptions, MysqlBackupOptions};
+    use db_sync_engine::pipeline::ArtifactSource;
+    use db_sync_engine::restore::{EngineRestoreOptions, MysqlRestoreOptions, TargetNaming};
+
+    vec![
+        PipelineStep::Backup {
+            profile_id: Uuid::new_v4(),
+            database: "shop".into(),
+            plan_id: None,
+            selections: Vec::new(),
+            output_dir: None,
+            compress: true,
+            encrypt: false,
+            record_row_counts: false,
+            engine: EngineBackupOptions::Mysql(MysqlBackupOptions::default()),
+        },
+        PipelineStep::Restore {
+            profile_id: Uuid::new_v4(),
+            source: ArtifactSource::PreviousStep,
+            naming: TargetNaming::DropAndRecreate {
+                name: target.into(),
+            },
+            engine: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
+            verify_checksum: true,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_pipeline_round_trips_and_names_are_unique() {
+    let (store, _dir) = store().await;
+
+    let created = store
+        .create_pipeline(PipelineCreate {
+            name: "  refresh staging  ".into(),
+            steps: backup_then_replace("staging"),
+        })
+        .await
+        .expect("create");
+
+    assert_eq!(created.name, "refresh staging", "the name is trimmed");
+    assert_eq!(
+        created.unattended_ack, None,
+        "a new pipeline is never armed"
+    );
+
+    let read = store.require_pipeline(created.id).await.unwrap();
+    assert_eq!(
+        read, created,
+        "the whole definition survives the round trip"
+    );
+
+    let err = store
+        .create_pipeline(PipelineCreate {
+            name: "refresh staging".into(),
+            steps: backup_then_replace("other"),
+        })
+        .await
+        .expect_err("a duplicate name must be refused");
+    assert!(matches!(err, StoreError::DuplicateName(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn an_invalid_pipeline_is_refused_before_it_is_stored() {
+    // The CLI, an import and the IPC layer all reach this. Validating on the
+    // way in means the runner never has to read one it would have to refuse.
+    let (store, _dir) = store().await;
+
+    let err = store
+        .create_pipeline(PipelineCreate {
+            name: "broken".into(),
+            steps: Vec::new(),
+        })
+        .await
+        .expect_err("an empty pipeline is not runnable");
+    assert!(matches!(err, StoreError::InvalidPipeline(_)), "got {err:?}");
+
+    assert!(
+        store.list_pipelines().await.unwrap().is_empty(),
+        "nothing may be left behind by a refused create"
+    );
+}
+
+#[tokio::test]
+async fn arming_requires_the_targets_typed_back_and_an_edit_undoes_it() {
+    let (store, _dir) = store().await;
+
+    let p = store
+        .create_pipeline(PipelineCreate {
+            name: "nightly replace".into(),
+            steps: backup_then_replace("staging"),
+        })
+        .await
+        .unwrap();
+
+    let wrong = store
+        .arm_pipeline(p.id, Some("stagng"))
+        .await
+        .expect_err("a typo must not authorise a drop");
+    assert!(
+        matches!(wrong, StoreError::InvalidPipeline(_)),
+        "got {wrong:?}"
+    );
+    assert!(!store.require_pipeline(p.id).await.unwrap().is_armed());
+
+    let armed = store.arm_pipeline(p.id, Some("staging")).await.unwrap();
+    assert!(armed.is_armed());
+    assert!(store.require_pipeline(p.id).await.unwrap().is_armed());
+
+    // Re-pointing the destructive step revokes the authorisation, because the
+    // authorisation was for `staging`, not for this pipeline.
+    let edited = store
+        .update_pipeline(
+            p.id,
+            PipelineUpdate {
+                name: None,
+                steps: Some(backup_then_replace("production")),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        !edited.is_armed(),
+        "an edit must not carry permission over to a different database"
+    );
+    assert_eq!(
+        store.require_pipeline(p.id).await.unwrap().unattended_ack,
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_pipeline_that_destroys_nothing_cannot_be_armed() {
+    use db_sync_engine::backup::{EngineBackupOptions, MysqlBackupOptions};
+
+    let (store, _dir) = store().await;
+    let p = store
+        .create_pipeline(PipelineCreate {
+            name: "just a backup".into(),
+            steps: vec![PipelineStep::Backup {
+                profile_id: Uuid::new_v4(),
+                database: "shop".into(),
+                plan_id: None,
+                selections: Vec::new(),
+                output_dir: None,
+                compress: true,
+                encrypt: false,
+                record_row_counts: false,
+                engine: EngineBackupOptions::Mysql(MysqlBackupOptions::default()),
+            }],
+        })
+        .await
+        .unwrap();
+
+    let err = store
+        .arm_pipeline(p.id, Some("shop"))
+        .await
+        .expect_err("there is nothing here to authorise");
+    assert!(matches!(err, StoreError::InvalidPipeline(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn an_update_that_would_break_a_pipeline_is_refused() {
+    let (store, _dir) = store().await;
+    let p = store
+        .create_pipeline(PipelineCreate {
+            name: "refresh".into(),
+            steps: backup_then_replace("staging"),
+        })
+        .await
+        .unwrap();
+
+    // Removing the backup leaves a restore consuming an artifact nothing makes.
+    let err = store
+        .update_pipeline(
+            p.id,
+            PipelineUpdate {
+                name: None,
+                steps: Some(backup_then_replace("staging").split_off(1)),
+            },
+        )
+        .await
+        .expect_err("the result of the patch has to be runnable");
+    assert!(matches!(err, StoreError::InvalidPipeline(_)), "got {err:?}");
+
+    assert_eq!(
+        store.require_pipeline(p.id).await.unwrap().steps.len(),
+        2,
+        "a refused update must leave the stored pipeline alone"
+    );
 }

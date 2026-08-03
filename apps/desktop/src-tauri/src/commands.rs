@@ -71,11 +71,13 @@ impl From<StoreError> for CommandError {
             StoreError::ProfileNotFound(_)
             | StoreError::SyncPlanNotFound(_)
             | StoreError::ScheduleNotFound(_)
-            | StoreError::DestinationNotFound(_) => "not_found",
+            | StoreError::DestinationNotFound(_)
+            | StoreError::PipelineNotFound(_) => "not_found",
             StoreError::Corrupt { .. } => "corrupt",
             StoreError::InvalidSchedule(_)
             | StoreError::InvalidDestination(_)
-            | StoreError::InvalidSshConnection(_) => "invalid",
+            | StoreError::InvalidSshConnection(_)
+            | StoreError::InvalidPipeline(_) => "invalid",
             StoreError::Secrets(_) => "keychain",
             StoreError::Sqlx(_) | StoreError::Migrate(_) => "storage",
         };

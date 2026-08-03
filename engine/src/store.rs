@@ -16,6 +16,7 @@ use crate::backup::TableSelection;
 use crate::destination::{Destination, DestinationCreate, DestinationUpdate};
 use crate::events::JobKind;
 use crate::job::{JobOutcome, JobRecord};
+use crate::pipeline::{Pipeline, PipelineCreate, PipelineUpdate};
 use crate::plan::{SyncPlan, SyncPlanCreate};
 use crate::profile::{ConnectionProfile, DbConfig, ProfileCreate, ProfileUpdate, ToolOverrides};
 use crate::schedule::{NotifyPolicy, Schedule, ScheduleCreate, ScheduleKind, ScheduleUpdate};
@@ -49,6 +50,10 @@ pub enum StoreError {
     ScheduleNotFound(Uuid),
     #[error("no destination with id {0}")]
     DestinationNotFound(Uuid),
+    #[error("no pipeline with id {0}")]
+    PipelineNotFound(Uuid),
+    #[error(transparent)]
+    InvalidPipeline(crate::pipeline::PipelineError),
     #[error(transparent)]
     InvalidSchedule(crate::schedule::ScheduleError),
     #[error(transparent)]
@@ -462,6 +467,171 @@ impl Store {
         rows.into_iter().map(row_to_job_step).collect()
     }
 
+    // ── Pipelines ───────────────────────────────────────────────────────
+
+    pub async fn list_pipelines(&self) -> Result<Vec<Pipeline>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {PIPELINE_COLUMNS} FROM pipelines ORDER BY name"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(row_to_pipeline).collect()
+    }
+
+    pub async fn get_pipeline(&self, id: Uuid) -> Result<Option<Pipeline>> {
+        let row = sqlx::query(&format!(
+            "SELECT {PIPELINE_COLUMNS} FROM pipelines WHERE id = ?1"
+        ))
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(row_to_pipeline).transpose()
+    }
+
+    pub async fn require_pipeline(&self, id: Uuid) -> Result<Pipeline> {
+        self.get_pipeline(id)
+            .await?
+            .ok_or(StoreError::PipelineNotFound(id))
+    }
+
+    /// Validated before it is written, so no path — CLI, import, IPC — can
+    /// store a pipeline the runner would have to refuse later.
+    pub async fn create_pipeline(&self, input: PipelineCreate) -> Result<Pipeline> {
+        input.validate().map_err(StoreError::InvalidPipeline)?;
+
+        let now = Utc::now();
+        let pipeline = Pipeline {
+            id: Uuid::new_v4(),
+            name: input.name.trim().to_string(),
+            steps: input.steps,
+            unattended_ack: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        sqlx::query(
+            "INSERT INTO pipelines (id, name, steps_json, unattended_ack, created_at, \
+             updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(pipeline.id.to_string())
+        .bind(&pipeline.name)
+        .bind(serde_json::to_string(&pipeline.steps).map_err(|e| corrupt("steps_json", e))?)
+        .bind(Option::<String>::None)
+        .bind(pipeline.created_at.to_rfc3339())
+        .bind(pipeline.updated_at.to_rfc3339())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            if is_unique_violation(&e) {
+                StoreError::DuplicateName(pipeline.name.clone())
+            } else {
+                StoreError::Sqlx(e)
+            }
+        })?;
+
+        Ok(pipeline)
+    }
+
+    /// Apply a patch, then re-validate the result.
+    ///
+    /// After, not before: a patch that is fine on its own can still leave the
+    /// pipeline invalid — removing the backup step out from under a restore
+    /// that consumes it — and the stored row is what the runner will read.
+    ///
+    /// Editing the steps clears `unattended_ack`. Permission to drop a database
+    /// unattended is granted for the targets somebody typed, and re-checking
+    /// the signature on read would already catch a rename; clearing it here as
+    /// well means an edit that happens to keep the same names still costs a
+    /// deliberate re-arm.
+    pub async fn update_pipeline(&self, id: Uuid, patch: PipelineUpdate) -> Result<Pipeline> {
+        let mut pipeline = self.require_pipeline(id).await?;
+        let steps_changed = patch.steps.is_some();
+
+        if let Some(name) = patch.name {
+            pipeline.name = name.trim().to_string();
+        }
+        if let Some(steps) = patch.steps {
+            pipeline.steps = steps;
+        }
+        if steps_changed {
+            pipeline.unattended_ack = None;
+        }
+        pipeline.updated_at = Utc::now();
+
+        pipeline.validate().map_err(StoreError::InvalidPipeline)?;
+
+        sqlx::query(
+            "UPDATE pipelines SET name = ?2, steps_json = ?3, unattended_ack = ?4, \
+             updated_at = ?5 WHERE id = ?1",
+        )
+        .bind(id.to_string())
+        .bind(&pipeline.name)
+        .bind(serde_json::to_string(&pipeline.steps).map_err(|e| corrupt("steps_json", e))?)
+        .bind(pipeline.unattended_ack.as_deref())
+        .bind(pipeline.updated_at.to_rfc3339())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            if is_unique_violation(&e) {
+                StoreError::DuplicateName(pipeline.name.clone())
+            } else {
+                StoreError::Sqlx(e)
+            }
+        })?;
+
+        Ok(pipeline)
+    }
+
+    /// Record that a human typed the destructive targets back, authorising
+    /// this pipeline to run with nobody present.
+    ///
+    /// `typed` is what they typed; it must match the pipeline's current
+    /// signature exactly. Passing `None` disarms. A pipeline that destroys
+    /// nothing cannot be armed, because there is nothing to authorise.
+    pub async fn arm_pipeline(&self, id: Uuid, typed: Option<&str>) -> Result<Pipeline> {
+        let mut pipeline = self.require_pipeline(id).await?;
+
+        let ack = match typed {
+            None => None,
+            Some(typed) => {
+                let expected = pipeline.destructive_signature().ok_or_else(|| {
+                    StoreError::InvalidPipeline(crate::pipeline::PipelineError::NothingToAuthorise)
+                })?;
+                if typed != expected {
+                    return Err(StoreError::InvalidPipeline(
+                        crate::pipeline::PipelineError::ConfirmationDoesNotMatch {
+                            expected,
+                            got: typed.to_string(),
+                        },
+                    ));
+                }
+                Some(expected)
+            }
+        };
+
+        pipeline.unattended_ack = ack;
+        pipeline.updated_at = Utc::now();
+
+        sqlx::query("UPDATE pipelines SET unattended_ack = ?2, updated_at = ?3 WHERE id = ?1")
+            .bind(id.to_string())
+            .bind(pipeline.unattended_ack.as_deref())
+            .bind(pipeline.updated_at.to_rfc3339())
+            .execute(&self.pool)
+            .await?;
+
+        Ok(pipeline)
+    }
+
+    pub async fn delete_pipeline(&self, id: Uuid) -> Result<bool> {
+        let res = sqlx::query("DELETE FROM pipelines WHERE id = ?1")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     // ── Known hosts ─────────────────────────────────────────────────────
 
     pub async fn get_known_host(&self, host_port: &str) -> Result<Option<(String, String)>> {
@@ -588,6 +758,26 @@ fn row_to_profile(row: sqlx::sqlite::SqliteRow) -> Result<ConnectionProfile> {
         db: serde_json::from_str::<DbConfig>(&db_raw).map_err(|e| corrupt("db_config", e))?,
         tool_overrides: serde_json::from_str::<ToolOverrides>(&tools_raw)
             .map_err(|e| corrupt("tool_overrides", e))?,
+        created_at: parse_ts(&row.get::<String, _>("created_at"), "created_at")?,
+        updated_at: parse_ts(&row.get::<String, _>("updated_at"), "updated_at")?,
+    })
+}
+
+/// Every column [`row_to_pipeline`] reads, in one place so the queries above
+/// cannot drift apart from it.
+const PIPELINE_COLUMNS: &str = "id, name, steps_json, unattended_ack, created_at, updated_at";
+
+fn row_to_pipeline(row: sqlx::sqlite::SqliteRow) -> Result<Pipeline> {
+    let steps_raw: String = row.get("steps_json");
+
+    Ok(Pipeline {
+        id: parse_uuid(&row.get::<String, _>("id"), "id")?,
+        name: row.get("name"),
+        // Unlike a step's detail blob, this one is the pipeline. A definition
+        // that cannot be read is corruption worth surfacing — running half of
+        // it would be worse than refusing to list it.
+        steps: serde_json::from_str(&steps_raw).map_err(|e| corrupt("steps_json", e))?,
+        unattended_ack: row.get("unattended_ack"),
         created_at: parse_ts(&row.get::<String, _>("created_at"), "created_at")?,
         updated_at: parse_ts(&row.get::<String, _>("updated_at"), "updated_at")?,
     })

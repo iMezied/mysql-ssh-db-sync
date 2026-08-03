@@ -47,6 +47,8 @@ pub enum OpError {
     Store(#[from] crate::store::StoreError),
     #[error(transparent)]
     Mask(#[from] MaskError),
+    #[error(transparent)]
+    Pipeline(#[from] crate::pipeline::PipelineError),
     // Masking failed *and* the destination could not be dropped, so a database
     // holding unmasked production data is still standing. Its own variant
     // because it is the one failure here that needs a human immediately.
@@ -1061,6 +1063,477 @@ pub async fn sync(
     })
 }
 
+// ── Pipelines ───────────────────────────────────────────────────────────
+
+/// What a pipeline needs from its caller that is not part of its definition.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
+pub struct PipelineRunRequest {
+    /// One per destructive step, in the order those steps appear.
+    ///
+    /// Not checked here. Each one is handed to the restore step it belongs to
+    /// and validated by [`RestoreRequest::validate`], which is the same check a
+    /// hand-built restore goes through — so the guarantee does not depend on
+    /// this function being careful.
+    #[serde(default)]
+    pub typed_confirmations: Vec<String>,
+    /// Where a backup step writes when it names no directory of its own.
+    pub default_output_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
+pub struct PipelineOutcome {
+    /// Artifacts written, in step order.
+    pub artifacts: Vec<String>,
+    /// Databases restored into, in step order.
+    pub databases: Vec<String>,
+    pub verification: Option<VerificationReport>,
+    pub masking: Option<MaskingReport>,
+    #[serde(default)]
+    pub offsite: Vec<PushResult>,
+    #[serde(default)]
+    pub removed_artifacts: Vec<String>,
+}
+
+impl PipelineOutcome {
+    /// Whether every part of this run did what it claimed.
+    ///
+    /// Same rule as [`SyncOutcome::fully_succeeded`]: a run that restored and
+    /// then failed verification is not a success, because the question asked of
+    /// the history is "did it work", not "did each command exit zero".
+    pub fn fully_succeeded(&self) -> bool {
+        self.verification.as_ref().is_none_or(|r| r.passed())
+            && self.offsite.iter().all(PushResult::succeeded)
+    }
+}
+
+/// What one step has produced so far, threaded down the list.
+///
+/// This is the whole of the data flow between steps: a restore consumes the
+/// most recent backup, a verify compares the most recent restore against the
+/// backup's source. Nothing fans out and nothing reaches backwards past the
+/// most recent producer, which is what lets the editor be a plain list.
+#[derive(Default)]
+struct RunState {
+    artifact: Option<PathBuf>,
+    output_dir: Option<PathBuf>,
+    /// The backup behind `artifact`, with its selections already resolved.
+    backup: Option<BackupRequest>,
+    source: Option<ConnectionProfile>,
+    target: Option<String>,
+    dest: Option<ConnectionProfile>,
+    coverage: Option<MaskingCoverage>,
+}
+
+/// Run a saved chain of actions as one job.
+///
+/// A dispatcher, not a second implementation. Every step calls the same
+/// `ops::` entry point the standalone button calls, for the reason `ops::sync`
+/// gives: a pipeline-flavoured copy of dump-and-restore would drift from the
+/// one the individual buttons run.
+///
+/// # Everything that can be decided early, is
+///
+/// Selections are resolved and every masking rule is checked against the real
+/// schema *before the first step runs*. Both are ordering constraints, not
+/// tidiness: `resolve_selections` must precede masking planning or a rule
+/// written off as inert can have its table promoted to schema+data afterwards
+/// and send real values to the destination unmasked, and a masking rule that
+/// names a column that does not exist is cheap to fix while no data has moved
+/// and expensive once a database somebody is using has to be dropped.
+pub async fn run_pipeline(
+    pipeline: &crate::pipeline::Pipeline,
+    request: &PipelineRunRequest,
+    store: &Store,
+    // Where the client binaries come from. See `ToolSource`.
+    tools: &ToolSource,
+    ctx: &JobContext,
+) -> Result<PipelineOutcome, OpError> {
+    use crate::pipeline::{ArtifactSource, PipelineStep};
+
+    let profiles = store.list_profiles().await?;
+    pipeline.validate_against(&profiles)?;
+
+    let profile = |id: uuid::Uuid| -> Result<ConnectionProfile, OpError> {
+        profiles
+            .iter()
+            .find(|p| p.id == id)
+            .cloned()
+            .ok_or(OpError::Store(crate::store::StoreError::ProfileNotFound(
+                id,
+            )))
+    };
+
+    // ── Resolve every backup step against the source's real table list ──
+    let mut resolved: BTreeMap<usize, BackupRequest> = BTreeMap::new();
+    for (i, step) in pipeline.steps.iter().enumerate() {
+        if let PipelineStep::Backup {
+            profile_id,
+            database,
+            plan_id,
+            selections,
+            output_dir,
+            compress,
+            encrypt,
+            record_row_counts,
+            engine,
+        } = step
+        {
+            let source = profile(*profile_id)?;
+
+            // A saved set is the thing being maintained, so it wins over the
+            // step's own list — but only for the database it was built against.
+            let saved = match plan_id {
+                Some(id) => {
+                    let plan = store.get_sync_plan(*id).await?.ok_or(OpError::Store(
+                        crate::store::StoreError::SyncPlanNotFound(*id),
+                    ))?;
+                    if plan.database != *database {
+                        return Err(OpError::Pipeline(
+                            crate::pipeline::PipelineError::TableSetMovedOn {
+                                step: i + 1,
+                                set: plan.name,
+                                expected: database.clone(),
+                                found: plan.database,
+                            },
+                        ));
+                    }
+                    plan.selections
+                }
+                None => selections.clone(),
+            };
+
+            resolved.insert(
+                i,
+                BackupRequest {
+                    common: CommonBackupOptions {
+                        database: database.clone(),
+                        selections: resolve_selections(&source, database, &saved, store, ctx)
+                            .await?,
+                        output_dir: output_dir
+                            .clone()
+                            .unwrap_or_else(|| request.default_output_dir.clone()),
+                        compress: *compress,
+                        encrypt: *encrypt,
+                        record_row_counts: *record_row_counts,
+                    },
+                    engine: engine.clone(),
+                },
+            );
+        }
+    }
+
+    // ── Check every masking rule against the schema, before anything runs ──
+    let mut coverages: BTreeMap<usize, Option<MaskingCoverage>> = BTreeMap::new();
+    for (i, step) in pipeline.steps.iter().enumerate() {
+        if let PipelineStep::Mask { rules } = step {
+            // The backup this mask step will end up describing: validation has
+            // already proved a restore precedes it, and a restore consuming a
+            // previous step proves a backup precedes that.
+            let Some((backup_index, backup)) = resolved.range(..i).next_back() else {
+                continue;
+            };
+            let source_id = match &pipeline.steps[*backup_index] {
+                PipelineStep::Backup { profile_id, .. } => *profile_id,
+                _ => unreachable!("resolved only holds backup steps"),
+            };
+            coverages.insert(
+                i,
+                plan_masking_for(
+                    &profile(source_id)?,
+                    &backup.common.database,
+                    rules,
+                    &backup.common.selections,
+                    store,
+                    ctx,
+                )
+                .await?,
+            );
+        }
+    }
+
+    // ── Write the plan down, then walk it ────────────────────────────────
+    let mut plan = StepPlan::new();
+    for step in &pipeline.steps {
+        plan = plan.add(step.kind(), step.label(&profiles));
+    }
+    let steps = StepRecorder::start(store, ctx, plan).await;
+
+    let mut state = RunState::default();
+    let mut outcome = PipelineOutcome::default();
+    let mut confirmations = request.typed_confirmations.iter();
+
+    for (i, step) in pipeline.steps.iter().enumerate() {
+        ctx.bail_if_cancelled().map_err(|_| OpError::Cancelled)?;
+
+        match step {
+            PipelineStep::Backup { profile_id, .. } => {
+                let source = profile(*profile_id)?;
+                let backup_request = resolved
+                    .get(&i)
+                    .expect("every backup step was resolved above")
+                    .clone();
+
+                steps.begin(JobStepKind::Backup).await;
+                let artifact = backup(&source, &backup_request, store, tools, ctx).await?;
+                steps
+                    .done(JobStepDetail::artifact(artifact.display().to_string()))
+                    .await;
+
+                outcome.artifacts.push(artifact.display().to_string());
+                state.output_dir = Some(backup_request.common.output_dir.clone());
+                state.backup = Some(backup_request);
+                state.source = Some(source);
+                state.artifact = Some(artifact);
+            }
+
+            PipelineStep::Restore {
+                profile_id,
+                source,
+                naming,
+                engine,
+                verify_checksum,
+            } => {
+                let dest = profile(*profile_id)?;
+                let artifact = match source {
+                    ArtifactSource::PreviousStep => state
+                        .artifact
+                        .clone()
+                        .expect("validation proved a backup precedes this"),
+                    ArtifactSource::Path { path } => path.clone(),
+                    ArtifactSource::NewestInDirectory { dir } => newest_artifact(dir)?,
+                };
+
+                let restore_request = RestoreRequest {
+                    artifact_path: artifact.clone(),
+                    naming: naming.clone(),
+                    engine: engine.clone(),
+                    verify_checksum: *verify_checksum,
+                    // Consumed in step order. A destructive step with nothing
+                    // left to take gets `None` and is refused by `validate`,
+                    // which is where that rule belongs.
+                    typed_confirmation: naming
+                        .is_destructive()
+                        .then(|| confirmations.next().cloned())
+                        .flatten(),
+                };
+
+                steps.begin(JobStepKind::Restore).await;
+                let target = restore(&dest, &restore_request, store, tools, ctx).await?;
+                steps.done(JobStepDetail::database(&target)).await;
+
+                outcome.databases.push(target.clone());
+                state.target = Some(target);
+                state.dest = Some(dest);
+            }
+
+            PipelineStep::Mask { .. } => {
+                let coverage = coverages.get(&i).and_then(Option::as_ref);
+                let (Some(coverage), Some(target), Some(dest)) =
+                    (coverage, &state.target, &state.dest)
+                else {
+                    // Every rule was inert, and `plan_masking_for` has already
+                    // warned. Recording it as skipped is the honest reading:
+                    // nothing was masked.
+                    steps
+                        .skip(
+                            JobStepKind::Mask,
+                            "no rule matches a table this pipeline copies",
+                        )
+                        .await;
+                    continue;
+                };
+
+                steps.begin(JobStepKind::Mask).await;
+                let report = mask_destination(dest, target, coverage, store, ctx).await?;
+                steps
+                    .done(
+                        JobStepDetail::default()
+                            .note(format!("{} column(s) masked", report.columns.len())),
+                    )
+                    .await;
+
+                state.coverage = Some(coverage.clone());
+                outcome.masking = Some(report);
+            }
+
+            PipelineStep::Verify { deep } => {
+                let (Some(backup_request), Some(source), Some(target), Some(dest)) =
+                    (&state.backup, &state.source, &state.target, &state.dest)
+                else {
+                    unreachable!("validation proved a backup and a restore precede this")
+                };
+
+                let with_data: Vec<String> = backup_request
+                    .common
+                    .tables_with_data()
+                    .into_iter()
+                    .map(|s| s.name.clone())
+                    .collect();
+                let schema_only: Vec<String> = backup_request
+                    .common
+                    .selections
+                    .iter()
+                    .filter(|s| s.mode == crate::backup::TableMode::SchemaOnly)
+                    .map(|s| s.name.clone())
+                    .collect();
+
+                steps.begin(JobStepKind::Verify).await;
+                let report = verify_restore(
+                    VerifyRequest {
+                        source_profile: source,
+                        dest_profile: dest,
+                        source_database: &backup_request.common.database,
+                        dest_database: target,
+                        tables_with_data: &with_data,
+                        schema_only: &schema_only,
+                        deep: *deep,
+                        masked_tables: &state
+                            .coverage
+                            .as_ref()
+                            .map(MaskingCoverage::tables)
+                            .unwrap_or_default(),
+                    },
+                    store,
+                    ctx,
+                )
+                .await?;
+
+                // A check that ran and found a difference is a finished step.
+                // The job's own outcome carries the bad news.
+                steps
+                    .done(
+                        JobStepDetail {
+                            tables_checked: Some(report.tables_checked as u32),
+                            ..JobStepDetail::default()
+                        }
+                        .note(match report.passed() {
+                            true => "every table matched".to_string(),
+                            false => format!("{} table(s) did not match", report.failures),
+                        }),
+                    )
+                    .await;
+                outcome.verification = Some(report);
+            }
+
+            PipelineStep::PushOffsite => {
+                let artifact = state
+                    .artifact
+                    .clone()
+                    .expect("validation proved a backup precedes this");
+
+                steps.begin(JobStepKind::Offsite).await;
+                let pushed = push_offsite(&artifact, store, ctx).await?;
+                steps.done(describe_offsite(&pushed)).await;
+                outcome.offsite = pushed;
+            }
+
+            PipelineStep::Retention { policy } => {
+                let dir = state
+                    .output_dir
+                    .clone()
+                    .expect("validation proved a backup precedes this");
+
+                // Deliberately gated the way `sync` gates it: a failed check is
+                // exactly when the older backups matter most, and a run that
+                // did not produce the off-site copy it was meant to has not
+                // earned the right to delete the local ones.
+                let verified = outcome.verification.as_ref().is_none_or(|r| r.passed());
+                let copied = outcome.offsite.iter().all(PushResult::succeeded);
+                if !verified || !copied {
+                    let reason = match verified {
+                        true => "the off-site copy failed",
+                        false => "verification failed",
+                    };
+                    steps
+                        .skip(
+                            JobStepKind::Retention,
+                            format!("{reason}; every existing backup kept"),
+                        )
+                        .await;
+                    continue;
+                }
+
+                steps.begin(JobStepKind::Retention).await;
+                let removed = apply_retention(&dir, *policy, ctx).await;
+                steps
+                    .done(
+                        JobStepDetail::default()
+                            .note(format!("{} artifact(s) removed", removed.len())),
+                    )
+                    .await;
+                outcome.removed_artifacts.extend(removed);
+            }
+
+            PipelineStep::Drill {
+                profile_id,
+                artifact_dir,
+                deep,
+                keep_on_failure,
+            } => {
+                let dest = profile(*profile_id)?;
+                let dir = artifact_dir
+                    .clone()
+                    .or_else(|| state.output_dir.clone())
+                    .unwrap_or_else(|| request.default_output_dir.clone());
+
+                steps.begin(JobStepKind::Drill).await;
+                // `ops::drill` plans its own steps; the recorder inside it goes
+                // quiet because this context is already inside one. See
+                // `StepRecorder::start`.
+                let drilled = drill(
+                    &dest,
+                    &DrillRequest {
+                        artifact_dir: dir,
+                        restore: crate::schedule::default_restore_options(dest.engine),
+                        deep_verify: *deep,
+                        keep_on_failure: *keep_on_failure,
+                    },
+                    store,
+                    tools,
+                    ctx,
+                )
+                .await?;
+
+                steps
+                    .done(
+                        JobStepDetail {
+                            artifact: Some(drilled.artifact.clone()),
+                            tables_checked: Some(drilled.report.tables_checked as u32),
+                            ..JobStepDetail::default()
+                        }
+                        .note(match drilled.report.passed() {
+                            true => "the backup restores and holds what it claims".to_string(),
+                            false => {
+                                format!("{} table(s) did not match", drilled.report.failures)
+                            }
+                        }),
+                    )
+                    .await;
+
+                if outcome.verification.is_none() {
+                    outcome.verification = Some(drilled.report);
+                }
+            }
+        }
+    }
+
+    Ok(outcome)
+}
+
+/// The newest artifact in a directory, the way a drill picks one.
+fn newest_artifact(dir: &std::path::Path) -> Result<PathBuf, OpError> {
+    crate::library::list_artifacts(dir)
+        .into_iter()
+        .next()
+        .map(|a| PathBuf::from(a.path))
+        .ok_or_else(|| {
+            OpError::Backup(BackupError::Invalid(format!(
+                "no backups found in {}; this step has nothing to restore",
+                dir.display()
+            )))
+        })
+}
+
 // ── Masking ─────────────────────────────────────────────────────────────
 
 /// Decide what masking will do, and refuse anything it cannot do safely.
@@ -1079,17 +1552,42 @@ async fn plan_masking(
 
     request.validate_masking()?;
 
-    let tables_with_data: Vec<String> = request
-        .backup
-        .common
-        .tables_with_data()
-        .into_iter()
+    plan_masking_for(
+        source,
+        &request.backup.common.database,
+        &request.masking,
+        &request.backup.common.selections,
+        store,
+        ctx,
+    )
+    .await
+}
+
+/// The engine-agnostic half of [`plan_masking`].
+///
+/// Split out so a pipeline's mask step can use it: everything above this line
+/// is `SyncRequest` shape, and everything below is "given these rules and these
+/// selections, what will actually be masked".
+async fn plan_masking_for(
+    source: &ConnectionProfile,
+    database: &str,
+    rules: &[MaskRule],
+    selections: &[TableSelection],
+    store: &Store,
+    ctx: &JobContext,
+) -> Result<Option<MaskingCoverage>, OpError> {
+    if rules.is_empty() {
+        return Ok(None);
+    }
+
+    let tables_with_data: Vec<String> = selections
+        .iter()
+        .filter(|s| s.mode == crate::backup::TableMode::SchemaAndData)
         .map(|s| s.name.clone())
         .collect();
 
     // Only the tables a rule actually names and that carry data need looking up.
-    let wanted: std::collections::BTreeSet<String> = request
-        .masking
+    let wanted: std::collections::BTreeSet<String> = rules
         .iter()
         .map(|r| r.table.clone())
         .filter(|t| tables_with_data.contains(t))
@@ -1100,13 +1598,13 @@ async fn plan_masking(
         JobPhase::Initializing,
         format!(
             "checking {} masking rule(s) against the source schema",
-            request.masking.len()
+            rules.len()
         ),
     )
     .await;
 
-    let columns = source_columns(source, &request.backup.common.database, &wanted, store).await?;
-    let coverage = mask::plan_coverage(source.engine, &request.masking, &tables_with_data, &columns)?;
+    let columns = source_columns(source, database, &wanted, store).await?;
+    let coverage = mask::plan_coverage(source.engine, rules, &tables_with_data, &columns)?;
 
     for inert in &coverage.inert {
         ctx.emit_warn(

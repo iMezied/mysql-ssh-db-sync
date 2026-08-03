@@ -395,3 +395,34 @@ async fn a_step_outlives_a_job_that_was_never_recorded() {
             .get("detail_json");
     assert_eq!(detail, "{}", "a planned step starts with nothing to say");
 }
+
+#[tokio::test]
+async fn the_pipelines_migration_enforces_unique_names_from_the_start() {
+    // Unlike 0009, which had to rename existing collisions: pipelines are new,
+    // so there is nothing to reconcile and the constraint can be born strict.
+    let (mut conn, _dir) = conn().await;
+    apply_range(&mut conn, None, "0011").await;
+
+    sqlx::query(
+        "INSERT INTO pipelines (id, name, steps_json, created_at, updated_at) \
+         VALUES ('p1','refresh staging','[]','c','u')",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    let ack: Option<String> = sqlx::query("SELECT unattended_ack FROM pipelines WHERE id = 'p1'")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap()
+        .get("unattended_ack");
+    assert_eq!(ack, None, "a pipeline starts unarmed");
+
+    let err = sqlx::query(
+        "INSERT INTO pipelines (id, name, steps_json, created_at, updated_at) \
+         VALUES ('p2','refresh staging','[]','c','u')",
+    )
+    .execute(&mut conn)
+    .await;
+    assert!(err.is_err(), "two pipelines cannot share a name");
+}

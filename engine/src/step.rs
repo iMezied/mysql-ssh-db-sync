@@ -227,18 +227,36 @@ pub struct StepRecorder<'a> {
     plan: StepPlan,
     /// 0-based index of the step `begin` will start next.
     cursor: Mutex<usize>,
+    /// False when this operation is running inside somebody else's step.
+    ///
+    /// A pipeline can contain a drill, and `ops::drill` plans its own three
+    /// steps. Left enabled, that plan would replace the pipeline's — the write
+    /// is a delete-then-insert — and the run would report the drill's shape
+    /// instead of the chain's. Nested, the whole recorder goes quiet and the
+    /// nested operation's events keep the outer step's mark, which is the
+    /// honest answer: from the outside it *is* one step.
+    enabled: bool,
 }
 
 impl<'a> StepRecorder<'a> {
     /// Write the plan down, then hand back a recorder positioned before the
     /// first step.
+    ///
+    /// Does nothing at all when the context is already inside a step.
     pub async fn start(store: &'a Store, ctx: &'a JobContext, plan: StepPlan) -> Self {
+        let enabled = ctx.current_step().await.is_none();
         let recorder = Self {
             store,
             ctx,
             plan,
             cursor: Mutex::new(0),
+            enabled,
         };
+
+        if !enabled {
+            return recorder;
+        }
+
         if let Err(e) = store
             .plan_job_steps(ctx.job_id, recorder.plan.entries())
             .await
@@ -260,6 +278,9 @@ impl<'a> StepRecorder<'a> {
     /// against the plan: a plan and an execution order that disagree would
     /// silently mislabel every row from that point on.
     pub async fn begin(&self, kind: JobStepKind) {
+        if !self.enabled {
+            return;
+        }
         let index = {
             let mut cursor = self.cursor.lock().await;
             let index = *cursor;
@@ -312,6 +333,9 @@ impl<'a> StepRecorder<'a> {
     }
 
     async fn close(&self, outcome: JobStepOutcome, detail: JobStepDetail) {
+        if !self.enabled {
+            return;
+        }
         let number = *self.cursor.lock().await as u32;
         if number == 0 {
             debug_assert!(false, "closed a step before beginning one");

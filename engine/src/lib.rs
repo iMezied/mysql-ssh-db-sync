@@ -30,6 +30,7 @@ pub mod mask;
 pub mod notify;
 pub mod ops;
 pub mod paths;
+pub mod pipeline;
 pub mod plan;
 pub mod profile;
 pub mod restore;

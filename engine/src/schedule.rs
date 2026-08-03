@@ -268,7 +268,7 @@ pub struct ScheduleUpdate {
 /// A drill restores into a database it just created, so the destructive
 /// options that exist for real restores have nothing to act on and are left
 /// off rather than defaulted on.
-fn default_restore_options(engine: crate::types::Engine) -> EngineRestoreOptions {
+pub fn default_restore_options(engine: crate::types::Engine) -> EngineRestoreOptions {
     match engine {
         crate::types::Engine::Mysql => {
             EngineRestoreOptions::Mysql(crate::restore::MysqlRestoreOptions::default())
