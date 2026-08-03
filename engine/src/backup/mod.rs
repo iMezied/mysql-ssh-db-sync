@@ -289,6 +289,28 @@ pub struct BackupRequest {
     pub engine: EngineBackupOptions,
 }
 
+/// What `ops::backup` has resolved by the time it knows which engine will run.
+///
+/// One struct rather than seven loose parameters because all three engine
+/// entry points take exactly this set, and three of the seven are string-ish
+/// borrows that a caller can silently transpose. Widening the set is then one
+/// edit here instead of four in step.
+pub struct BackupRun<'a> {
+    pub profile: &'a ConnectionProfile,
+    pub request: &'a BackupRequest,
+    /// Already resolved — with a tunnel this is its local end, which is why
+    /// the engines take an endpoint rather than reaching for the profile's host.
+    pub endpoint: mysql::Endpoint,
+    pub server_version: String,
+    /// Public keys to encrypt the artifact to. Empty means no encryption.
+    pub recipients: &'a [String],
+    /// Exact source row counts, when the request asked for them. Empty
+    /// otherwise — see `CommonBackupOptions::record_row_counts`.
+    pub source_row_counts: &'a std::collections::BTreeMap<String, u64>,
+    /// Where the client binaries come from: this machine, or a container.
+    pub tools: &'a crate::tools::ToolSource,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum BackupError {
     #[error("profile engine is {profile:?} but options are for {options:?}")]

@@ -24,17 +24,15 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::{BackupError, BackupRequest, EngineBackupOptions, MongoBackupOptions, TableMode};
+use super::{BackupError, BackupRun, EngineBackupOptions, MongoBackupOptions, TableMode};
 use crate::backup::mysql::Endpoint;
 use crate::db::MONGO_AUTH_SOURCE;
 use crate::events::JobPhase;
 use crate::exec::{ChildHandle, ToolCommand, wait_checked};
 use crate::job::JobContext;
 use crate::manifest::{ArtifactFormat, BackupManifest, MANIFEST_VERSION, sha256_file};
-use crate::profile::ConnectionProfile;
 use crate::tools::{
-    CompatibilityVerdict, MountMode, ResolvedTool, Tool, ToolSource, Version,
-    check_mongodump_compatibility,
+    CompatibilityVerdict, MountMode, ResolvedTool, Tool, Version, check_mongodump_compatibility,
 };
 use crate::types::Engine;
 
@@ -130,17 +128,17 @@ enum DumpProgress {
 }
 
 /// Run a MongoDB backup.
-pub async fn run_mongo_backup(
-    profile: &ConnectionProfile,
-    request: &BackupRequest,
-    endpoint: Endpoint,
-    server_version: String,
-    recipients: &[String],
-    source_row_counts: &std::collections::BTreeMap<String, u64>,
-    // Where the client binaries come from: this machine, or a container.
-    tools: &ToolSource,
-    ctx: &JobContext,
-) -> Result<PathBuf, BackupError> {
+pub async fn run_mongo_backup(run: BackupRun<'_>, ctx: &JobContext) -> Result<PathBuf, BackupError> {
+    let BackupRun {
+        profile,
+        request,
+        endpoint,
+        server_version,
+        recipients,
+        source_row_counts,
+        tools,
+    } = run;
+
     request.validate(profile)?;
 
     let EngineBackupOptions::Mongo(options) = &request.engine else {
@@ -489,8 +487,9 @@ fn restrict_permissions(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backup::{CommonBackupOptions, TableSelection};
-    use crate::profile::{DbConfig, ToolOverrides};
+    use crate::backup::{BackupRequest, CommonBackupOptions, TableSelection};
+    use crate::profile::{ConnectionProfile, DbConfig, ToolOverrides};
+    use crate::tools::ToolSource;
     use crate::types::EnvironmentTag;
     use secrecy::SecretString;
 

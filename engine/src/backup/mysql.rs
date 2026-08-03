@@ -26,16 +26,13 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::{BackupError, BackupRequest, EngineBackupOptions, MysqlBackupOptions, TableSelection};
+use super::{BackupError, BackupRun, EngineBackupOptions, MysqlBackupOptions, TableSelection};
 use crate::definer;
 use crate::events::{JobPhase, ProgressEvent};
 use crate::exec::{ChildHandle, ToolCommand, wait_checked};
 use crate::job::JobContext;
 use crate::manifest::{ArtifactFormat, BackupManifest, MANIFEST_VERSION, sha256_file};
-use crate::profile::ConnectionProfile;
-use crate::tools::{
-    ResolvedTool, Tool, ToolSource, Version, mysql_needs_column_statistics_flag,
-};
+use crate::tools::{ResolvedTool, Tool, Version, mysql_needs_column_statistics_flag};
 use crate::types::Engine;
 
 /// Where the dump is being sent, once a tunnel (if any) is up.
@@ -82,23 +79,17 @@ enum DumpProgress {
 }
 
 /// Run a MySQL backup.
-///
-/// `endpoint` is already resolved — with a tunnel that is its local end, which
-/// is why this takes an endpoint rather than reaching for the profile's host.
-pub async fn run_mysql_backup(
-    profile: &ConnectionProfile,
-    request: &BackupRequest,
-    endpoint: Endpoint,
-    server_version: String,
-    // Public keys to encrypt the artifact to. Empty means no encryption.
-    recipients: &[String],
-    // Exact source row counts, when the request asked for them. Empty
-    // otherwise — see `CommonBackupOptions::record_row_counts`.
-    source_row_counts: &std::collections::BTreeMap<String, u64>,
-    // Where the client binaries come from: this machine, or a container.
-    tools: &ToolSource,
-    ctx: &JobContext,
-) -> Result<PathBuf, BackupError> {
+pub async fn run_mysql_backup(run: BackupRun<'_>, ctx: &JobContext) -> Result<PathBuf, BackupError> {
+    let BackupRun {
+        profile,
+        request,
+        endpoint,
+        server_version,
+        recipients,
+        source_row_counts,
+        tools,
+    } = run;
+
     request.validate(profile)?;
 
     let EngineBackupOptions::Mysql(options) = &request.engine else {
@@ -635,6 +626,7 @@ fn restrict_permissions(path: &Path) {
 mod tests {
     use super::*;
     use crate::backup::{CommonBackupOptions, TableMode};
+    use crate::tools::ToolSource;
 
     fn plan() -> DumpPlan {
         DumpPlan {

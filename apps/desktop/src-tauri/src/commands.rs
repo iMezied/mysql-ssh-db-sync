@@ -877,11 +877,9 @@ pub async fn active_job_ids(state: State<'_, AppState>) -> CmdResult<Vec<Uuid>> 
 #[specta::specta]
 pub async fn discover_tools(state: State<'_, AppState>) -> CmdResult<Vec<ToolStatus>> {
     let source = state.store.tool_source().await;
-    Ok(
-        tauri::async_runtime::spawn_blocking(move || db_sync_engine::tools::discover(&source))
-            .await
-            .map_err(|e| CommandError::new("tools", format!("tool discovery did not finish: {e}")))?,
-    )
+    tauri::async_runtime::spawn_blocking(move || db_sync_engine::tools::discover(&source))
+        .await
+        .map_err(|e| CommandError::new("tools", format!("tool discovery did not finish: {e}")))
 }
 
 /// The same, for a source the user is considering but has not saved.
@@ -892,11 +890,9 @@ pub async fn discover_tools(state: State<'_, AppState>) -> CmdResult<Vec<ToolSta
 #[tauri::command]
 #[specta::specta]
 pub async fn test_tool_source(source: ToolSource) -> CmdResult<Vec<ToolStatus>> {
-    Ok(
-        tauri::async_runtime::spawn_blocking(move || db_sync_engine::tools::discover(&source))
-            .await
-            .map_err(|e| CommandError::new("tools", format!("tool discovery did not finish: {e}")))?,
-    )
+    tauri::async_runtime::spawn_blocking(move || db_sync_engine::tools::discover(&source))
+        .await
+        .map_err(|e| CommandError::new("tools", format!("tool discovery did not finish: {e}")))
 }
 
 /// Running containers, for the exec source picker.

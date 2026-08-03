@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use crate::backup::mysql::Endpoint;
 use crate::backup::{
-    BackupError, BackupRequest, CommonBackupOptions, TableSelection, run_mongo_backup,
+    BackupError, BackupRequest, BackupRun, CommonBackupOptions, TableSelection, run_mongo_backup,
     run_mysql_backup, run_postgres_backup,
 };
 use crate::connect::{self, ConnectError};
@@ -260,47 +260,19 @@ pub async fn backup(
         BTreeMap::new()
     };
 
-    let endpoint = reachable.endpoint.clone();
+    let run = BackupRun {
+        profile,
+        request,
+        endpoint: reachable.endpoint.clone(),
+        server_version: version,
+        recipients: &recipients,
+        source_row_counts: &row_counts,
+        tools,
+    };
     let artifact = match profile.engine {
-        Engine::Mysql => {
-            run_mysql_backup(
-                profile,
-                request,
-                endpoint,
-                version,
-                &recipients,
-                &row_counts,
-                tools,
-                ctx,
-            )
-            .await?
-        }
-        Engine::Postgres => {
-            run_postgres_backup(
-                profile,
-                request,
-                endpoint,
-                version,
-                &recipients,
-                &row_counts,
-                tools,
-                ctx,
-            )
-            .await?
-        }
-        Engine::Mongo => {
-            run_mongo_backup(
-                profile,
-                request,
-                endpoint,
-                version,
-                &recipients,
-                &row_counts,
-                tools,
-                ctx,
-            )
-            .await?
-        }
+        Engine::Mysql => run_mysql_backup(run, ctx).await?,
+        Engine::Postgres => run_postgres_backup(run, ctx).await?,
+        Engine::Mongo => run_mongo_backup(run, ctx).await?,
     };
 
     Ok(artifact)

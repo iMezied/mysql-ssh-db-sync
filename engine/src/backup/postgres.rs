@@ -21,15 +21,14 @@ use uuid::Uuid;
 
 use super::mysql::Endpoint;
 use super::{
-    BackupError, BackupRequest, EngineBackupOptions, PgDumpFormat, PostgresBackupOptions, TableMode,
+    BackupError, BackupRun, EngineBackupOptions, PgDumpFormat, PostgresBackupOptions, TableMode,
 };
 use crate::events::{JobPhase, ProgressEvent};
 use crate::exec::{ChildHandle, ToolCommand, wait_checked};
 use crate::job::JobContext;
 use crate::manifest::{BackupManifest, MANIFEST_VERSION, sha256_file};
-use crate::profile::ConnectionProfile;
-use crate::tools::{MountMode,
-    CompatibilityVerdict, ResolvedTool, Tool, ToolSource, Version, check_pg_dump_compatibility,
+use crate::tools::{
+    CompatibilityVerdict, MountMode, ResolvedTool, Tool, Version, check_pg_dump_compatibility,
 };
 use crate::types::Engine;
 
@@ -59,19 +58,19 @@ enum DumpProgress {
 
 /// Run a PostgreSQL backup.
 pub async fn run_postgres_backup(
-    profile: &ConnectionProfile,
-    request: &BackupRequest,
-    endpoint: Endpoint,
-    server_version: String,
-    // Public keys to encrypt the artifact to. Empty means no encryption.
-    recipients: &[String],
-    // Exact source row counts, when the request asked for them. Empty
-    // otherwise — see `CommonBackupOptions::record_row_counts`.
-    source_row_counts: &std::collections::BTreeMap<String, u64>,
-    // Where the client binaries come from: this machine, or a container.
-    tools: &ToolSource,
+    run: BackupRun<'_>,
     ctx: &JobContext,
 ) -> Result<PathBuf, BackupError> {
+    let BackupRun {
+        profile,
+        request,
+        endpoint,
+        server_version,
+        recipients,
+        source_row_counts,
+        tools,
+    } = run;
+
     request.validate(profile)?;
 
     let EngineBackupOptions::Postgres(options) = &request.engine else {
@@ -593,6 +592,7 @@ fn restrict_permissions(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::ToolSource;
     use secrecy::SecretString;
 
     /// A tool pinned to a path that exists, so the fixture never depends on

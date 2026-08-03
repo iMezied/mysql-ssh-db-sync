@@ -1395,7 +1395,6 @@ async fn open_store(path: &std::path::Path) -> Result<Store> {
     Ok(store)
 }
 
-/// Find a profile by id or by a unique prefix of its name.
 // ── Pipelines ───────────────────────────────────────────────────────────
 
 async fn run_pipeline_command(store: &Store, cmd: PipelineCommand, json: bool) -> Result<()> {
@@ -1622,6 +1621,7 @@ async fn resolve_pipeline(
     }
 }
 
+/// Find a profile by id or by a unique prefix of its name.
 async fn resolve_profile(store: &Store, needle: &str) -> Result<db_sync_engine::ConnectionProfile> {
     if let Ok(id) = Uuid::parse_str(needle) {
         return Ok(store.require_profile(id).await?);

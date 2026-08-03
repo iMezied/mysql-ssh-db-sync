@@ -123,7 +123,7 @@ impl Tool {
 /// running on, not the database being talked to. A per-profile binary override
 /// still wins over whatever is set here — that one *is* about the database,
 /// which is why the two coexist.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolSource {
     /// Binaries installed on this machine.
@@ -131,6 +131,7 @@ pub enum ToolSource {
     /// The default, and the only one that works with no container runtime
     /// present. Changing the default would silently re-route every existing
     /// install through Docker.
+    #[default]
     Local,
     /// Borrow the binaries from a container that is already running.
     ///
@@ -150,12 +151,6 @@ pub enum ToolSource {
     /// Costs an image pull once and then always has the right client, with no
     /// dependency on anything else still running.
     DockerRun { image: String },
-}
-
-impl Default for ToolSource {
-    fn default() -> Self {
-        Self::Local
-    }
 }
 
 /// The hostname a container uses to reach the machine hosting it.

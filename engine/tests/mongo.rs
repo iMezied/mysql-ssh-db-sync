@@ -690,7 +690,7 @@ db_test! {
         let (dump, restore) = require_tools!();
 
         use db_sync_engine::backup::{
-            run_mongo_backup, BackupRequest, CommonBackupOptions, EngineBackupOptions,
+            run_mongo_backup, BackupRequest, BackupRun, CommonBackupOptions, EngineBackupOptions,
             MongoBackupOptions, TableSelection,
         };
         use db_sync_engine::job::JobContext;
@@ -728,13 +728,15 @@ db_test! {
         };
 
         let artifact = run_mongo_backup(
-            &profile,
-            &request,
-            endpoint(),
-            "7.0.0".into(),
-            &[],
-            &Default::default(),
-            &ToolSource::Local,
+            BackupRun {
+                profile: &profile,
+                request: &request,
+                endpoint: endpoint(),
+                server_version: "7.0.0".into(),
+                recipients: &[],
+                source_row_counts: &Default::default(),
+                tools: &ToolSource::Local,
+            },
             &ctx,
         )
         .await
@@ -841,7 +843,7 @@ db_test! {
         // refused for exactly the lack of it. Proving it end to end means
         // proving the age layer sits outside mongodump's own gzip.
         use db_sync_engine::backup::{
-            run_mongo_backup, BackupRequest, CommonBackupOptions, EngineBackupOptions,
+            run_mongo_backup, BackupRequest, BackupRun, CommonBackupOptions, EngineBackupOptions,
             MongoBackupOptions, TableSelection,
         };
         use db_sync_engine::job::JobContext;
@@ -870,13 +872,15 @@ db_test! {
         };
 
         let artifact = run_mongo_backup(
-            &profile,
-            &request,
-            endpoint(),
-            "7.0.0".into(),
-            std::slice::from_ref(&recipient),
-            &Default::default(),
-            &ToolSource::Local,
+            BackupRun {
+                profile: &profile,
+                request: &request,
+                endpoint: endpoint(),
+                server_version: "7.0.0".into(),
+                recipients: std::slice::from_ref(&recipient),
+                source_row_counts: &Default::default(),
+                tools: &ToolSource::Local,
+            },
             &ctx,
         )
         .await
