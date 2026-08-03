@@ -1607,7 +1607,8 @@ impl Store {
 
 /// Every column the row mapper needs, in one place, so the four queries below
 /// cannot drift apart from each other or from [`row_to_schedule`].
-const SCHEDULE_COLUMNS: &str = "id, name, kind, sync_plan_id, dest_profile_id, cron_expression, \
+const SCHEDULE_COLUMNS: &str = "id, name, kind, sync_plan_id, dest_profile_id, pipeline_id, \
+     cron_expression, \
      timezone, enabled, action_json, webhook_url, notify, catch_up, last_run_at, last_outcome, \
      last_job_id, created_at, updated_at";
 
@@ -1641,11 +1642,45 @@ impl Store {
             .ok_or(StoreError::ScheduleNotFound(id))
     }
 
+    /// Refuse to store a schedule that would drop a database unattended
+    /// without a person having authorised it.
+    ///
+    /// Checked on every write rather than only on create: a pipeline can be
+    /// re-pointed at a real database after the schedule exists, and
+    /// `update_pipeline` clearing the acknowledgment is what makes this catch
+    /// it. Also checked again at run time by the scheduler, because the
+    /// pipeline can change between the two.
+    async fn check_pipeline_target(
+        &self,
+        kind: ScheduleKind,
+        pipeline_id: Option<Uuid>,
+    ) -> Result<()> {
+        if kind != ScheduleKind::Pipeline {
+            return Ok(());
+        }
+        let Some(id) = pipeline_id else {
+            return Ok(()); // `validate` already reports the missing pipeline.
+        };
+        let pipeline = self.require_pipeline(id).await?;
+
+        if pipeline.is_destructive() && !pipeline.is_armed() {
+            return Err(StoreError::InvalidSchedule(
+                crate::schedule::ScheduleError::PipelineNotArmed {
+                    targets: pipeline.destructive_targets().join(", "),
+                    name: pipeline.name,
+                },
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn create_schedule(&self, input: ScheduleCreate) -> Result<Schedule> {
         // Refuse to persist something that could never safely run. Validating
         // only in the UI would leave the CLI able to write an unattended
         // drop-and-recreate straight into the table.
         input.validate().map_err(StoreError::InvalidSchedule)?;
+        self.check_pipeline_target(input.kind, input.pipeline_id)
+            .await?;
 
         let now = Utc::now();
         let schedule = Schedule {
@@ -1654,6 +1689,7 @@ impl Store {
             kind: input.kind,
             plan_id: input.plan_id,
             dest_profile_id: input.dest_profile_id,
+            pipeline_id: input.pipeline_id,
             cron: input.cron,
             timezone: input.timezone,
             enabled: input.enabled,
@@ -1669,16 +1705,17 @@ impl Store {
         };
 
         sqlx::query(
-            "INSERT INTO schedules (id, name, kind, sync_plan_id, dest_profile_id, \
+            "INSERT INTO schedules (id, name, kind, sync_plan_id, dest_profile_id, pipeline_id, \
              cron_expression, timezone, enabled, action_json, webhook_url, notify, catch_up, \
              created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         )
         .bind(schedule.id.to_string())
         .bind(&schedule.name)
         .bind(schedule.kind.as_str())
         .bind(schedule.plan_id.map(|u| u.to_string()))
         .bind(schedule.dest_profile_id.map(|u| u.to_string()))
+        .bind(schedule.pipeline_id.map(|u| u.to_string()))
         .bind(schedule.cron.as_str())
         .bind(schedule.timezone.as_str())
         .bind(schedule.enabled)
@@ -1804,6 +1841,7 @@ fn row_to_schedule(row: sqlx::sqlite::SqliteRow) -> Result<Schedule> {
     let kind_raw: String = row.get("kind");
     let plan_raw: Option<String> = row.get("sync_plan_id");
     let dest_raw: Option<String> = row.get("dest_profile_id");
+    let pipeline_raw: Option<String> = row.get("pipeline_id");
     let last_run_raw: Option<String> = row.get("last_run_at");
     let last_outcome_raw: Option<String> = row.get("last_outcome");
     let last_job_raw: Option<String> = row.get("last_job_id");
@@ -1825,6 +1863,9 @@ fn row_to_schedule(row: sqlx::sqlite::SqliteRow) -> Result<Schedule> {
             .transpose()?,
         dest_profile_id: dest_raw
             .map(|s| parse_uuid(&s, "dest_profile_id"))
+            .transpose()?,
+        pipeline_id: pipeline_raw
+            .map(|s| parse_uuid(&s, "pipeline_id"))
             .transpose()?,
         // A cron expression that no longer parses is corruption, not "never
         // run". Reporting it beats a schedule that silently stops firing.

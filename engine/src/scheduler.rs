@@ -345,6 +345,12 @@ impl Scheduler {
             return self.perform_drill(schedule, ctx, job_id).await;
         }
 
+        // A pipeline carries its own connections and selections, so it is
+        // routed before the plan lookup for the same reason a drill is.
+        if schedule.is_pipeline() {
+            return self.perform_pipeline(schedule, ctx).await;
+        }
+
         // Every one of these lookups can fail because something the schedule
         // points at was deleted. Each gets its own message naming what is
         // missing — "not found" alone would send the user hunting.
@@ -560,6 +566,101 @@ impl Scheduler {
     /// the pattern it generated, so a schedule cannot aim one at a real
     /// database. `Schedule::validate` refuses restore target options for the
     /// same reason.
+    /// Run a saved chain on a schedule.
+    ///
+    /// The confirmations come from the pipeline's own acknowledgment — the
+    /// names a person typed back when they armed it. Re-checked here rather
+    /// than trusted from when the schedule was made: the pipeline can be
+    /// re-pointed at a different database in between, and `update_pipeline`
+    /// clearing the acknowledgment is what makes that land as a refusal
+    /// instead of a drop nobody agreed to.
+    async fn perform_pipeline(
+        &self,
+        schedule: &Schedule,
+        ctx: &JobContext,
+    ) -> Result<RunResult, String> {
+        let pipeline_id = schedule
+            .pipeline_id
+            .ok_or("this pipeline schedule has no pipeline; it cannot run")?;
+        let pipeline = self
+            .store
+            .get_pipeline(pipeline_id)
+            .await
+            .map_err(|e| format!("could not read the pipeline: {e}"))?
+            .ok_or("the pipeline this schedule runs has been deleted")?;
+
+        schedule
+            .validate_pipeline_target(&pipeline)
+            .map_err(|e| e.to_string())?;
+
+        let confirmations = pipeline
+            .unattended_ack
+            .as_deref()
+            .map(|ack| ack.lines().map(str::to_string).collect())
+            .unwrap_or_default();
+
+        // Attributed to the first connection a step names and the last one, so
+        // history reads the same as a manual run of the same chain.
+        let source = pipeline
+            .steps
+            .iter()
+            .find_map(|s| s.profile_id())
+            .ok_or("this pipeline touches no connection")?;
+        let dest = pipeline.steps.iter().rev().find_map(|s| s.profile_id());
+
+        crate::ops::record_start(
+            &self.store,
+            ctx,
+            JobKind::Sync,
+            source,
+            dest,
+            serde_json::json!({ "pipeline": pipeline.name, "steps": pipeline.steps.len() })
+                .to_string(),
+        )
+        .await
+        .map_err(|e| format!("could not record the job: {e}"))?;
+
+        let request = crate::ops::PipelineRunRequest {
+            typed_confirmations: confirmations,
+            default_output_dir: schedule.action.output_dir.clone(),
+        };
+        let tools = self.store.tool_source().await;
+        let outcome = crate::ops::run_pipeline(&pipeline, &request, &self.store, &tools, ctx).await;
+
+        Ok(match outcome {
+            Ok(done) => {
+                // Asked once, before the parts are moved out: a run whose
+                // verification failed is not a success, and the message has to
+                // agree with the outcome.
+                let succeeded = done.fully_succeeded();
+                RunResult {
+                    outcome: match succeeded {
+                        true => JobOutcome::Success,
+                        false => JobOutcome::Failed,
+                    },
+                    artifact: done.artifacts.last().map(std::path::PathBuf::from),
+                    target_database: done.databases.last().cloned(),
+                    verification: done.verification,
+                    removed_artifacts: done.removed_artifacts.len(),
+                    error: match succeeded {
+                        true => None,
+                        false => Some(
+                            "the pipeline ran but not every step did what it claimed".to_string(),
+                        ),
+                    },
+                }
+            }
+            Err(e) => RunResult {
+                outcome: JobOutcome::Failed,
+                artifact: None,
+                target_database: None,
+                verification: None,
+                removed_artifacts: 0,
+                error: Some(e.to_string()),
+            },
+        })
+    }
+
     async fn perform_drill(
         &self,
         schedule: &Schedule,

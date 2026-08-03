@@ -15,6 +15,7 @@ import {
 
 import PageHeader from "@/components/PageHeader";
 import { api } from "@/lib/api";
+import { destructiveTargets, isArmed } from "@/lib/pipeline";
 import { useProgressStore } from "@/lib/jobProgress";
 import { cn } from "@/lib/utils";
 import { events } from "@/bindings";
@@ -155,7 +156,7 @@ function ScheduleRow({ view }: { view: ScheduleView }) {
     onSuccess: (jobId) => {
       invalidate();
       noteLaunch(jobId, {
-        title: schedule.kind === "drill" ? "Drill" : "Scheduled run",
+        title: SCHEDULE_KIND_LABELS[schedule.kind ?? "sync"],
         detail: schedule.name,
       });
       navigate(`/jobs/${jobId}`);
@@ -307,6 +308,17 @@ function ScheduleRow({ view }: { view: ScheduleView }) {
  * plan is a first-class operation on the Sync page rather than something buried
  * in a second editor that could drift from it.
  */
+/**
+ * Exhaustive on purpose. The two-way ternary this replaced rendered a pipeline
+ * schedule as "Scheduled run" — a third kind has to be a compile error, not a
+ * wrong label on the row that tells somebody what runs at 04:00.
+ */
+const SCHEDULE_KIND_LABELS: Record<ScheduleKind, string> = {
+  sync: "Scheduled run",
+  drill: "Drill",
+  pipeline: "Pipeline",
+};
+
 function ScheduleForm({ onClose }: { onClose: () => void }) {
   const queryClient = useQueryClient();
 
@@ -328,14 +340,29 @@ function ScheduleForm({ onClose }: { onClose: () => void }) {
   const [drillProfileId, setDrillProfileId] = useState("");
   const [drillDeep, setDrillDeep] = useState(false);
   const [drillKeepOnFailure, setDrillKeepOnFailure] = useState(false);
+  // Pipeline-only.
+  const [pipelineId, setPipelineId] = useState("");
 
   const isDrill = kind === "drill";
+  const isPipeline = kind === "pipeline";
 
   const profiles = useQuery({ queryKey: ["profiles"], queryFn: api.listProfiles });
   const backupDir = useQuery({
     queryKey: ["backup-dir"],
     queryFn: api.backupDirectory,
   });
+  const pipelines = useQuery({
+    queryKey: ["pipelines"],
+    queryFn: api.listPipelines,
+  });
+  const chosenPipeline = pipelines.data?.find((p) => p.id === pipelineId) ?? null;
+  // Refused by the engine, so saying it here is about the fix being one click
+  // away rather than about enforcement.
+  const needsArming =
+    chosenPipeline != null &&
+    destructiveTargets(chosenPipeline.steps).length > 0 &&
+    !isArmed(chosenPipeline);
+
   const plans = useQuery({
     queryKey: ["sync-plans", sourceId],
     queryFn: () => api.listSyncPlans(sourceId),
@@ -404,6 +431,33 @@ function ScheduleForm({ onClose }: { onClose: () => void }) {
             catch_up: false,
             enabled: true,
           }
+        : isPipeline
+        ? {
+            kind: "pipeline",
+            name,
+            // The steps carry their own connections and table selections, so
+            // the engine refuses a schedule that also names them here.
+            plan_id: null,
+            dest_profile_id: null,
+            pipeline_id: pipelineId,
+            cron,
+            timezone,
+            action: {
+              output_dir: backupDir.data ?? "",
+              compress: true,
+              encrypt: false,
+              backup: engineBackupOptions(),
+              restore: null,
+              verify: false,
+              retention: null,
+              record_row_counts: false,
+              keep_on_failure: false,
+            },
+            webhook_url: webhook.trim() === "" ? null : webhook.trim(),
+            notify,
+            catch_up: catchUp,
+            enabled: true,
+          }
         : {
         kind: "sync",
         name,
@@ -444,7 +498,9 @@ function ScheduleForm({ onClose }: { onClose: () => void }) {
   });
 
   const cronValid = preview.isSuccess;
-  const ready = isDrill
+  const ready = isPipeline
+    ? name.trim() !== "" && pipelineId !== "" && cronValid && !needsArming
+    : isDrill
     ? name.trim() !== "" && drillProfileId !== "" && cronValid
     : name.trim() !== "" &&
       planId !== "" &&
@@ -488,8 +544,38 @@ function ScheduleForm({ onClose }: { onClose: () => void }) {
           >
             <option value="sync">Back up — and optionally restore elsewhere</option>
             <option value="drill">Drill — prove the newest backup restores</option>
+            <option value="pipeline">Pipeline — run a saved chain of actions</option>
           </select>
         </label>
+
+        {isPipeline && (
+          <label className="block">
+            <span className="field-label">Pipeline</span>
+            <select
+              className="field-input"
+              value={pipelineId}
+              onChange={(e) => setPipelineId(e.target.value)}
+            >
+              <option value="">Choose a pipeline…</option>
+              {pipelines.data?.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
+            {needsArming && chosenPipeline && (
+              // The engine refuses this outright. Saying it here is so the
+              // fix — authorising it on the Pipelines page — is one click
+              // away rather than discovered on Save.
+              <span className="mt-1 block text-xs leading-relaxed text-amber-300/90">
+                {chosenPipeline.name} replaces{" "}
+                {destructiveTargets(chosenPipeline.steps).join(", ")}, and
+                nobody is present at the scheduled time to confirm that.
+                Authorise it for unattended runs on the Pipelines page first.
+              </span>
+            )}
+          </label>
+        )}
 
         <label className="block">
           <span className="field-label">Name</span>

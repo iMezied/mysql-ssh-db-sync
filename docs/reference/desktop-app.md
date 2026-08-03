@@ -31,6 +31,12 @@ for key-file auth.
 Deleting one that is still referenced is refused, and the error names every
 holder.
 
+## Table sets
+
+Named, reusable table selections. Four things consume one — Backup, Sync,
+Schedules and Restore — so the editor lives on its own page. Tables a set does
+not list are backed up **with their data**.
+
 ## Backup
 
 Pick a connection and a database, choose tables, choose compression, encryption
@@ -52,6 +58,21 @@ data table. Running a sync backs up and restores in one job, with optional
 verification.
 
 An existing `tables.conf` can be imported rather than re-ticked.
+
+## Pipelines
+
+A saved, ordered list of steps run as one job. Add, reorder and remove steps;
+Save is disabled with the reason on screen while the chain cannot run.
+
+Unlike Sync, a restore step here may **replace** a database. That puts a
+`destroys data` badge on the step and asks for the target's name to be typed
+back before Run works, every run.
+
+**Unattended runs** under Run authorises a destructive pipeline for schedules
+and `dbsync`. What is stored is the database names, so editing a destructive
+step revokes it.
+
+See [Pipelines](../guides/pipelines.md).
 
 ## Schedules
 
@@ -86,6 +107,12 @@ destination with no credential is refused before it is stored.
 ## Jobs
 
 Run history with per-step detail and outcomes. Cancel a running job here.
+
+## Job detail
+
+Where every Run button lands. Shows the outcome, the elapsed time, the steps a
+composite job is made of — each with its status, duration and result — and the
+timeline. Selecting a step narrows the timeline to it.
 
 ## Settings
 

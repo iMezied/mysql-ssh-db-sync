@@ -1391,6 +1391,16 @@ export type Schedule = {
 	 *  replication job to a local backup and nobody would notice for months.
 	 */
 	dest_profile_id: string | null,
+	/**
+	 *  The chain this schedule runs. Required for a pipeline schedule and
+	 *  always absent otherwise.
+	 * 
+	 *  Deliberately not a foreign key, for the same reason `dest_profile_id`
+	 *  is not: a deleted pipeline has to make the next run fail loudly rather
+	 *  than leave a schedule that still looks configured and quietly does
+	 *  nothing.
+	 */
+	pipeline_id?: string | null,
 	cron: string,
 	timezone: ScheduleTimezone,
 	enabled: boolean,
@@ -1448,6 +1458,7 @@ export type ScheduleCreate = {
 	kind?: ScheduleKind,
 	plan_id: string | null,
 	dest_profile_id: string | null,
+	pipeline_id?: string | null,
 	cron: string,
 	timezone?: ScheduleTimezone,
 	action: ScheduleAction,
@@ -1474,7 +1485,14 @@ export type ScheduleKind =
  */
 "sync" | 
 /**  Restore the newest artifact into a scratch database, check it, drop it. */
-"drill";
+"drill" | 
+/**
+ *  Run a saved chain of actions.
+ * 
+ *  The only kind that may destroy a database unattended, and only while the
+ *  pipeline is armed. See [`ScheduleError::PipelineNotArmed`].
+ */
+"pipeline";
 
 /**  The restore half of a scheduled sync. */
 export type ScheduleRestore = {

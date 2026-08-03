@@ -12,6 +12,7 @@ use chrono::{Duration, Utc};
 use db_sync_engine::backup::{EngineBackupOptions, MysqlBackupOptions, TableSelection};
 use db_sync_engine::cron::ScheduleTimezone;
 use db_sync_engine::job::JobOutcome;
+use db_sync_engine::pipeline::PipelineCreate;
 use db_sync_engine::plan::SyncPlanCreate;
 use db_sync_engine::profile::{DbConfig, ProfileCreate, ToolOverrides};
 use db_sync_engine::restore::{EngineRestoreOptions, MysqlRestoreOptions, TargetNaming};
@@ -114,6 +115,7 @@ fn safe_restore() -> ScheduleRestore {
 
 fn backup_only(plan_id: Uuid, cron: &str) -> ScheduleCreate {
     ScheduleCreate {
+        pipeline_id: None,
         name: "nightly backup".into(),
         kind: ScheduleKind::Sync,
         plan_id: Some(plan_id),
@@ -164,6 +166,7 @@ async fn a_schedule_survives_a_round_trip_intact() {
 
     let created = store
         .create_schedule(ScheduleCreate {
+        pipeline_id: None,
             kind: ScheduleKind::Sync,
             name: "staging refresh".into(),
             plan_id: Some(plan_id),
@@ -239,6 +242,7 @@ async fn a_destructive_schedule_cannot_be_created() {
 
     let result = store
         .create_schedule(ScheduleCreate {
+        pipeline_id: None,
             kind: ScheduleKind::Sync,
             name: "dangerous".into(),
             plan_id: Some(plan_id),
@@ -279,6 +283,7 @@ async fn a_schedule_cannot_be_edited_into_a_destructive_one() {
 
     let created = store
         .create_schedule(ScheduleCreate {
+        pipeline_id: None,
             kind: ScheduleKind::Sync,
             name: "staging refresh".into(),
             plan_id: Some(plan_id),
@@ -584,6 +589,7 @@ async fn deleting_a_destination_profile_leaves_the_schedule_in_place() {
 
     let created = store
         .create_schedule(ScheduleCreate {
+        pipeline_id: None,
             kind: ScheduleKind::Sync,
             name: "staging refresh".into(),
             plan_id: Some(plan_id),
@@ -632,4 +638,207 @@ async fn requiring_a_missing_schedule_names_the_id() {
         Err(StoreError::ScheduleNotFound(got)) => assert_eq!(got, id),
         other => panic!("expected ScheduleNotFound, got {other:?}"),
     }
+}
+
+// ── Pipeline schedules ──────────────────────────────────────────────────
+
+/// A connection for pipeline steps to point at.
+async fn pipeline_profile(store: &Store) -> Uuid {
+    store
+        .create_profile(ProfileCreate {
+            name: "pipeline-src".into(),
+            engine: Engine::Mysql,
+            environment: EnvironmentTag::Dev,
+            ssh_connection_id: None,
+            db: DbConfig {
+                host: "10.0.0.9".into(),
+                port: 3306,
+                user: "root".into(),
+                database: Some("app".into()),
+            },
+            tool_overrides: ToolOverrides::default(),
+        })
+        .await
+        .unwrap()
+        .id
+}
+
+fn replace_pipeline(profile: Uuid, target: &str) -> PipelineCreate {
+    use db_sync_engine::backup::{EngineBackupOptions, MysqlBackupOptions};
+    use db_sync_engine::pipeline::{ArtifactSource, PipelineStep};
+    use db_sync_engine::restore::{EngineRestoreOptions, MysqlRestoreOptions, TargetNaming};
+
+    PipelineCreate {
+        name: format!("refresh {target}"),
+        steps: vec![
+            PipelineStep::Backup {
+                profile_id: profile,
+                database: "app".into(),
+                plan_id: None,
+                selections: Vec::new(),
+                output_dir: None,
+                compress: true,
+                encrypt: false,
+                record_row_counts: false,
+                engine: EngineBackupOptions::Mysql(MysqlBackupOptions::default()),
+            },
+            PipelineStep::Restore {
+                profile_id: profile,
+                source: ArtifactSource::PreviousStep,
+                naming: TargetNaming::DropAndRecreate { name: target.into() },
+                engine: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
+                verify_checksum: true,
+            },
+        ],
+    }
+}
+
+fn pipeline_schedule(pipeline_id: Uuid, cron: &str) -> ScheduleCreate {
+    ScheduleCreate {
+        name: "nightly refresh".into(),
+        kind: ScheduleKind::Pipeline,
+        plan_id: None,
+        dest_profile_id: None,
+        pipeline_id: Some(pipeline_id),
+        cron: cron.parse().unwrap(),
+        timezone: ScheduleTimezone::Local,
+        enabled: true,
+        action: action(None),
+        webhook_url: None,
+        notify: NotifyPolicy::OnFailure,
+        catch_up: false,
+    }
+}
+
+#[tokio::test]
+async fn an_unarmed_destructive_pipeline_cannot_be_scheduled() {
+    // Every other kind of schedule is refused a destructive target outright.
+    // A pipeline may carry one, but only once a person has typed the names
+    // back — otherwise this is exactly the 04:00 drop nobody agreed to.
+    let (store, _dir) = store().await;
+    let profile = pipeline_profile(&store).await;
+    let pipeline = store
+        .create_pipeline(replace_pipeline(profile, "staging"))
+        .await
+        .unwrap();
+
+    let err = store
+        .create_schedule(pipeline_schedule(pipeline.id, "0 4 * * *"))
+        .await
+        .expect_err("an unarmed replace must not become an unattended job");
+
+    let message = err.to_string();
+    assert!(message.contains("staging"), "it must name what it would drop: {message}");
+    assert!(
+        message.contains("Authorise"),
+        "and say how to fix it: {message}"
+    );
+}
+
+#[tokio::test]
+async fn an_armed_pipeline_can_be_scheduled() {
+    let (store, _dir) = store().await;
+    let profile = pipeline_profile(&store).await;
+    let pipeline = store
+        .create_pipeline(replace_pipeline(profile, "staging"))
+        .await
+        .unwrap();
+    store.arm_pipeline(pipeline.id, Some("staging")).await.unwrap();
+
+    let schedule = store
+        .create_schedule(pipeline_schedule(pipeline.id, "0 4 * * *"))
+        .await
+        .expect("an armed pipeline may run unattended");
+
+    assert_eq!(schedule.pipeline_id, Some(pipeline.id));
+    assert!(schedule.is_pipeline());
+    assert_eq!(
+        store.require_schedule(schedule.id).await.unwrap().pipeline_id,
+        Some(pipeline.id),
+        "the pipeline reference survives the round trip"
+    );
+}
+
+#[tokio::test]
+async fn disarming_a_pipeline_stops_its_schedule_at_the_next_run() {
+    // The schedule row stays; what changes is that the run refuses. Deleting
+    // the schedule instead would lose a cron expression somebody wrote, and
+    // withdrawing authorisation is not the same as saying "never again".
+    let (store, _dir) = store().await;
+    let profile = pipeline_profile(&store).await;
+    let pipeline = store
+        .create_pipeline(replace_pipeline(profile, "staging"))
+        .await
+        .unwrap();
+    store.arm_pipeline(pipeline.id, Some("staging")).await.unwrap();
+    let schedule = store
+        .create_schedule(pipeline_schedule(pipeline.id, "0 4 * * *"))
+        .await
+        .unwrap();
+
+    store.arm_pipeline(pipeline.id, None).await.unwrap();
+
+    let disarmed = store.require_pipeline(pipeline.id).await.unwrap();
+    assert!(
+        schedule.validate_pipeline_target(&disarmed).is_err(),
+        "the run has to refuse once authorisation is withdrawn"
+    );
+    assert!(
+        store.require_schedule(schedule.id).await.is_ok(),
+        "the schedule itself is untouched"
+    );
+}
+
+#[tokio::test]
+async fn a_non_destructive_pipeline_needs_no_arming() {
+    use db_sync_engine::backup::{EngineBackupOptions, MysqlBackupOptions};
+    use db_sync_engine::pipeline::PipelineStep;
+
+    let (store, _dir) = store().await;
+    let profile = pipeline_profile(&store).await;
+    let pipeline = store
+        .create_pipeline(PipelineCreate {
+            name: "just a backup".into(),
+            steps: vec![PipelineStep::Backup {
+                profile_id: profile,
+                database: "app".into(),
+                plan_id: None,
+                selections: Vec::new(),
+                output_dir: None,
+                compress: true,
+                encrypt: false,
+                record_row_counts: false,
+                engine: EngineBackupOptions::Mysql(MysqlBackupOptions::default()),
+            }],
+        })
+        .await
+        .unwrap();
+
+    store
+        .create_schedule(pipeline_schedule(pipeline.id, "0 4 * * *"))
+        .await
+        .expect("a chain that destroys nothing has nothing to authorise");
+}
+
+#[tokio::test]
+async fn a_pipeline_schedule_takes_no_plan_or_destination() {
+    let (store, _dir) = store().await;
+    let profile = pipeline_profile(&store).await;
+    let pipeline = store
+        .create_pipeline(replace_pipeline(profile, "staging"))
+        .await
+        .unwrap();
+    store.arm_pipeline(pipeline.id, Some("staging")).await.unwrap();
+
+    // The steps already say which connections they touch. Accepting a second
+    // answer here would be two sources of truth, and the loser would lose
+    // silently.
+    let mut input = pipeline_schedule(pipeline.id, "0 4 * * *");
+    input.dest_profile_id = Some(profile);
+
+    let err = store
+        .create_schedule(input)
+        .await
+        .expect_err("a pipeline schedule carries nothing else");
+    assert!(err.to_string().contains("carries its own"), "got {err}");
 }

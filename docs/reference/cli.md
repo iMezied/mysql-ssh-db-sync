@@ -29,6 +29,7 @@ the binary wins.
 | `strip-definers` | Strip `DEFINER=` clauses from a MySQL dump on stdin |
 | `schedule` | Inspect and run scheduled jobs |
 | `drill` | Prove the newest backup in a directory actually restores |
+| `pipeline` | List, inspect and run saved chains of actions |
 | `backup` | Back up a database to an artifact on disk |
 | `restore` | Restore an artifact into a database |
 | `mask` | Manage the masking rules on a sync plan |
@@ -120,6 +121,43 @@ list means "all of it".
 
 Exits non-zero if the restore or the check failed. A passing drill always cleans
 up.
+
+---
+
+## `dbsync pipeline <SUBCOMMAND>`
+
+| Subcommand | What it does |
+|---|---|
+| `list` | Saved pipelines, with what each replaces and whether it is armed |
+| `show <PIPELINE>` | The chain step by step, and what a run would need |
+| `run <PIPELINE>` | Run it now |
+
+`run` options:
+
+| Option | Effect |
+|---|---|
+| `--confirm <NAME>` | A database this pipeline replaces, typed back. Repeat once per destructive step, in the order they appear |
+| `--dir <PATH>` | Where a backup step writes when it names no directory of its own |
+
+`<PIPELINE>` is an id or a unique prefix of the name. An ambiguous prefix is
+refused rather than guessed — guessing could start a chain that drops a
+database.
+
+Exits non-zero when any step failed or a check did not pass.
+
+Pipelines are **created in the app**, not here. The option surface is large,
+and a second construction path is a second place for the destructive target
+check to be forgotten — the same reasoning as schedules.
+
+A pipeline that replaces a database needs `--confirm` for each target, or to
+have been **armed** in the app for unattended runs. An armed one runs with no
+arguments:
+
+```bash
+dbsync pipeline run "refresh staging"
+```
+
+See [Pipelines](../guides/pipelines.md).
 
 ---
 

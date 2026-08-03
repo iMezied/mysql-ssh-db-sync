@@ -4,10 +4,12 @@ Cross-server database backup, restore and sync for MySQL, PostgreSQL and
 MongoDB — a desktop app for DBAs, plus a headless CLI that does exactly the
 same things.
 
-> **Status: M15.** MySQL, PostgreSQL and MongoDB backup and restore work end
+> **Status: M18.** MySQL, PostgreSQL and MongoDB backup and restore work end
 > to end over SSH tunnels; cross-server sync runs as one job with verification
 > and retention. Scheduling, packaging, encryption at rest, content
-> verification, restore drills and column masking are in. See the
+> verification, restore drills and column masking are in. Saved pipelines chain
+> those operations into one named, cancellable job, and are the only thing here
+> that may replace a destination database. See the
 > [roadmap](#roadmap) for what is outstanding. The original Bash tool in this
 > repo still works and is unchanged; see [Legacy tool](#legacy-tool).
 
@@ -783,6 +785,9 @@ a schedule that comes due, moves data, verifies it, and enforces retention.
 | **M13** | Shareable configuration export/import carrying no credentials, audit trail | **Done** |
 | **M14** | MongoDB: introspection, `mongodump`/`mongorestore`, verification, masking, CLI and GUI. SQL Server still not attempted | **Partly done** |
 | **M15** | Saved SSH servers, shared by reference and adopted from existing configurations | **Done** |
+| **M16** | Client tools run from a container, with every host path translated | **Done** |
+| **M17** | Table sets get their own page; a `tables.conf` import that means what the file means | **Done** |
+| **M18** | Pipelines: saved chains of actions, step-by-step progress, replacing a destination with the name typed back, and unattended runs once armed | **Done** |
 
 **MongoDB is supported; SQL Server is not**, and the split is not arbitrary.
 MongoDB fit because `mongodump --archive` produces a single client-side stream,

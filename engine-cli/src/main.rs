@@ -2522,6 +2522,7 @@ async fn run_schedule_command(cmd: ScheduleCommand, store: &Store, json: bool) -
 
             let created = store
                 .create_schedule(ScheduleCreate {
+                    pipeline_id: None,
                     kind: ScheduleKind::Drill,
                     name,
                     // A drill has no plan; the artifact fixes what it holds.

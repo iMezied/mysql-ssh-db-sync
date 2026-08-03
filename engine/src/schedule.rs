@@ -87,6 +87,11 @@ pub enum ScheduleKind {
     Sync,
     /// Restore the newest artifact into a scratch database, check it, drop it.
     Drill,
+    /// Run a saved chain of actions.
+    ///
+    /// The only kind that may destroy a database unattended, and only while the
+    /// pipeline is armed. See [`ScheduleError::PipelineNotArmed`].
+    Pipeline,
 }
 
 impl ScheduleKind {
@@ -94,6 +99,7 @@ impl ScheduleKind {
         match self {
             ScheduleKind::Sync => "sync",
             ScheduleKind::Drill => "drill",
+            ScheduleKind::Pipeline => "pipeline",
         }
     }
 
@@ -101,6 +107,7 @@ impl ScheduleKind {
         match s {
             "sync" => Some(ScheduleKind::Sync),
             "drill" => Some(ScheduleKind::Drill),
+            "pipeline" => Some(ScheduleKind::Pipeline),
             _ => None,
         }
     }
@@ -175,6 +182,18 @@ pub enum ScheduleError {
         plan_engine: crate::types::Engine,
         options: crate::types::Engine,
     },
+    #[error("a pipeline schedule needs a pipeline; it is where the steps come from")]
+    PipelineRequired,
+    #[error(
+        "a pipeline carries its own connections and table selections, so a pipeline schedule \
+         takes no sync plan, no destination and no restore options"
+    )]
+    PipelineTakesNothingElse,
+    #[error(
+        "{name:?} replaces {targets}, and nobody is present at the scheduled time to confirm \
+         that. Authorise it for unattended runs on the Pipelines page first"
+    )]
+    PipelineNotArmed { name: String, targets: String },
     #[error("{0:?} is not a usable webhook URL: {1}")]
     BadWebhook(String, String),
 }
@@ -201,6 +220,15 @@ pub struct Schedule {
     /// column quietly set to NULL — which would silently downgrade a
     /// replication job to a local backup and nobody would notice for months.
     pub dest_profile_id: Option<Uuid>,
+    /// The chain this schedule runs. Required for a pipeline schedule and
+    /// always absent otherwise.
+    ///
+    /// Deliberately not a foreign key, for the same reason `dest_profile_id`
+    /// is not: a deleted pipeline has to make the next run fail loudly rather
+    /// than leave a schedule that still looks configured and quietly does
+    /// nothing.
+    #[serde(default)]
+    pub pipeline_id: Option<Uuid>,
     #[specta(type = String)]
     pub cron: CronExpression,
     pub timezone: ScheduleTimezone,
@@ -225,6 +253,8 @@ pub struct ScheduleCreate {
     pub kind: ScheduleKind,
     pub plan_id: Option<Uuid>,
     pub dest_profile_id: Option<Uuid>,
+    #[serde(default)]
+    pub pipeline_id: Option<Uuid>,
     #[specta(type = String)]
     pub cron: CronExpression,
     #[serde(default)]
@@ -297,9 +327,40 @@ impl Schedule {
             self.kind,
             self.plan_id,
             self.dest_profile_id,
+            self.pipeline_id,
             &self.action,
             self.webhook_url.as_deref(),
         )
+    }
+
+    /// Whether this schedule may run the pipeline it points at, unattended.
+    ///
+    /// Separate from [`Self::validate`] because it needs the pipeline and that
+    /// one is pure. Called wherever a schedule is written, so a chain cannot
+    /// gain a nightly run by being edited after the schedule was made.
+    ///
+    /// # Why this is allowed at all
+    ///
+    /// Every other kind of schedule is refused a destructive target outright,
+    /// because nobody is present at 04:00 to type a database name back. A
+    /// pipeline can be *armed*: somebody types the names once, and what is
+    /// stored is those names, so re-pointing the step revokes it. The
+    /// confirmation still happens — it happened earlier, and by a person.
+    pub fn validate_pipeline_target(
+        &self,
+        pipeline: &crate::pipeline::Pipeline,
+    ) -> Result<(), ScheduleError> {
+        if !pipeline.is_destructive() || pipeline.is_armed() {
+            return Ok(());
+        }
+        Err(ScheduleError::PipelineNotArmed {
+            name: pipeline.name.clone(),
+            targets: pipeline.destructive_targets().join(", "),
+        })
+    }
+
+    pub const fn is_pipeline(&self) -> bool {
+        matches!(self.kind, ScheduleKind::Pipeline)
     }
 
     /// The instant this schedule should fire for, if it is due right now.
@@ -421,6 +482,7 @@ impl ScheduleCreate {
             self.kind,
             self.plan_id,
             self.dest_profile_id,
+            self.pipeline_id,
             &self.action,
             self.webhook_url.as_deref(),
         )
@@ -432,6 +494,7 @@ fn validate_parts(
     kind: ScheduleKind,
     plan: Option<Uuid>,
     dest: Option<Uuid>,
+    pipeline: Option<Uuid>,
     action: &ScheduleAction,
     webhook: Option<&str>,
 ) -> Result<(), ScheduleError> {
@@ -441,6 +504,28 @@ fn validate_parts(
 
     if let Some(url) = webhook {
         validate_webhook(url)?;
+    }
+
+    // ── Pipelines ───────────────────────────────────────────────────────
+    //
+    // A pipeline already says which connections it touches, which tables it
+    // selects and how it restores. Accepting any of that here as well would be
+    // two sources of truth for one run, and the one that lost would lose
+    // silently. Whether it may *destroy* anything unattended is a separate
+    // question, asked by `validate_pipeline_target` where the pipeline itself
+    // is in hand.
+    if kind == ScheduleKind::Pipeline {
+        if pipeline.is_none() {
+            return Err(ScheduleError::PipelineRequired);
+        }
+        if plan.is_some() || dest.is_some() || action.restore.is_some() {
+            return Err(ScheduleError::PipelineTakesNothingElse);
+        }
+        return Ok(());
+    }
+
+    if pipeline.is_some() {
+        return Err(ScheduleError::PipelineTakesNothingElse);
     }
 
     // ── Drills ──────────────────────────────────────────────────────────
@@ -552,6 +637,7 @@ mod tests {
 
     fn schedule(cron: &str, created_at: DateTime<Utc>) -> Schedule {
         Schedule {
+            pipeline_id: None,
             id: Uuid::new_v4(),
             name: "nightly".into(),
             kind: ScheduleKind::Sync,
@@ -595,6 +681,7 @@ mod tests {
             ScheduleKind::Sync,
             Some(Uuid::new_v4()),
             Some(Uuid::new_v4()),
+            None,
             &a,
             None,
         )
@@ -633,6 +720,7 @@ mod tests {
                 ScheduleKind::Sync,
                 Some(Uuid::new_v4()),
                 Some(Uuid::new_v4()),
+                None,
                 &a,
                 None
             )
@@ -649,6 +737,7 @@ mod tests {
                 ScheduleKind::Sync,
                 Some(Uuid::new_v4()),
                 Some(Uuid::new_v4()),
+                None,
                 &action(None),
                 None
             ),
@@ -660,6 +749,7 @@ mod tests {
                 "n",
                 ScheduleKind::Sync,
                 Some(Uuid::new_v4()),
+                None,
                 None,
                 &action(Some(safe_restore())),
                 None
@@ -680,6 +770,7 @@ mod tests {
                 ScheduleKind::Sync,
                 Some(Uuid::new_v4()),
                 Some(Uuid::new_v4()),
+                None,
                 &a,
                 None
             ),
@@ -694,6 +785,7 @@ mod tests {
                 "   ",
                 ScheduleKind::Sync,
                 Some(Uuid::new_v4()),
+                None,
                 None,
                 &action(None),
                 None

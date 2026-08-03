@@ -40,6 +40,7 @@ specific here, and getting them wrong is where the confusion starts.
 - [Connections and SSH servers](guides/connections-and-ssh.md)
 - [Backup and restore](guides/backup-and-restore.md)
 - [Sync between servers](guides/sync.md)
+- [Pipelines: saved chains of actions](guides/pipelines.md)
 - [Scheduling](guides/scheduling.md)
 - [Masking](guides/masking.md)
 - [Encryption](guides/encryption.md)

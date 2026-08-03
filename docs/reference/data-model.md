@@ -1,6 +1,6 @@
 # Data model reference
 
-One SQLite database, nine tables, eight migrations applied on open. The desktop
+One SQLite database, twelve tables, twelve migrations applied on open. The desktop
 app and the CLI share it; neither derives the path independently.
 
 ## Where it lives
@@ -103,6 +103,10 @@ app.
 | `0006_drill_schedules.sql` | drill-kind schedules |
 | `0007_audit.sql` | audit_log |
 | `0008_ssh_connections.sql` | ssh_connections, `profiles.ssh_connection_id` |
+| `0009_table_set_names.sql` | a table set's name is unique within its connection |
+| `0010_job_steps.sql` | job_steps — the steps a composite job is made of |
+| `0011_pipelines.sql` | pipelines |
+| `0012_pipeline_schedules.sql` | `schedules.pipeline_id` |
 
 Applied automatically when either binary opens the store. Both also run
 `sshconn::adopt_legacy_configs` at startup — whichever is opened first performs

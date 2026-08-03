@@ -99,6 +99,23 @@ Explanation: [Verification](explanation/verification.md)
 
 ---
 
+## Pipeline
+
+A **named, ordered list of steps** — back up, restore, verify, mask, copy
+off-site, retain, drill — saved once and run as one job.
+
+Distinct from a sync, which is the same idea with a fixed shape and nothing
+saved. A pipeline can also *replace* a destination database, which a sync
+deliberately refuses; it asks for the target's name typed back on every run,
+and for a scheduled one, typed back once when it is **armed**. Editing a
+destructive step disarms it, so permission is granted for a named database
+rather than for a pipeline.
+
+`dbsync pipeline list` shows them. This answers "what chains do we have, and
+which of them can destroy something".
+
+---
+
 ## Job
 
 One **run** of something long: a backup, a restore, a sync, a drill. A job has a

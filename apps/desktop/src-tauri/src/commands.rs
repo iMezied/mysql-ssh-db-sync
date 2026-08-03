@@ -1494,6 +1494,9 @@ impl From<db_sync_engine::schedule::ScheduleError> for CommandError {
         use db_sync_engine::schedule::ScheduleError as E;
         let kind = match &e {
             E::DestructiveTarget(_) => "destructive_schedule",
+            // Its own kind, so the page can offer the one action that fixes
+            // it — authorising the pipeline — rather than a generic message.
+            E::PipelineNotArmed { .. } => "pipeline_not_armed",
             E::BadWebhook(..) => "bad_webhook",
             E::NameRequired
             | E::RestoreMismatch
@@ -1501,6 +1504,8 @@ impl From<db_sync_engine::schedule::ScheduleError> for CommandError {
             | E::DrillTakesNoPlan
             | E::DrillNeedsProfile
             | E::DrillTakesNoTarget
+            | E::PipelineRequired
+            | E::PipelineTakesNothingElse
             | E::EngineMismatch { .. } => "invalid",
         };
         Self::new(kind, e.to_string())

@@ -426,3 +426,57 @@ async fn the_pipelines_migration_enforces_unique_names_from_the_start() {
     .await;
     assert!(err.is_err(), "two pipelines cannot share a name");
 }
+
+#[tokio::test]
+async fn the_pipeline_schedule_migration_keeps_every_existing_schedule() {
+    // Additive, so no rebuild — but it arrives at a table whose rows are the
+    // unattended jobs somebody is relying on.
+    let (mut conn, _dir) = conn().await;
+    apply_range(&mut conn, None, "0011").await;
+
+    sqlx::query(
+        "INSERT INTO profiles (id, name, engine, environment, db_config, tool_overrides, \
+         created_at, updated_at) VALUES ('p1','prod','mysql','prod','{}','{}','t','t')",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO sync_plans (id, profile_id, name, database_name, table_selections, \
+         revision, created_at, updated_at) VALUES ('pl1','p1','nightly','app','[]',1,'t','t')",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO schedules (id, kind, sync_plan_id, name, cron_expression, action_json, \
+         last_run_at, created_at, updated_at) \
+         VALUES ('s1','sync','pl1','nightly','0 3 * * *','{\"a\":1}', \
+         '2026-07-01T03:00:00Z','c','u')",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    apply_range(&mut conn, Some("0011"), "0012").await;
+
+    let row = sqlx::query(
+        "SELECT sync_plan_id, action_json, last_run_at, pipeline_id FROM schedules WHERE id = 's1'",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .expect("the schedule must survive");
+
+    assert_eq!(row.get::<String, _>("sync_plan_id"), "pl1");
+    assert_eq!(row.get::<String, _>("action_json"), "{\"a\":1}");
+    assert_eq!(
+        row.get::<String, _>("last_run_at"),
+        "2026-07-01T03:00:00Z",
+        "losing the high-water mark would re-run an occurrence already done"
+    );
+    assert_eq!(
+        row.get::<Option<String>, _>("pipeline_id"),
+        None,
+        "an existing schedule is not suddenly a pipeline one"
+    );
+}

@@ -91,7 +91,7 @@ assumes. See [DECISIONS.md](../../DECISIONS.md), M14.
 ## The frontend
 
 React and TypeScript, TanStack Query for server state, React Router for the
-eleven pages, Tailwind for styling. Pages are thin: they call `api.*`, which
+fourteen pages, Tailwind for styling. Pages are thin: they call `api.*`, which
 unwraps the discriminated result from the generated bindings into promises so
 Query's error states work normally.
 

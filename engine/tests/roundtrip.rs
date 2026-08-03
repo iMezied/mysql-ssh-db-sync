@@ -679,6 +679,7 @@ db_test! {
 
         let schedule = store
             .create_schedule(db_sync_engine::schedule::ScheduleCreate {
+        pipeline_id: None,
                 kind: db_sync_engine::schedule::ScheduleKind::Sync,
                 name: "nightly staging refresh".into(),
                 plan_id: Some(plan.id),
@@ -838,6 +839,7 @@ db_test! {
 
         let schedule = store
             .create_schedule(db_sync_engine::schedule::ScheduleCreate {
+        pipeline_id: None,
                 kind: db_sync_engine::schedule::ScheduleKind::Sync,
                 name: "hourly backup".into(),
                 plan_id: Some(plan.id),
@@ -1437,6 +1439,7 @@ db_test! {
 
         let schedule = store
             .create_schedule(db_sync_engine::schedule::ScheduleCreate {
+        pipeline_id: None,
                 kind: db_sync_engine::schedule::ScheduleKind::Drill,
                 name: "nightly drill".into(),
                 // A drill has no plan: the artifact fixes what it contains.

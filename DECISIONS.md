@@ -2026,3 +2026,137 @@ name, unchanged.
 `..._is_never_merged_into`. It already tolerated both outcomes, because the
 second could tick underneath it; what it pins is the invariant that survives the
 change, which is that a restore never writes into a database it did not create.
+
+## M18 — Pipelines, and the first schedule allowed to destroy something
+
+### A job records the steps it is made of
+
+A sync was six things in a row and the structure existed in two places a user
+could not read: banner comments in `ops::sync`, and a flat `ProgressEvent`
+stream told apart only by phase. The page could show a scrolling log. It could
+not answer "which part are we on", "how long did the restore take", or the one
+that matters after a failure — "how far did it get".
+
+Step identity is carried by `JobContext`, not by call sites. `enter_step` sets a
+mark and `emit_event` stamps it onto everything passing through, so the fifty
+places that build an event — every per-table line in every dump engine — are
+unchanged and stay unaware steps exist. `to_log_line` writes the marker into the
+text too, because a job read back after a restart has no event stream left.
+
+**Steps are planned before the first one runs.** Inserting a row when a step
+begins cannot tell "step 4 has not happened yet" from "step 4 never will", so a
+run that died at the restore would read as a four-step run that finished.
+Planning up front costs one write and makes the failure honest: the verification
+that never ran says `skipped`, with no `started_at`, because a duration of zero
+would imply it did.
+
+`job_steps` has **no foreign key** to `job_history`. The engine ops are callable
+without a history row — that is how every integration test drives `ops::sync`,
+and the row belongs to the shell rather than to the operation. An FK would let a
+diagnostic write abort a forty-minute restore. Recording never fails a job for
+the same reason: a store error is reported on the stream and swallowed.
+
+### Data flows down the list, and that is the whole model
+
+A restore consumes what the most recent backup wrote; a verify compares the most
+recent restore against the source that backup came from. Nothing fans out and
+nothing reaches past the most recent producer.
+
+That is what lets the editor be a plain vertical list. A general graph would
+need wiring, wiring needs a canvas, and a canvas needs somebody to lay out a
+chain whose shape is almost always a straight line. `ArtifactSource` covers
+restoring a file no step here created, and is explicit because it is the
+exception.
+
+### A nested recorder goes quiet
+
+A pipeline can contain a drill, and `ops::drill` plans three steps of its own.
+The step write is a delete-then-insert, so an enabled inner recorder would
+replace the outer plan and leave the run reporting the drill's shape with the
+steps either side of it gone. `StepRecorder::start` does nothing when the
+context is already inside a step, and the nested operation's events keep the
+outer mark — which is the honest reading: from outside it is one step.
+
+### A schedule may now carry a destructive target, once armed
+
+This reverses a rule stated plainly in M4′ and enforced in two places:
+
+> ### A schedule cannot carry a destructive target
+> Nobody is present at the scheduled time to confirm it.
+
+That reasoning was right and still is. What changed is that the confirmation no
+longer has to happen *at* the scheduled time.
+
+A pipeline can be **armed**: somebody types the destructive target names back
+once, and what is stored is those names —
+`Pipeline::destructive_signature`, compared on read rather than trusted. A
+boolean would have been wrong in the way that matters: it survives an edit.
+Re-pointing the restore step at `production` makes the stored `staging` stop
+matching, and the pipeline disarms itself rather than being silently re-aimed at
+a database nobody agreed to drop. Changing the steps at all clears the
+acknowledgment outright, so an edit that happens to keep the same names still
+costs a deliberate re-arm.
+
+The engine's own rule is untouched. A manual run supplies the typed name at run
+time; an unattended one supplies the name a human typed earlier; both go through
+`RestoreRequest::validate`. The check is not weakened, only pre-answered, and by
+a person.
+
+It is checked in three places on purpose, because the pipeline can change
+between any two of them: `Store::check_pipeline_target` when the schedule is
+written, `Schedule::validate_pipeline_target` when the scheduler is about to
+run it, and `RestoreRequest::validate` inside the run.
+
+`ScheduleKind::Pipeline` reuses the `schedules` table rather than getting its
+own, for the reason 0006 gave when drills did: cron, timezone, enabled,
+catch-up, notify and the high-water mark would all be duplicated, and two
+implementations of "is this due" is two things to drift.
+
+### The builder duplicates the validation matrix, deliberately
+
+`lib/pipeline.ts` mirrors `Pipeline::validate`. The engine's copy is the one
+that decides and refuses on the way into the store no matter which path wrote
+it; the TypeScript copy exists so Save can be disabled with the reason on
+screen, instead of letting somebody assemble six steps and learn on submit that
+step two could never have worked. The file says which one wins.
+
+`destructiveSignature` has to match the Rust byte for byte — the engine compares
+what was typed against its own copy, so a different join would make arming fail
+with a message about a name the user can see is correct. It has a test saying so.
+
+### `SCHEDULE_KIND_LABELS` is exhaustive
+
+The Schedules page labelled rows with `kind === "drill" ? "Drill" : "Scheduled
+run"`, so a pipeline schedule rendered as "Scheduled run" — the two-way-ternary
+failure mode `engineDefaults.ts` already warns about, on the row that tells
+somebody what runs at 04:00. A `Record<ScheduleKind, string>` makes a fourth
+kind a compile error instead.
+
+### Creation stays in the app
+
+`dbsync pipeline` lists, shows and runs; it does not create. Same split as
+schedules and for the same reason — the option surface is large, and a second
+construction path is a second place for the destructive-target check to be
+forgotten. `show` prints what a run would need, so a missing `--confirm` is not
+discovered halfway through a cron job.
+
+### Naming
+
+`StepOutcome` and `StepDetail` were the obvious names and both were taken:
+`connect::StepOutcome` already exists for connection-test reporting, and specta
+refuses two exported types sharing a name. The step types are `JobStepOutcome`
+and `JobStepDetail`, pairing with `JobStep` and `JobStepKind`.
+
+`JobStepDetail` carries no `skip_serializing_if`. It would make the serialised
+and deserialised shapes differ, and specta answers that by exporting two
+TypeScript types with a union over them — leaving the page importing
+`JobStep_Serialize`. A few null fields in a tiny blob is the cheaper side.
+
+### Also fixed here
+
+The sync and roundtrip integration suites **did not run**. Every profile helper
+created an SSH connection called `fixture-ssh`, so the unique name index 0009
+added rejected the second profile in each test and the suite failed at setup
+before a single assertion — seven of ten in `sync.rs`, thirteen in
+`roundtrip.rs`. `saved_ssh` now reuses a connection of that name, which is what
+a saved connection is for.

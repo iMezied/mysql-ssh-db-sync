@@ -1,6 +1,6 @@
 # IPC API reference
 
-The 65 commands the webview can invoke. Generated from the Rust signatures by
+The 78 commands the webview can invoke. Generated from the Rust signatures by
 `tauri-specta` into `apps/desktop/src/bindings.ts`, which is **generated — never
 hand-edited**.
 
@@ -149,3 +149,20 @@ cargo test -p db-sync-desktop --test ipc
 
 - [For developers](../roles/developers.md)
 - [Architecture](../explanation/architecture.md)
+
+## Pipelines
+
+| Command | Returns |
+|---|---|
+| `list_pipelines` | `Pipeline[]` |
+| `get_pipeline(id)` | `Pipeline \| null` |
+| `create_pipeline(input)` | `Pipeline` — refused unless the whole chain is runnable |
+| `update_pipeline(id, patch)` | `Pipeline` — re-validated after the patch, and clears any unattended authorisation |
+| `arm_pipeline(id, typed)` | `Pipeline` — `typed` is the target names typed back, or `null` to withdraw |
+| `delete_pipeline(id)` | `bool` |
+| `start_pipeline(id, typedConfirmations)` | job id, immediately |
+| `list_job_steps(jobId)` | `JobStep[]` — empty for a single-step job |
+
+`start_pipeline` does not check the confirmations: each is handed to the
+restore step it belongs to and validated by the engine, which is the same check
+a hand-built restore goes through.
