@@ -14,6 +14,17 @@ set -euo pipefail
 
 MYSQL_CONTAINER="${MYSQL_CONTAINER:-db-sync-mysql-1}"
 DBSYNC_BIN="${DBSYNC_BIN:-./target/debug/dbsync}"
+
+# Same guard as verify-fixtures.sh, for the same reason: name the container
+# that is missing rather than letting every check come back blank.
+if ! docker inspect "$MYSQL_CONTAINER" >/dev/null 2>&1; then
+  {
+    echo "verify-definer-roundtrip.sh: no container named '$MYSQL_CONTAINER'."
+    echo "  Start it with: docker compose -f docker-compose.test.yml up -d --wait"
+  } >&2
+  exit 1
+fi
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 

@@ -7,6 +7,17 @@
 # Ports are deliberately non-default so a developer's local MySQL/Postgres is
 # never touched by a test run.
 
+# Pinned, because everything that talks to these containers addresses them by
+# name — `db-sync-postgres-1` and friends appear in two shell scripts and ten
+# places across the integration suites. Compose otherwise takes the project
+# name from the directory it is run in, which is `db-sync` on a machine that
+# cloned into that folder and `mysql-ssh-db-sync` on CI, where the checkout is
+# named after the repository. Every one of those names was therefore correct
+# locally and wrong in CI, which is why the fixture verification reported 22
+# checks failing with an empty result and no reason: `docker exec` was being
+# handed a container that did not exist.
+name: db-sync
+
 services:
   mysql:
     image: mysql:8.0

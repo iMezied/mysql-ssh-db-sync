@@ -14,6 +14,25 @@ set -euo pipefail
 MYSQL_CONTAINER="${MYSQL_CONTAINER:-db-sync-mysql-1}"
 PG_CONTAINER="${PG_CONTAINER:-db-sync-postgres-1}"
 
+# Checked once, here, because every query below sends stderr to /dev/null — it
+# is there to hide client noise, and it hid this too. A container that does not
+# exist made all 22 checks fail with `expected 20, got ` and nothing to explain
+# it, which is a worse failure than the one it was protecting against.
+for container in "$MYSQL_CONTAINER" "$PG_CONTAINER"; do
+  if ! docker inspect "$container" >/dev/null 2>&1; then
+    {
+      echo "verify-fixtures.sh: no container named '$container'."
+      echo
+      echo "  Start the fixtures with:"
+      echo "    docker compose -f docker-compose.test.yml up -d --wait"
+      echo
+      echo "  Currently running:"
+      docker ps --format '    {{.Names}}' || echo "    (docker ps failed)"
+    } >&2
+    exit 1
+  fi
+done
+
 failures=0
 
 check() {
