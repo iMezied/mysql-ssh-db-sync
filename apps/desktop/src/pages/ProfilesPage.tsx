@@ -1,7 +1,14 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
-import { ChevronDown, ChevronRight, KeyRound, Plus, Trash2 } from "lucide-react";
+import {
+  ChevronDown,
+  ChevronRight,
+  KeyRound,
+  Pencil,
+  Plus,
+  Trash2,
+} from "lucide-react";
 
 import PageHeader from "@/components/PageHeader";
 import ConnectionTest from "@/components/ConnectionTest";
@@ -12,8 +19,6 @@ import type {
   DbConfig,
   Engine,
   EnvironmentTag,
-  ProfileCreate,
-  SshConnection,
 } from "@/bindings";
 import { DEFAULT_PORT, ENGINE_LABEL } from "@/lib/engineDefaults";
 
@@ -23,8 +28,19 @@ const ENV_STYLES: Record<EnvironmentTag, string> = {
   dev: "bg-emerald-500/15 text-emerald-300 ring-emerald-500/30",
 };
 
-function emptyDraft(): ProfileCreate & { db: DbConfig } {
+/** A connection being created or edited. `id` is null for a new one. */
+type Draft = {
+  id: string | null;
+  name: string;
+  engine: Engine;
+  environment: EnvironmentTag;
+  ssh_connection_id: string | null;
+  db: DbConfig;
+};
+
+function emptyDraft(): Draft {
   return {
+    id: null,
     name: "",
     engine: "mysql",
     environment: "dev",
@@ -35,7 +51,7 @@ function emptyDraft(): ProfileCreate & { db: DbConfig } {
 
 export default function ProfilesPage() {
   const queryClient = useQueryClient();
-  const [draft, setDraft] = useState<(ProfileCreate & { db: DbConfig }) | null>(null);
+  const [draft, setDraft] = useState<Draft | null>(null);
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
 
@@ -56,9 +72,18 @@ export default function ProfilesPage() {
 
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["profiles"] });
 
-  const create = useMutation({
-    mutationFn: (input: ProfileCreate) =>
-      api.createProfile(input, password.length > 0 ? password : null),
+  const save = useMutation({
+    mutationFn: async (d: Draft) => {
+      const { id, ...fields } = d;
+      if (id === null) {
+        return api.createProfile(fields, password.length > 0 ? password : null);
+      }
+      // Every key is present on purpose: this form owns all of them, and an
+      // explicit null on `ssh_connection_id` is how a tunnel is removed.
+      // The password is not here — it is set from the row, so that editing a
+      // host cannot silently rewrite a credential the form never showed.
+      return api.updateProfile(id, { ...fields, tool_overrides: null });
+    },
     onSuccess: async () => {
       setDraft(null);
       setPassword("");
@@ -129,7 +154,18 @@ export default function ProfilesPage() {
                   ? (sshNames.get(p.ssh_connection_id) ?? "an SSH server")
                   : null
               }
-              connections={sshConnections.data ?? []}
+              onEdit={() => {
+                setDraft({
+                  id: p.id,
+                  name: p.name,
+                  engine: p.engine,
+                  environment: p.environment,
+                  ssh_connection_id: p.ssh_connection_id,
+                  db: p.db,
+                });
+                setPassword("");
+                setError(null);
+              }}
               onDelete={() => remove.mutate(p.id)}
               deleting={remove.isPending && remove.variables === p.id}
             />
@@ -141,11 +177,11 @@ export default function ProfilesPage() {
             className="panel mt-4 p-5"
             onSubmit={(e) => {
               e.preventDefault();
-              create.mutate(draft);
+              save.mutate(draft);
             }}
           >
             <h2 className="mb-4 text-sm font-semibold text-slate-200">
-              New connection
+              {draft.id === null ? "New connection" : `Edit ${draft.name}`}
             </h2>
 
             <div className="grid grid-cols-2 gap-4">
@@ -299,31 +335,49 @@ export default function ProfilesPage() {
                       to tunnel through a bastion.
                     </>
                   )}
+                  {draft.id !== null && (
+                    // Said before the save, not after: the host field means a
+                    // different thing on each side of this change, and a tunnel
+                    // added to a working connection is the moment it silently
+                    // stops working.
+                    <> Re-test the connection after changing this.</>
+                  )}
                 </p>
               </label>
 
-              <label className="col-span-2">
-                <span className="field-label">Password (stored in keychain)</span>
-                <input
-                  className="field-input"
-                  type="password"
-                  autoComplete="off"
-                  placeholder="Leave blank to add later"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                />
-              </label>
+              {draft.id === null && (
+                <label className="col-span-2">
+                  <span className="field-label">
+                    Password (stored in keychain)
+                  </span>
+                  <input
+                    className="field-input"
+                    type="password"
+                    autoComplete="off"
+                    placeholder="Leave blank to add later"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                  />
+                </label>
+              )}
             </div>
+
+            {draft.id !== null && (
+              <p className="mt-3 text-xs text-slate-500">
+                The password is changed from the connection's own row — expand
+                it to set, replace, or clear the stored one.
+              </p>
+            )}
 
             {error && <p className="mt-3 text-sm text-red-400">{error}</p>}
 
             <div className="mt-5 flex gap-2">
               <button
                 type="submit"
-                disabled={create.isPending}
+                disabled={save.isPending}
                 className="rounded-md bg-blue-600 px-3 py-2 text-sm font-medium text-white transition hover:bg-blue-500 disabled:opacity-50"
               >
-                {create.isPending ? "Saving…" : "Save connection"}
+                {save.isPending ? "Saving…" : "Save connection"}
               </button>
               <button
                 type="button"
@@ -347,13 +401,13 @@ export default function ProfilesPage() {
 function ProfileRow({
   profile,
   sshName,
-  connections,
+  onEdit,
   onDelete,
   deleting,
 }: {
   profile: ConnectionProfile;
   sshName: string | null;
-  connections: SshConnection[];
+  onEdit: () => void;
   onDelete: () => void;
   deleting: boolean;
 }) {
@@ -422,6 +476,14 @@ function ProfileRow({
         </span>
 
         <button
+          onClick={onEdit}
+          title="Edit this connection"
+          className="rounded p-1.5 text-slate-500 transition hover:bg-slate-800 hover:text-slate-300"
+        >
+          <Pencil className="h-4 w-4" />
+        </button>
+
+        <button
           onClick={onDelete}
           disabled={deleting}
           title="Delete connection and purge its keychain entries"
@@ -434,7 +496,10 @@ function ProfileRow({
 
       {expanded && (
         <div className="space-y-4 border-t border-slate-800 px-4 py-3">
-          <TunnelSelect profile={profile} connections={connections} />
+          <PasswordField
+            profileId={profile.id}
+            stored={secrets.data?.has_db_password ?? false}
+          />
           <ConnectionTest profileId={profile.id} />
         </div>
       )}
@@ -443,64 +508,74 @@ function ProfileRow({
 }
 
 /**
- * Re-points an existing connection at a different tunnel, or removes it.
+ * Store, replace, or clear the database password for a saved connection.
  *
- * Only reachable once a connection exists, which is when the question actually
- * comes up: a bastion is introduced, retired, or replaced long after the
- * database it fronts was first configured.
+ * Lives on the row rather than in the edit form because the value only ever
+ * travels one way: the form is populated from the profile, and there is
+ * nothing to populate this with. It is also the second half of the create
+ * form's "leave blank to add later" — without it, there was no later.
  */
-function TunnelSelect({
-  profile,
-  connections,
+function PasswordField({
+  profileId,
+  stored,
 }: {
-  profile: ConnectionProfile;
-  connections: SshConnection[];
+  profileId: string;
+  stored: boolean;
 }) {
   const queryClient = useQueryClient();
-  const [error, setError] = useState<string | null>(null);
+  const [value, setValue] = useState("");
+  const [done, setDone] = useState<string | null>(null);
 
-  const attach = useMutation({
-    // Presence is what carries the meaning here: an explicit null detaches,
-    // and omitting the key would leave the tunnel exactly as it was.
-    mutationFn: (id: string | null) =>
-      api.updateProfile(profile.id, { ssh_connection_id: id }),
+  const save = useMutation({
+    mutationFn: () => api.setProfileSecret(profileId, "db_password", value),
     onSuccess: async () => {
-      setError(null);
-      await queryClient.invalidateQueries({ queryKey: ["profiles"] });
+      setDone(value.length === 0 ? "Password cleared." : "Password stored.");
+      setValue("");
+      await queryClient.invalidateQueries({
+        queryKey: ["secret-status", profileId],
+      });
     },
-    onError: (e: unknown) =>
-      setError(e instanceof Error ? e.message : "Could not change the tunnel."),
   });
 
   return (
-    <div>
-      <label className="block max-w-md">
-        <span className="field-label">SSH tunnel</span>
-        <select
+    <div className="flex items-end gap-2">
+      <label className="flex-1">
+        <span className="field-label flex items-center gap-1.5">
+          <KeyRound
+            className={cn(
+              "h-3.5 w-3.5",
+              stored ? "text-emerald-400" : "text-slate-600",
+            )}
+          />
+          Database password — {stored ? "stored in the keychain" : "not stored"}
+        </span>
+        <input
           className="field-input"
-          disabled={attach.isPending}
-          value={profile.ssh_connection_id ?? ""}
-          onChange={(e) => attach.mutate(e.target.value || null)}
-        >
-          <option value="">No tunnel — connect directly</option>
-          {connections.map((c) => (
-            <option key={c.id} value={c.id}>
-              {c.name} ({c.endpoint.user}@{c.endpoint.host})
-            </option>
-          ))}
-        </select>
+          type="password"
+          autoComplete="off"
+          placeholder={stored ? "Replace it, or save empty to clear" : "Not set"}
+          value={value}
+          onChange={(e) => {
+            setValue(e.target.value);
+            setDone(null);
+          }}
+        />
       </label>
 
-      <p className="mt-1.5 text-xs leading-relaxed text-slate-500">
-        {/* Said here rather than after the fact: the host field means a
-            different thing on each side of this change, and a tunnel added to
-            a working connection is the moment it silently stops working. */}
-        The host and port above are resolved <em>from the SSH server</em> when a
-        tunnel is set, and from this machine when it is not. Re-test the
-        connection after changing this.
-      </p>
+      <button
+        onClick={() => save.mutate()}
+        disabled={save.isPending}
+        className="rounded-md border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:bg-slate-800 disabled:opacity-50"
+      >
+        {save.isPending ? "Saving…" : "Save"}
+      </button>
 
-      {error && <p className="mt-2 text-xs text-red-400">{error}</p>}
+      {done && <span className="pb-2 text-xs text-emerald-400">{done}</span>}
+      {save.isError && (
+        <span className="pb-2 text-xs text-red-400">
+          {(save.error as Error).message}
+        </span>
+      )}
     </div>
   );
 }
