@@ -14,7 +14,10 @@ import {
 } from "lucide-react";
 
 import PageHeader from "@/components/PageHeader";
+import EngineMark from "@/components/EngineMark";
+import ProfileChip from "@/components/ProfileChip";
 import { api } from "@/lib/api";
+import { ENGINE_LABEL } from "@/lib/engineDefaults";
 import { destructiveTargets, isArmed } from "@/lib/pipeline";
 import { useProgressStore } from "@/lib/jobProgress";
 import { cn } from "@/lib/utils";
@@ -690,9 +693,21 @@ function ScheduleForm({ onClose }: { onClose: () => void }) {
 
       {engineMismatch && (
         <Warning>
-          {engineMismatch.source.name} is {engineMismatch.source.engine} and{" "}
-          {engineMismatch.dest.name} is {engineMismatch.dest.engine}. Copying
-          between engines is a migration, not a sync.
+          {engineMismatch.source.name} is{" "}
+          <EngineMark
+            engine={engineMismatch.source.engine}
+            size="sm"
+            withLabel
+            className="align-text-bottom"
+          />{" "}
+          and {engineMismatch.dest.name} is{" "}
+          <EngineMark
+            engine={engineMismatch.dest.engine}
+            size="sm"
+            withLabel
+            className="align-text-bottom"
+          />
+          . Copying between engines is a migration, not a sync.
         </Warning>
       )}
 
@@ -988,10 +1003,11 @@ function ProfilePicker({
           .filter((p) => !exclude || p.id !== exclude)
           .map((p) => (
             <option key={p.id} value={p.id}>
-              {p.name} ({p.engine}, {p.environment})
+              {p.name} ({ENGINE_LABEL[p.engine]}, {p.environment})
             </option>
           ))}
       </select>
+      <ProfileChip profile={profiles.find((p) => p.id === value)} />
     </label>
   );
 }

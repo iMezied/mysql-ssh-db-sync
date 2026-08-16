@@ -4,8 +4,9 @@ import { FileUp, Layers, Pencil, Plus, Trash2 } from "lucide-react";
 
 import PageHeader from "@/components/PageHeader";
 import TableSelector from "@/components/TableSelector";
+import ProfileChip from "@/components/ProfileChip";
 import { api, ApiError } from "@/lib/api";
-import { supportsSchemaOnly } from "@/lib/engineDefaults";
+import { ENGINE_LABEL, supportsSchemaOnly } from "@/lib/engineDefaults";
 import {
   keyOf,
   materialise,
@@ -164,10 +165,11 @@ export default function TableSetsPage() {
               <option value="">Choose a connection…</option>
               {profiles.data?.map((p) => (
                 <option key={p.id} value={p.id}>
-                  {p.name}
+                  {p.name} ({ENGINE_LABEL[p.engine]})
                 </option>
               ))}
             </select>
+            <ProfileChip profile={profile} />
           </label>
         </div>
 

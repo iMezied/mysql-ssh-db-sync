@@ -36,6 +36,25 @@ export const ENGINE_LABEL: Record<Engine, string> = {
 };
 
 /**
+ * What colour the engine's mark is drawn in.
+ *
+ * Each is its brand hue, lightened for a dark background: the published values
+ * (`#4479A1`, `#4169E1`, `#47A248`) sit at roughly 3:1 against `slate-900`,
+ * which is thin for a 16px glyph. Lightening also pulls MySQL and PostgreSQL
+ * apart — both ship a blue, twenty degrees of hue between them, and at icon
+ * size that reads as one colour. Teal against indigo does not.
+ *
+ * The green is far enough from the `dev` environment badge's emerald to not be
+ * mistaken for it, and the two are different shapes anyway: this is a glyph,
+ * that is a pill.
+ */
+export const ENGINE_COLOR: Record<Engine, string> = {
+  mysql: "#5FBDDA",
+  postgres: "#7B93E8",
+  mongo: "#5FBF62",
+};
+
+/**
  * What this engine calls a table and a collection of rows.
  *
  * The pages are written in relational vocabulary because four of the five were

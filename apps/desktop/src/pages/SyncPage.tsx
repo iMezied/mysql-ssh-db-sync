@@ -17,8 +17,11 @@ import type {
 import {
   defaultBackupOptions,
   defaultRestoreOptions,
+  ENGINE_LABEL,
   supportsSchemaOnly,
 } from "@/lib/engineDefaults";
+import EngineMark from "@/components/EngineMark";
+import ProfileChip from "@/components/ProfileChip";
 import TableSelector from "@/components/TableSelector";
 import { keyOf, materialise } from "@/lib/tableSelection";
 
@@ -157,10 +160,22 @@ export default function SyncPage() {
 
         {engineMismatch && (
           <Warning>
-            {engineMismatch.source.name} is {engineMismatch.source.engine} and{" "}
-            {engineMismatch.dest.name} is {engineMismatch.dest.engine}. Copying
-            between engines is a migration, not a sync — nothing here translates
-            SQL dialects.
+            {engineMismatch.source.name} is{" "}
+            <EngineMark
+              engine={engineMismatch.source.engine}
+              size="sm"
+              withLabel
+              className="align-text-bottom"
+            />{" "}
+            and {engineMismatch.dest.name} is{" "}
+            <EngineMark
+              engine={engineMismatch.dest.engine}
+              size="sm"
+              withLabel
+              className="align-text-bottom"
+            />
+            . Copying between engines is a migration, not a sync — nothing here
+            translates SQL dialects.
           </Warning>
         )}
 
@@ -340,10 +355,11 @@ function ProfilePicker({
           .filter((p) => p.id !== exclude)
           .map((p) => (
             <option key={p.id} value={p.id}>
-              {p.name} ({p.engine}, {p.environment})
+              {p.name} ({ENGINE_LABEL[p.engine]}, {p.environment})
             </option>
           ))}
       </select>
+      <ProfileChip profile={profiles.find((p) => p.id === value)} />
     </label>
   );
 }

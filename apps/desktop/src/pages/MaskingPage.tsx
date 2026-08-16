@@ -3,7 +3,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, Plus, Trash2 } from "lucide-react";
 
 import PageHeader from "@/components/PageHeader";
+import ProfileChip from "@/components/ProfileChip";
 import { api } from "@/lib/api";
+import { ENGINE_LABEL } from "@/lib/engineDefaults";
 import type { MaskRule, MaskTransform } from "@/bindings";
 
 /**
@@ -152,15 +154,20 @@ export default function MaskingPage() {
         )}
 
         <section className="flex flex-wrap gap-3">
-          <Select
-            label="Connection"
-            value={profileId}
-            onChange={setProfileId}
-            options={(profiles.data ?? []).map((p) => ({
-              value: p.id,
-              label: `${p.name} (${p.engine})`,
-            }))}
-          />
+          <div>
+            <Select
+              label="Connection"
+              value={profileId}
+              onChange={setProfileId}
+              options={(profiles.data ?? []).map((p) => ({
+                value: p.id,
+                label: `${p.name} (${ENGINE_LABEL[p.engine]})`,
+              }))}
+            />
+            <ProfileChip
+              profile={(profiles.data ?? []).find((p) => p.id === profileId)}
+            />
+          </div>
           <Select
             label="Plan"
             value={planId}

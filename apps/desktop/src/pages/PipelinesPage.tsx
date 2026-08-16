@@ -12,7 +12,9 @@ import {
 } from "lucide-react";
 
 import PageHeader from "@/components/PageHeader";
+import ProfileChip from "@/components/ProfileChip";
 import { api, ApiError } from "@/lib/api";
+import { ENGINE_LABEL } from "@/lib/engineDefaults";
 import { useProgressStore } from "@/lib/jobProgress";
 import {
   STEP_LABELS,
@@ -413,10 +415,13 @@ function StepFields({
         <option value="">Choose a connection…</option>
         {profiles.map((p) => (
           <option key={p.id} value={p.id}>
-            {p.name}
+            {p.name} ({ENGINE_LABEL[p.engine]})
           </option>
         ))}
       </select>
+      {/* A pipeline step names a connection it will act on unattended, so
+          which server that is deserves saying in full rather than by name. */}
+      <ProfileChip profile={profiles.find((p) => p.id === profileId)} />
     </label>
   );
 

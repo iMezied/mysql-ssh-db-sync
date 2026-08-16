@@ -15,10 +15,18 @@ import {
   stepSummary,
   worthShowing,
 } from "@/lib/jobSteps";
+import EngineMark from "@/components/EngineMark";
+import EnvironmentBadge from "@/components/EnvironmentBadge";
 import { useProgressStore } from "@/lib/jobProgress";
 import { useTick } from "@/lib/useTick";
 import { cn, formatElapsed, formatDuration, formatTimestamp } from "@/lib/utils";
-import type { JobOutcome, JobRecord, JobStep, ProgressEvent } from "@/bindings";
+import type {
+  ConnectionProfile,
+  JobOutcome,
+  JobRecord,
+  JobStep,
+  ProgressEvent,
+} from "@/bindings";
 
 const OUTCOME_STYLES: Record<JobOutcome, string> = {
   success: "bg-emerald-500/15 text-emerald-300",
@@ -221,20 +229,32 @@ function JobFacts({ job }: { job: JobRecord }) {
     queryFn: api.listProfiles,
   });
 
-  const nameOf = (id: string | null) =>
-    id ? (profiles.data?.find((p) => p.id === id)?.name ?? null) : null;
+  const profileOf = (id: string | null) =>
+    id ? (profiles.data?.find((p) => p.id === id) ?? null) : null;
 
-  const source = nameOf(job.source_profile_id);
+  const source = profileOf(job.source_profile_id);
   // A restore records the same profile at both ends; naming it twice would
   // suggest two servers were involved.
   const dest =
     job.dest_profile_id && job.dest_profile_id !== job.source_profile_id
-      ? nameOf(job.dest_profile_id)
+      ? profileOf(job.dest_profile_id)
       : null;
 
+  // Read long after the run, this is often the only record of which server was
+  // touched — worth saying in the same shape the picker used, tag and all.
+  const describe = (p: ConnectionProfile) => (
+    <span className="flex flex-wrap items-center gap-1.5">
+      <EngineMark engine={p.engine} size="sm" />
+      {p.name}
+      <EnvironmentBadge environment={p.environment} />
+    </span>
+  );
+
   const facts = [
-    ...(source ? [{ label: dest ? "Source" : "Connection", value: source }] : []),
-    ...(dest ? [{ label: "Destination", value: dest }] : []),
+    ...(source
+      ? [{ label: dest ? "Source" : "Connection", value: describe(source) }]
+      : []),
+    ...(dest ? [{ label: "Destination", value: describe(dest) }] : []),
     ...summariseOptions(job.kind, job.options_json),
   ];
 

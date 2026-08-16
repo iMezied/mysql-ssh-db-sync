@@ -12,7 +12,9 @@ import {
 } from "lucide-react";
 
 import PageHeader from "@/components/PageHeader";
+import EngineMark from "@/components/EngineMark";
 import { api } from "@/lib/api";
+import { ENGINE_LABEL } from "@/lib/engineDefaults";
 import { basename } from "@/lib/jobDetails";
 import { useProgressStore } from "@/lib/jobProgress";
 import { formatBytes, formatTimestamp } from "@/lib/utils";
@@ -307,9 +309,15 @@ function ArtifactRow({
             <span>{formatBytes(artifact.size_bytes)}</span>
             <span>{formatTimestamp(artifact.modified_at)}</span>
             {artifact.database && (
-              <span>
+              <span className="flex items-center gap-1.5">
                 {artifact.database}
-                {artifact.engine ? ` · ${artifact.engine}` : ""}
+                {artifact.engine && (
+                  <>
+                    ·
+                    <EngineMark engine={artifact.engine} size="sm" />
+                    {ENGINE_LABEL[artifact.engine]}
+                  </>
+                )}
               </span>
             )}
             {artifact.source_profile_name && (

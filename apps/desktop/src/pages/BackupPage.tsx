@@ -14,8 +14,10 @@ import type {
   PgDumpFormat,
   TableMode,
 } from "@/bindings";
+import ProfileChip from "@/components/ProfileChip";
 import {
   defaultBackupOptions,
+  ENGINE_LABEL,
   ENGINE_NOUNS,
   supportsSchemaOnly,
 } from "@/lib/engineDefaults";
@@ -145,10 +147,11 @@ export default function BackupPage() {
               <option value="">Select a connection…</option>
               {profiles.data?.map((p) => (
                 <option key={p.id} value={p.id}>
-                  {p.name} ({p.engine})
+                  {p.name} ({ENGINE_LABEL[p.engine]})
                 </option>
               ))}
             </select>
+            <ProfileChip profile={selectedProfile} />
           </label>
 
           <label className="min-w-56 flex-1">

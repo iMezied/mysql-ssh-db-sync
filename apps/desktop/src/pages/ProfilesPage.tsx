@@ -12,6 +12,8 @@ import {
 
 import PageHeader from "@/components/PageHeader";
 import ConnectionTest from "@/components/ConnectionTest";
+import EngineMark from "@/components/EngineMark";
+import EnvironmentBadge from "@/components/EnvironmentBadge";
 import { api, ApiError } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import type {
@@ -21,12 +23,6 @@ import type {
   EnvironmentTag,
 } from "@/bindings";
 import { DEFAULT_PORT, ENGINE_LABEL } from "@/lib/engineDefaults";
-
-const ENV_STYLES: Record<EnvironmentTag, string> = {
-  prod: "bg-red-500/15 text-red-300 ring-red-500/30",
-  staging: "bg-amber-500/15 text-amber-300 ring-amber-500/30",
-  dev: "bg-emerald-500/15 text-emerald-300 ring-emerald-500/30",
-};
 
 /** A connection being created or edited. `id` is null for a new one. */
 type Draft = {
@@ -433,19 +429,13 @@ function ProfileRow({
       </button>
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
+          <EngineMark engine={profile.engine} />
           <span className="truncate text-sm font-medium text-slate-100">
             {profile.name}
           </span>
-          <span
-            className={cn(
-              "rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase ring-1",
-              ENV_STYLES[profile.environment],
-            )}
-          >
-            {profile.environment}
-          </span>
-          <span className="rounded bg-slate-800 px-1.5 py-0.5 text-[10px] uppercase text-slate-400">
-            {profile.engine}
+          <EnvironmentBadge environment={profile.environment} />
+          <span className="text-[10px] uppercase tracking-wide text-slate-500">
+            {ENGINE_LABEL[profile.engine]}
           </span>
         </div>
         <div className="mt-1 truncate font-mono text-xs text-slate-500">

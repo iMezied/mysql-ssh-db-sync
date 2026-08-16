@@ -14,7 +14,12 @@ import type {
   RestoreRequest,
   TargetNaming,
 } from "@/bindings";
-import { defaultRestoreOptions } from "@/lib/engineDefaults";
+import EngineMark from "@/components/EngineMark";
+import ProfileChip from "@/components/ProfileChip";
+import {
+  defaultRestoreOptions,
+  ENGINE_LABEL,
+} from "@/lib/engineDefaults";
 import { unlistedTables } from "@/lib/tableSelection";
 
 /**
@@ -224,11 +229,12 @@ export default function RestorePage() {
               <option value="">Select a connection…</option>
               {profiles.data?.map((p) => (
                 <option key={p.id} value={p.id}>
-                  {p.name} ({p.engine}
+                  {p.name} ({ENGINE_LABEL[p.engine]}
                   {p.environment === "prod" ? ", production" : ""})
                 </option>
               ))}
             </select>
+            <ProfileChip profile={profile} />
           </label>
 
           <label className="min-w-64 flex-1">
@@ -260,7 +266,7 @@ export default function RestorePage() {
         {engineMismatch && (
           <ErrorNote
             title="This artifact cannot go into this connection"
-            detail={`The backup was taken from ${artifact?.engine} and ${profile?.name} is ${profile?.engine}. Nothing here translates between the two dialects, so the restore is refused rather than half-applied.`}
+            detail={`The backup was taken from ${artifact?.engine ? ENGINE_LABEL[artifact.engine] : "an unknown engine"} and ${profile?.name} is ${profile ? ENGINE_LABEL[profile.engine] : "something else"}. Nothing here translates between the two dialects, so the restore is refused rather than half-applied.`}
           />
         )}
 
@@ -443,9 +449,15 @@ function ArtifactSummary({ artifact }: { artifact: Artifact }) {
         <span>{formatBytes(artifact.size_bytes)}</span>
         <span>{formatTimestamp(artifact.modified_at)}</span>
         {artifact.database && (
-          <span>
+          <span className="flex items-center gap-1.5">
             {artifact.database}
-            {artifact.engine ? ` · ${artifact.engine}` : ""}
+            {artifact.engine && (
+              <>
+                ·
+                <EngineMark engine={artifact.engine} size="sm" />
+                {ENGINE_LABEL[artifact.engine]}
+              </>
+            )}
           </span>
         )}
         {artifact.source_profile_name && (
