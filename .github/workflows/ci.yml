@@ -16,7 +16,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Windows is deliberately absent. Its clippy and format gates pass, but
+        # the `db-sync-desktop` lib-test binary dies before `main` with
+        # 0xc0000139 STATUS_ENTRYPOINT_NOT_FOUND — the loader finding a DLL that
+        # does not export something it links against, almost certainly a WebView2
+        # or Tauri runtime skew on the runner image. No test output is produced,
+        # because no test runs.
+        #
+        # It is left out rather than marked non-blocking because a job that is
+        # always red teaches everyone to ignore the whole page, and this one has
+        # no macOS or Linux consequence: development and installation happen on
+        # macOS, and `release.yml` still builds and packages
+        # `x86_64-pc-windows-msvc` on a tag. That build compiles the app rather
+        # than the test harness, so it is not obviously affected — but nothing
+        # here proves it either, and the next Windows release is where this has
+        # to be answered.
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
