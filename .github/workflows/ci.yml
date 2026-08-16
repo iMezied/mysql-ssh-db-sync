@@ -123,10 +123,17 @@ jobs:
       # gnome-keyring provides the Secret Service the engine stores database
       # passwords in. Without it the credential-touching suites cannot run at
       # all, which is what kept them out of CI until now.
+      #
+      # `dbus-x11` is the daemon that Secret Service is spoken to over; the
+      # `-dev` package and `pkg-config` are what `libdbus-sys` needs to build
+      # against it. Installing only the first is why this job never got as far
+      # as running a fixture: `cargo build -p db-sync-cli` panicked in that
+      # crate's build script, which reports a missing `dbus-1.pc` and exits 101.
       - name: Install database client tools and a credential store
         run: |
           sudo apt-get update
-          sudo apt-get install -y mysql-client gnome-keyring dbus-x11
+          sudo apt-get install -y mysql-client gnome-keyring dbus-x11 \
+            libdbus-1-dev pkg-config
 
           sudo install -d /usr/share/postgresql-common/pgdg
           sudo curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
