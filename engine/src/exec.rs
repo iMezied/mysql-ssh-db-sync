@@ -605,6 +605,12 @@ mod tests {
         );
     }
 
+    // Unix-only, and not merely because of the `libc::kill` probe below: the
+    // command is `sh -c` with a `&` background job, and what is being tested is
+    // process-group semantics, which Windows does not have in this shape. On
+    // Windows the probe compiles out, `grandchild` goes unused, and `-D
+    // warnings` fails the build over a test that could never have run there.
+    #[cfg(unix)]
     #[test]
     fn killing_the_group_takes_down_grandchildren() {
         // `sh -c` with a background child: killing only the direct child would
