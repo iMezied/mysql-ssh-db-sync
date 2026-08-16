@@ -155,8 +155,24 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y postgresql-client-18
 
+          # Installing the 18 client does not make it the one that runs. The
+          # runner image ships PostgreSQL 16 and its binary owns
+          # /usr/bin/pg_dump, so `pg_dump` stayed 16.14 and every PostgreSQL
+          # round-trip died on "pg_dump 16.14.0 is older than the server
+          # (18.6.0)" — the engine refusing correctly, against a client this
+          # step went to some trouble to replace. PGDG keeps each major in its
+          # own directory; 18's goes first.
+          echo "/usr/lib/postgresql/18/bin" >> "$GITHUB_PATH"
+          export PATH="/usr/lib/postgresql/18/bin:$PATH"
+
+          # Checked here rather than discovered in a round-trip test several
+          # minutes later, where it reads as a backup bug.
           pg_dump --version
           mysqldump --version
+          pg_dump --version | grep -qE ' 18\.' || {
+            echo "expected pg_dump 18, got: $(pg_dump --version)" >&2
+            exit 1
+          }
 
       - name: Build CLI
         run: cargo build -p db-sync-cli
