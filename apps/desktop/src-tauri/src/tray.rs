@@ -82,9 +82,9 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
 /// for the current appearance and inverts when the menu is open. The full
 /// colour app tile reads as wrong there and stays dark against a dark menu bar.
 #[cfg(target_os = "macos")]
-fn with_icon<R: tauri::Runtime, M: tauri::Manager<R>>(
+fn with_icon<R: tauri::Runtime>(
     builder: TrayIconBuilder<R>,
-    _app: &M,
+    _app: &AppHandle<R>,
 ) -> TrayIconBuilder<R> {
     match tauri::image::Image::from_bytes(include_bytes!("../icons/tray-template.png")) {
         Ok(icon) => builder.icon(icon).icon_as_template(true),
@@ -96,10 +96,17 @@ fn with_icon<R: tauri::Runtime, M: tauri::Manager<R>>(
 }
 
 /// Everywhere else the coloured application icon is the convention.
+///
+/// Takes the handle concretely rather than any `Manager`, because
+/// `default_window_icon` is not a `Manager` method — it comes from
+/// `shared_app_impl!`, which covers `App` and `AppHandle` and nothing else.
+/// The bound was wrong from the day it was written and nobody could see it:
+/// macOS compiles the other arm of this `cfg`, so the only machine anyone
+/// builds on skipped straight past it.
 #[cfg(not(target_os = "macos"))]
-fn with_icon<R: tauri::Runtime, M: tauri::Manager<R>>(
+fn with_icon<R: tauri::Runtime>(
     builder: TrayIconBuilder<R>,
-    app: &M,
+    app: &AppHandle<R>,
 ) -> TrayIconBuilder<R> {
     match app.default_window_icon() {
         Some(icon) => builder.icon(icon.clone()),
