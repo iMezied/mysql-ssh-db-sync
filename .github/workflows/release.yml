@@ -62,6 +62,11 @@ jobs:
           cache: npm
           cache-dependency-path: apps/desktop/package-lock.json
 
+      # Same reason as CI: package-lock.json is an npm 11 lockfile and node 22
+      # ships npm 10, which refuses it with EUSAGE. Untested until now only
+      # because no release has been cut since the lockfile was regenerated.
+      - run: npm install -g npm@11
+
       # ubuntu-22.04 rather than 24.04 on purpose: the AppImage produced on a
       # newer glibc will not start on an older distribution, and building on the
       # oldest supported base is the only reliable fix.

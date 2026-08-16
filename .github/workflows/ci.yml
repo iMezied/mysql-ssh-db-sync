@@ -61,6 +61,18 @@ jobs:
           cache: npm
           cache-dependency-path: apps/desktop/package-lock.json
 
+      # Node 22 ships npm 10, and package-lock.json was written by npm 11.
+      # That is not a cosmetic difference: vitest 4 asks for
+      # `vite: ^6 || ^7 || ^8`, npm 11 resolves it to vite 8 — which builds on
+      # rolldown and pulls no esbuild at all — and npm 10 resolves the same
+      # range to a vite that wants esbuild 0.28.2, finds no entry for it, and
+      # refuses the whole install with EUSAGE. The lockfile is not stale; it is
+      # simply an npm 11 lockfile, so the tool that reads it has to be npm 11.
+      #
+      # Pinned to the major rather than bumping node, so the runtime the tests
+      # execute under stays the one they are developed against.
+      - run: npm install -g npm@11
+
       - name: Install Linux system dependencies
         run: |
           sudo apt-get update
