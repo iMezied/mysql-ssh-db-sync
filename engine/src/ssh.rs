@@ -443,51 +443,7 @@ async fn authenticate(
     credentials: &HopCredentials,
 ) -> Result<(), TunnelError> {
     let result = match &endpoint.auth {
-        SshAuth::Agent => {
-            let mut agent = russh::keys::agent::client::AgentClient::connect_env()
-                .await
-                .map_err(|e| TunnelError::Agent(e.to_string()))?;
-
-            let identities = agent
-                .request_identities()
-                .await
-                .map_err(|e| TunnelError::Agent(e.to_string()))?;
-
-            if identities.is_empty() {
-                return Err(TunnelError::Agent(
-                    "ssh-agent holds no identities; add one with `ssh-add`".into(),
-                ));
-            }
-
-            // Try each identity; the agent cannot tell us which the server
-            // will accept, and offering the wrong one is not an error.
-            let mut last = None;
-            for identity in identities {
-                let key = identity.public_key().into_owned();
-                match session
-                    .authenticate_publickey_with(endpoint.user.clone(), key, None, &mut agent)
-                    .await
-                {
-                    Ok(AuthResult::Success) => {
-                        last = Some(AuthResult::Success);
-                        break;
-                    }
-                    Ok(other) => last = Some(other),
-                    Err(e) => {
-                        return Err(TunnelError::Auth {
-                            user: endpoint.user.clone(),
-                            host: endpoint.host.clone(),
-                            detail: e.to_string(),
-                        });
-                    }
-                }
-            }
-
-            last.unwrap_or(AuthResult::Failure {
-                remaining_methods: russh::MethodSet::empty(),
-                partial_success: false,
-            })
-        }
+        SshAuth::Agent => authenticate_with_agent(session, endpoint).await?,
         SshAuth::KeyFile { path, .. } => {
             let key = load_key(path, credentials.key_passphrase.as_ref())?;
             session
@@ -514,6 +470,81 @@ async fn authenticate(
             detail: format!("server rejected our credentials (it offers: {remaining_methods:?})"),
         }),
     }
+}
+
+/// Offer every identity a running ssh-agent holds.
+#[cfg(unix)]
+async fn authenticate_with_agent(
+    session: &mut Handle<ClientHandler>,
+    endpoint: &SshEndpoint,
+) -> Result<AuthResult, TunnelError> {
+    let mut agent = russh::keys::agent::client::AgentClient::connect_env()
+        .await
+        .map_err(|e| TunnelError::Agent(e.to_string()))?;
+
+    let identities = agent
+        .request_identities()
+        .await
+        .map_err(|e| TunnelError::Agent(e.to_string()))?;
+
+    if identities.is_empty() {
+        return Err(TunnelError::Agent(
+            "ssh-agent holds no identities; add one with `ssh-add`".into(),
+        ));
+    }
+
+    // Try each identity; the agent cannot tell us which the server will
+    // accept, and offering the wrong one is not an error.
+    let mut last = None;
+    for identity in identities {
+        let key = identity.public_key().into_owned();
+        match session
+            .authenticate_publickey_with(endpoint.user.clone(), key, None, &mut agent)
+            .await
+        {
+            Ok(AuthResult::Success) => {
+                last = Some(AuthResult::Success);
+                break;
+            }
+            Ok(other) => last = Some(other),
+            Err(e) => {
+                return Err(TunnelError::Auth {
+                    user: endpoint.user.clone(),
+                    host: endpoint.host.clone(),
+                    detail: e.to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(last.unwrap_or(AuthResult::Failure {
+        remaining_methods: russh::MethodSet::empty(),
+        partial_success: false,
+    }))
+}
+
+/// There is no agent on Windows this can speak to, so say that rather than
+/// fail obscurely.
+///
+/// `connect_env` is `#[cfg(unix)]` in russh — it reads `SSH_AUTH_SOCK` and
+/// opens a Unix socket, neither of which Windows has. What russh does offer
+/// there is `connect_pageant`, and Pageant is PuTTY's agent, not the one
+/// Windows OpenSSH runs; that one is behind a named pipe russh 0.62 does not
+/// expose. Wiring up Pageant would therefore authenticate against an agent
+/// most Windows users do not have running, and fail just as puzzlingly for
+/// everyone else.
+///
+/// Key-file authentication is unaffected and is the path that works.
+#[cfg(not(unix))]
+async fn authenticate_with_agent(
+    _session: &mut Handle<ClientHandler>,
+    _endpoint: &SshEndpoint,
+) -> Result<AuthResult, TunnelError> {
+    Err(TunnelError::Agent(
+        "ssh-agent authentication is not available on Windows; \
+         give this connection a key file instead"
+            .into(),
+    ))
 }
 
 /// Real tunnels over russh.
