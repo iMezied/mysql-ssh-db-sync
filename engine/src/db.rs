@@ -697,7 +697,11 @@ impl MongoIntrospector {
         Ok(Self { client })
     }
 
-    fn collection(&self, database: &str, name: &str) -> mongodb::Collection<mongodb::bson::Document> {
+    fn collection(
+        &self,
+        database: &str,
+        name: &str,
+    ) -> mongodb::Collection<mongodb::bson::Document> {
         self.client.database(database).collection(name)
     }
 
@@ -946,10 +950,7 @@ struct MongoStorageStats {
     index_size: Option<u64>,
 }
 
-async fn collection_storage_stats(
-    db: &mongodb::Database,
-    name: &str,
-) -> Option<MongoStorageStats> {
+async fn collection_storage_stats(db: &mongodb::Database, name: &str) -> Option<MongoStorageStats> {
     use mongodb::bson::doc;
 
     let mut cursor = db

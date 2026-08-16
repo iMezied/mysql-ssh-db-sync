@@ -382,7 +382,11 @@ fn search_path(binary: &str) -> Option<std::path::PathBuf> {
 }
 
 /// The Docker client, whose name differs on Windows.
-const DOCKER_BIN: &str = if cfg!(windows) { "docker.exe" } else { "docker" };
+const DOCKER_BIN: &str = if cfg!(windows) {
+    "docker.exe"
+} else {
+    "docker"
+};
 
 /// Absolute directories every Docker distribution is known to install into.
 ///
@@ -640,8 +644,14 @@ mod tests {
         // and no Docker distribution installs into any of them).
         let Some(found) = find_docker() else { return };
 
-        assert!(found.is_absolute(), "not runnable without a PATH: {found:?}");
-        assert!(is_executable(&found), "found something unrunnable: {found:?}");
+        assert!(
+            found.is_absolute(),
+            "not runnable without a PATH: {found:?}"
+        );
+        assert!(
+            is_executable(&found),
+            "found something unrunnable: {found:?}"
+        );
         assert_eq!(
             found.file_stem().and_then(|n| n.to_str()),
             Some("docker"),

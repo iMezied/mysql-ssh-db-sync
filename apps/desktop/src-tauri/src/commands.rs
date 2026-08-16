@@ -21,7 +21,6 @@ use db_sync_engine::destination::{Destination, DestinationCreate, DestinationUpd
 use db_sync_engine::events::{JobKind, JobPhase};
 use db_sync_engine::job::JobRecord;
 use db_sync_engine::job::{JobContext, JobOutcome};
-use db_sync_engine::tools::{DockerContainer, ToolSource, ToolStatus};
 use db_sync_engine::library::{self, Artifact, IntegrityCheck};
 use db_sync_engine::mask::MaskRule;
 use db_sync_engine::ops::{self, SyncRequest};
@@ -31,10 +30,11 @@ use db_sync_engine::profile::{ConnectionProfile, ProfileCreate, ProfileUpdate};
 use db_sync_engine::restore::RestoreRequest;
 use db_sync_engine::schedule::{Schedule, ScheduleCreate, ScheduleUpdate};
 use db_sync_engine::secrets::{self, SecretKind};
-use db_sync_engine::sshconn::{SshConnection, SshConnectionCreate, SshConnectionUpdate};
 use db_sync_engine::settings::{self, AppSettings};
+use db_sync_engine::sshconn::{SshConnection, SshConnectionCreate, SshConnectionUpdate};
 use db_sync_engine::step::JobStep;
 use db_sync_engine::store::StoreError;
+use db_sync_engine::tools::{DockerContainer, ToolSource, ToolStatus};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -327,11 +327,9 @@ pub async fn create_ssh_connection(
         // Rolled back on a keychain failure for the same reason a profile is:
         // a record that exists without the credential it needs looks configured
         // and is not.
-        if let Err(e) = secrets::set_secret(
-            connection.id,
-            SecretKind::SshKeyPassphrase,
-            &passphrase,
-        ) {
+        if let Err(e) =
+            secrets::set_secret(connection.id, SecretKind::SshKeyPassphrase, &passphrase)
+        {
             let _ = state.store.delete_ssh_connection(connection.id).await;
             return Err(e.into());
         }
@@ -657,8 +655,8 @@ pub async fn update_pipeline(
 
     // Worth recording specifically: an edit that revokes an unattended
     // authorisation is the change somebody will be looking for later.
-    let disarmed = before.is_some_and(|b| b.unattended_ack.is_some())
-        && after.unattended_ack.is_none();
+    let disarmed =
+        before.is_some_and(|b| b.unattended_ack.is_some()) && after.unattended_ack.is_none();
     state
         .store
         .audit(
@@ -748,14 +746,8 @@ pub async fn start_pipeline(
         .steps
         .iter()
         .find_map(|s| s.profile_id())
-        .ok_or_else(|| {
-            CommandError::new("invalid", "this pipeline touches no connection")
-        })?;
-    let dest = pipeline
-        .steps
-        .iter()
-        .rev()
-        .find_map(|s| s.profile_id());
+        .ok_or_else(|| CommandError::new("invalid", "this pipeline touches no connection"))?;
+    let dest = pipeline.steps.iter().rev().find_map(|s| s.profile_id());
 
     let request = ops::PipelineRunRequest {
         typed_confirmations,

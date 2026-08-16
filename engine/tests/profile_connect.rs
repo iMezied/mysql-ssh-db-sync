@@ -8,9 +8,9 @@
 
 use db_sync_engine::connect;
 use db_sync_engine::profile::{DbConfig, ProfileCreate, ToolOverrides};
-use db_sync_engine::sshconn::{SshAuth, SshConfig, SshConnectionCreate, SshEndpoint};
 use db_sync_engine::secrets::{self, SecretKind};
 use db_sync_engine::ssh::{RusshTunnelProvider, SshCredentials, TunnelProvider};
+use db_sync_engine::sshconn::{SshAuth, SshConfig, SshConnectionCreate, SshEndpoint};
 use db_sync_engine::store::Store;
 use db_sync_engine::types::{Engine, EnvironmentTag};
 use std::sync::Arc;

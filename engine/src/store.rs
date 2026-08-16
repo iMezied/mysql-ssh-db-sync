@@ -119,9 +119,11 @@ impl Store {
     // ── Profiles ────────────────────────────────────────────────────────
 
     pub async fn list_profiles(&self) -> Result<Vec<ConnectionProfile>> {
-        let rows = sqlx::query(&format!("SELECT {PROFILE_COLUMNS} FROM profiles ORDER BY name"))
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {PROFILE_COLUMNS} FROM profiles ORDER BY name"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
 
         rows.into_iter().map(row_to_profile).collect()
     }
@@ -1268,10 +1270,7 @@ impl Store {
         rows.into_iter().map(row_to_ssh_connection).collect()
     }
 
-    pub async fn create_ssh_connection(
-        &self,
-        input: SshConnectionCreate,
-    ) -> Result<SshConnection> {
+    pub async fn create_ssh_connection(&self, input: SshConnectionCreate) -> Result<SshConnection> {
         input.validate().map_err(StoreError::InvalidSshConnection)?;
 
         let now = Utc::now();

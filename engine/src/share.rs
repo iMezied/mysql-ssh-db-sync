@@ -328,10 +328,9 @@ async fn import_ssh_connections(
             continue;
         };
         let (Some(id), Some(jump_id)) = (ids.get(&incoming.name), ids.get(jump_name)) else {
-            report.orphaned_ssh_references.push(format!(
-                "{} (needs jump host {jump_name:?})",
-                incoming.name
-            ));
+            report
+                .orphaned_ssh_references
+                .push(format!("{} (needs jump host {jump_name:?})", incoming.name));
             continue;
         };
 
@@ -367,7 +366,8 @@ async fn adopt_inline_ssh(
     };
 
     let (id, created) =
-        crate::sshconn::adopt_endpoint(store, &mut existing, &legacy.endpoint, jump_host_id).await?;
+        crate::sshconn::adopt_endpoint(store, &mut existing, &legacy.endpoint, jump_host_id)
+            .await?;
 
     if created && let Some(adopted) = existing.iter().find(|c| c.id == id) {
         report.ssh_connections_created.push(adopted.name.clone());
@@ -413,10 +413,9 @@ pub async fn import(
             (Some(name), _) => match ssh_ids.get(name.as_str()) {
                 Some(id) => Some(*id),
                 None => {
-                    report.orphaned_ssh_references.push(format!(
-                        "{} (needs SSH connection {name:?})",
-                        incoming.name
-                    ));
+                    report
+                        .orphaned_ssh_references
+                        .push(format!("{} (needs SSH connection {name:?})", incoming.name));
                     None
                 }
             },
@@ -780,7 +779,11 @@ mod tests {
             1,
             "the endpoint must appear once, not once per profile: {json}"
         );
-        assert_eq!(json.matches("\"eu-bastion\"").count(), 4, "one definition, three references");
+        assert_eq!(
+            json.matches("\"eu-bastion\"").count(),
+            4,
+            "one definition, three references"
+        );
     }
 
     #[test]

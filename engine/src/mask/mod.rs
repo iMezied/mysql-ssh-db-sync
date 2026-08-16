@@ -752,7 +752,13 @@ mod tests {
     fn a_table_that_cannot_be_introspected_stops_the_run() {
         // "We could not look" is not "the column is fine".
         let rules = vec![MaskRule::email("users", "email")];
-        let err = plan_coverage(Engine::Mysql, &rules, &["users".to_string()], &BTreeMap::new()).unwrap_err();
+        let err = plan_coverage(
+            Engine::Mysql,
+            &rules,
+            &["users".to_string()],
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
         assert!(matches!(err, MaskError::UnknownTable { .. }), "{err}");
     }
 

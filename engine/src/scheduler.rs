@@ -702,9 +702,15 @@ impl Scheduler {
 
         let _ = job_id;
 
-        let outcome = ops::drill(&dest, &request, &self.store, &self.store.tool_source().await, ctx)
-            .await
-            .map_err(|e| e.to_string())?;
+        let outcome = ops::drill(
+            &dest,
+            &request,
+            &self.store,
+            &self.store.tool_source().await,
+            ctx,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
 
         // The drill ran; whether it *passed* is a separate question, and the
         // one the schedule exists to answer.

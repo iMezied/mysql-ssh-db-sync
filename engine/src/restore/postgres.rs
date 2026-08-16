@@ -17,9 +17,9 @@ use super::{EngineRestoreOptions, PostgresRestoreOptions, RestoreError, RestoreR
 use crate::backup::mysql::Endpoint;
 use crate::events::JobPhase;
 use crate::exec::{ChildHandle, ToolCommand, wait_checked};
-use crate::tools::{MountMode,ResolvedTool, Tool};
 use crate::job::JobContext;
 use crate::manifest::{ArtifactFormat, BackupManifest};
+use crate::tools::{MountMode, ResolvedTool, Tool};
 
 enum RestoreProgress {
     Phase(JobPhase, String),

@@ -37,9 +37,7 @@
 use mongodb::bson::{Bson, Document, doc};
 use sha2::{Digest, Sha256};
 
-use super::{
-    DEFAULT_HASH_LENGTH, FAKE_EMAIL_DOMAIN, FAKE_PHONE_PREFIX, MaskRule, MaskTransform,
-};
+use super::{DEFAULT_HASH_LENGTH, FAKE_EMAIL_DOMAIN, FAKE_PHONE_PREFIX, MaskRule, MaskTransform};
 
 /// How many documents to rewrite per bulk write.
 ///
@@ -393,12 +391,14 @@ pub async fn apply(
                 crate::db::DbError::Query(format!("reading {}: {e}", update.collection))
             })?;
 
-        while cursor.advance().await.map_err(|e| {
-            crate::db::DbError::Query(format!("reading {}: {e}", update.collection))
-        })? {
-            let document = cursor.deserialize_current().map_err(|e| {
-                crate::db::DbError::Query(format!("decoding a document: {e}"))
-            })?;
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| crate::db::DbError::Query(format!("reading {}: {e}", update.collection)))?
+        {
+            let document = cursor
+                .deserialize_current()
+                .map_err(|e| crate::db::DbError::Query(format!("decoding a document: {e}")))?;
 
             let Some(current) = get_path(&document, &update.field) else {
                 continue;
@@ -650,7 +650,12 @@ mod tests {
         // A phone number stored as an int64 is ordinary in a document store,
         // and refusing to mask it would leave it readable.
         assert!(
-            replacement(Some(&Bson::Int64(441632960900)), &MaskTransform::Phone, salt()).is_some(),
+            replacement(
+                Some(&Bson::Int64(441632960900)),
+                &MaskTransform::Phone,
+                salt()
+            )
+            .is_some(),
             "an integer field must still mask"
         );
     }

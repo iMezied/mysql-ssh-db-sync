@@ -20,10 +20,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use db_sync_engine::db::{ConnectParams, Introspector, connect};
-use db_sync_engine::sshconn::{SshAuth, SshConfig, SshEndpoint};
 use db_sync_engine::ssh::{
     AcceptAllHostKeys, RusshTunnelProvider, SshCredentials, TunnelHandle, TunnelProvider,
 };
+use db_sync_engine::sshconn::{SshAuth, SshConfig, SshEndpoint};
 use db_sync_engine::types::Engine;
 use secrecy::SecretString;
 use tokio::net::TcpStream;

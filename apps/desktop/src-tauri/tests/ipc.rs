@@ -914,7 +914,9 @@ async fn an_unrunnable_pipeline_is_refused_at_the_boundary_with_a_reason() {
     );
     assert_eq!(err["kind"], "invalid", "got {err}");
     assert!(
-        err["message"].as_str().is_some_and(|m| m.contains("step 1")),
+        err["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("step 1")),
         "the refusal must say which step: {err}"
     );
 }

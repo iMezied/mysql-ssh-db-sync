@@ -573,10 +573,7 @@ fn globals_command(plan: &DumpPlan, pg_dumpall: &ResolvedTool) -> ToolCommand {
         args.push("--no-privileges".into());
     }
 
-    with_password(
-        pg_dumpall.command().args(args),
-        &plan.endpoint,
-    )
+    with_password(pg_dumpall.command().args(args), &plan.endpoint)
 }
 
 fn restrict_permissions(path: &Path) {
@@ -627,7 +624,12 @@ mod tests {
 
     #[test]
     fn the_password_never_appears_in_the_command_line() {
-        let rendered = dump_command(&local_tool(Tool::PgDump), &plan(PgDumpFormat::Custom), Some(Path::new("/tmp/app.dump"))).display();
+        let rendered = dump_command(
+            &local_tool(Tool::PgDump),
+            &plan(PgDumpFormat::Custom),
+            Some(Path::new("/tmp/app.dump")),
+        )
+        .display();
         assert!(!rendered.contains("hunter2"));
         assert!(
             rendered.contains("--no-password"),
@@ -637,7 +639,12 @@ mod tests {
 
     #[test]
     fn schema_only_tables_keep_structure_but_lose_rows() {
-        let rendered = dump_command(&local_tool(Tool::PgDump), &plan(PgDumpFormat::Custom), Some(Path::new("/tmp/app.dump"))).display();
+        let rendered = dump_command(
+            &local_tool(Tool::PgDump),
+            &plan(PgDumpFormat::Custom),
+            Some(Path::new("/tmp/app.dump")),
+        )
+        .display();
         assert!(
             rendered.contains("--exclude-table-data=public.audit_log"),
             "schema-only must exclude data, not the table"
@@ -647,13 +654,23 @@ mod tests {
 
     #[test]
     fn excluded_tables_are_dropped_entirely() {
-        let rendered = dump_command(&local_tool(Tool::PgDump), &plan(PgDumpFormat::Custom), Some(Path::new("/tmp/app.dump"))).display();
+        let rendered = dump_command(
+            &local_tool(Tool::PgDump),
+            &plan(PgDumpFormat::Custom),
+            Some(Path::new("/tmp/app.dump")),
+        )
+        .display();
         assert!(rendered.contains("--exclude-table=public.temp"));
     }
 
     #[test]
     fn portable_defaults_are_applied() {
-        let rendered = dump_command(&local_tool(Tool::PgDump), &plan(PgDumpFormat::Custom), Some(Path::new("/tmp/app.dump"))).display();
+        let rendered = dump_command(
+            &local_tool(Tool::PgDump),
+            &plan(PgDumpFormat::Custom),
+            Some(Path::new("/tmp/app.dump")),
+        )
+        .display();
         assert!(rendered.contains("--no-owner"));
         assert!(rendered.contains("--no-privileges"));
     }
@@ -661,14 +678,20 @@ mod tests {
     #[test]
     fn archive_formats_write_their_own_file() {
         for format in [PgDumpFormat::Custom, PgDumpFormat::Directory] {
-            let rendered = dump_command(&local_tool(Tool::PgDump), &plan(format), Some(Path::new("/tmp/app.dump"))).display();
+            let rendered = dump_command(
+                &local_tool(Tool::PgDump),
+                &plan(format),
+                Some(Path::new("/tmp/app.dump")),
+            )
+            .display();
             assert!(rendered.contains("--file=/tmp/app.dump"), "{format:?}");
         }
     }
 
     #[test]
     fn plain_format_streams_to_stdout_for_compression() {
-        let rendered = dump_command(&local_tool(Tool::PgDump), &plan(PgDumpFormat::Plain), None).display();
+        let rendered =
+            dump_command(&local_tool(Tool::PgDump), &plan(PgDumpFormat::Plain), None).display();
         assert!(
             !rendered.contains("--file="),
             "plain output is piped through gzip, not written directly"
@@ -681,13 +704,19 @@ mod tests {
         let mut p = plan(PgDumpFormat::Custom);
         p.options.parallel_jobs = Some(4);
         assert!(
-            !dump_command(&local_tool(Tool::PgDump), &p, None).display().contains("--jobs"),
+            !dump_command(&local_tool(Tool::PgDump), &p, None)
+                .display()
+                .contains("--jobs"),
             "pg_dump rejects -j for the custom format"
         );
 
         let mut p = plan(PgDumpFormat::Directory);
         p.options.parallel_jobs = Some(4);
-        assert!(dump_command(&local_tool(Tool::PgDump), &p, None).display().contains("--jobs=4"));
+        assert!(
+            dump_command(&local_tool(Tool::PgDump), &p, None)
+                .display()
+                .contains("--jobs=4")
+        );
     }
 
     #[test]

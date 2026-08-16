@@ -109,9 +109,7 @@ impl Tool {
         match self {
             Tool::Mysqldump | Tool::Mysql => Some("mysql-client"),
             Tool::PgDump | Tool::PgDumpall | Tool::PgRestore | Tool::Psql => Some("libpq"),
-            Tool::Mongodump | Tool::Mongorestore => {
-                Some("mongodb/brew/mongodb-database-tools")
-            }
+            Tool::Mongodump | Tool::Mongorestore => Some("mongodb/brew/mongodb-database-tools"),
             Tool::Mydumper | Tool::Myloader => Some("mydumper"),
         }
     }
@@ -162,7 +160,10 @@ pub const DOCKER_HOST_ALIAS: &str = "host.docker.internal";
 
 impl ToolSource {
     pub const fn is_docker(&self) -> bool {
-        matches!(self, ToolSource::DockerExec { .. } | ToolSource::DockerRun { .. })
+        matches!(
+            self,
+            ToolSource::DockerExec { .. } | ToolSource::DockerRun { .. }
+        )
     }
 
     /// Whether the machinery this source depends on is actually reachable.
@@ -205,8 +206,7 @@ impl ToolSource {
 /// [`ToolSource::rewrite_host`] exists to prevent.
 fn is_loopback(host: &str) -> bool {
     let bare = host.trim_start_matches('[').trim_end_matches(']');
-    matches!(bare, "localhost" | "127.0.0.1" | "::1" | "0.0.0.0")
-        || bare.starts_with("127.")
+    matches!(bare, "localhost" | "127.0.0.1" | "::1" | "0.0.0.0") || bare.starts_with("127.")
 }
 
 /// A located tool, and everything needed to invoke it.
@@ -291,13 +291,11 @@ impl ResolvedTool {
 
         if let Some(explicit) = override_path {
             let path = Path::new(explicit);
-            return path
-                .is_file()
-                .then(|| Self {
-                    tool,
-                    location: Location::Local(path.to_path_buf()),
-                    mounts: Vec::new(),
-                });
+            return path.is_file().then(|| Self {
+                tool,
+                location: Location::Local(path.to_path_buf()),
+                mounts: Vec::new(),
+            });
         }
 
         let location = match source {
@@ -311,7 +309,11 @@ impl ResolvedTool {
                 program: in_container_path(None, binary),
             },
         };
-        Some(Self { tool, location, mounts: Vec::new() })
+        Some(Self {
+            tool,
+            location,
+            mounts: Vec::new(),
+        })
     }
 
     /// Make a host path visible to the tool, returning the path the tool must
@@ -986,7 +988,10 @@ mod source_tests {
         );
         // The name, never the value — argv is world-readable via `ps`.
         assert!(line.contains("-e MYSQL_PWD"), "got: {line}");
-        assert!(!line.contains("MYSQL_PWD="), "a value leaked into argv: {line}");
+        assert!(
+            !line.contains("MYSQL_PWD="),
+            "a value leaked into argv: {line}"
+        );
         // Image then command, so the caller's `.args(..)` land as the tool's
         // own arguments rather than as Docker options.
         assert!(line.ends_with("mysql:8 mysqldump"), "got: {line}");
@@ -1016,7 +1021,10 @@ mod source_tests {
             bin_dir: Some("/usr/local/mysql/bin/".into()),
         };
         let line = cmdline(&resolved(Tool::Mysqldump, &source));
-        assert!(line.ends_with("c /usr/local/mysql/bin/mysqldump"), "got: {line}");
+        assert!(
+            line.ends_with("c /usr/local/mysql/bin/mysqldump"),
+            "got: {line}"
+        );
     }
 
     #[test]
@@ -1100,7 +1108,11 @@ mod source_tests {
                    malformed-line-with-no-tabs\n";
         let rows = parse_ps(out);
 
-        assert_eq!(rows.len(), 2, "a malformed line must not become a container");
+        assert_eq!(
+            rows.len(),
+            2,
+            "a malformed line must not become a container"
+        );
         assert_eq!(rows[0].id, "8485e4e11b29");
         assert_eq!(rows[0].name, "mysql8");
         assert_eq!(rows[1].image, "postgres:16");
@@ -1243,14 +1255,18 @@ mod source_tests {
             rendered.contains("-v /tmp/dbsync-mongo-abc.conf:"),
             "the host file must be bound in: {rendered}"
         );
-        assert!(rendered.contains(":ro"), "an input must be read-only: {rendered}");
+        assert!(
+            rendered.contains(":ro"),
+            "an input must be read-only: {rendered}"
+        );
     }
 
     #[test]
     fn a_writable_mount_is_not_marked_read_only() {
         // pg_dump -Fc writes its archive itself; a read-only bind would fail.
         let mut tool = resolved(Tool::PgDump, &run_source());
-        tool.mount(Path::new("/backups"), MountMode::ReadWrite).unwrap();
+        tool.mount(Path::new("/backups"), MountMode::ReadWrite)
+            .unwrap();
 
         let rendered = tool.command().display();
         assert!(rendered.contains("-v /backups:"), "{rendered}");
@@ -1265,7 +1281,8 @@ mod source_tests {
         // Anything after the image name is the container's command, not
         // docker's, so a -v placed there would be passed to mysqldump.
         let mut tool = resolved(Tool::Mysqldump, &run_source());
-        tool.mount(Path::new("/tmp/x"), MountMode::ReadOnly).unwrap();
+        tool.mount(Path::new("/tmp/x"), MountMode::ReadOnly)
+            .unwrap();
 
         let rendered = tool.command().display();
         let mount_at = rendered.find("-v ").expect("mount present");
@@ -1279,8 +1296,12 @@ mod source_tests {
     #[test]
     fn two_mounts_with_the_same_name_do_not_collide() {
         let mut tool = resolved(Tool::PgRestore, &run_source());
-        let a = tool.mount(Path::new("/one/app.dump"), MountMode::ReadOnly).unwrap();
-        let b = tool.mount(Path::new("/two/app.dump"), MountMode::ReadOnly).unwrap();
+        let a = tool
+            .mount(Path::new("/one/app.dump"), MountMode::ReadOnly)
+            .unwrap();
+        let b = tool
+            .mount(Path::new("/two/app.dump"), MountMode::ReadOnly)
+            .unwrap();
         assert_ne!(a, b, "the second mount shadowed the first");
     }
 
@@ -1402,8 +1423,7 @@ mod tests {
         // The Database Tools are versioned 100.x independently of the server.
         // Applying pg_dump's rule here would block every correct install: a
         // 100.9.4 client against a 7.0.5 server is normal, not 93 majors ahead.
-        let verdict =
-            check_mongodump_compatibility(Version::new(100, 9, 4), Version::new(7, 0, 5));
+        let verdict = check_mongodump_compatibility(Version::new(100, 9, 4), Version::new(7, 0, 5));
         assert!(verdict.is_ok(), "got: {verdict:?}");
 
         // And the same pairing under pg_dump's rule would be refused — which is

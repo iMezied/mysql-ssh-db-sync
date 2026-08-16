@@ -79,7 +79,10 @@ enum DumpProgress {
 }
 
 /// Run a MySQL backup.
-pub async fn run_mysql_backup(run: BackupRun<'_>, ctx: &JobContext) -> Result<PathBuf, BackupError> {
+pub async fn run_mysql_backup(
+    run: BackupRun<'_>,
+    ctx: &JobContext,
+) -> Result<PathBuf, BackupError> {
     let BackupRun {
         profile,
         request,
@@ -533,10 +536,7 @@ fn schema_command(plan: &DumpPlan) -> ToolCommand {
     // instead of the new one.
     args.push(plan.database.clone());
 
-    with_password(
-        plan.mysqldump.command().args(args),
-        &plan.endpoint,
-    )
+    with_password(plan.mysqldump.command().args(args), &plan.endpoint)
 }
 
 fn data_command(plan: &DumpPlan, table: &TableSelection) -> ToolCommand {
@@ -573,10 +573,7 @@ fn data_command(plan: &DumpPlan, table: &TableSelection) -> ToolCommand {
     args.push(plan.database.clone());
     args.push(table.name.clone());
 
-    with_password(
-        plan.mysqldump.command().args(args),
-        &plan.endpoint,
-    )
+    with_password(plan.mysqldump.command().args(args), &plan.endpoint)
 }
 
 /// Dump only the triggers, for the final pass.
@@ -605,10 +602,7 @@ fn trigger_command(plan: &DumpPlan) -> ToolCommand {
     ));
     args.push(plan.database.clone());
 
-    with_password(
-        plan.mysqldump.command().args(args),
-        &plan.endpoint,
-    )
+    with_password(plan.mysqldump.command().args(args), &plan.endpoint)
 }
 
 /// Backups routinely contain production data; keep them owner-readable only.
@@ -632,12 +626,8 @@ mod tests {
         DumpPlan {
             recipients: Vec::new(),
             excluded: vec!["temp".into()],
-            mysqldump: ResolvedTool::resolve(
-                Tool::Mysqldump,
-                &ToolSource::Local,
-                Some("/bin/sh"),
-            )
-            .expect("an override that exists resolves without touching PATH"),
+            mysqldump: ResolvedTool::resolve(Tool::Mysqldump, &ToolSource::Local, Some("/bin/sh"))
+                .expect("an override that exists resolves without touching PATH"),
             endpoint: Endpoint {
                 host: "127.0.0.1".into(),
                 port: 13306,

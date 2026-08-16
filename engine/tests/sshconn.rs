@@ -416,7 +416,9 @@ async fn an_inline_jump_host_becomes_its_own_record() {
         .await
         .unwrap();
 
-    let jump = resolved.jump_host.expect("the jump host must be adopted too");
+    let jump = resolved
+        .jump_host
+        .expect("the jump host must be adopted too");
     assert_eq!(jump.endpoint.host, "edge.example.com");
     assert_eq!(jump.name, "jump@edge.example.com");
     assert_eq!(
@@ -433,7 +435,10 @@ async fn adoption_runs_once_and_is_safe_to_repeat() {
     let (store, _dir) = store().await;
     legacy_profile(&store, "prod", legacy_config("bastion.example.com")).await;
 
-    assert_eq!(sshconn::adopt_legacy_configs(&store).await.unwrap().len(), 1);
+    assert_eq!(
+        sshconn::adopt_legacy_configs(&store).await.unwrap().len(),
+        1
+    );
     assert!(
         sshconn::adopt_legacy_configs(&store)
             .await

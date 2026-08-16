@@ -284,7 +284,11 @@ async fn the_unique_name_migration_renames_collisions_instead_of_deleting_them()
         .collect();
 
     assert_eq!(names.len(), 3, "no set may be dropped: {names:?}");
-    assert_eq!(names[0], ("pl1".into(), "nightly".into()), "oldest keeps it");
+    assert_eq!(
+        names[0],
+        ("pl1".into(), "nightly".into()),
+        "oldest keeps it"
+    );
     assert_eq!(names[1], ("pl2".into(), "nightly (2)".into()));
     assert_eq!(names[2], ("pl3".into(), "weekly".into()), "untouched");
 
@@ -335,7 +339,10 @@ async fn the_unique_name_migration_leaves_a_clean_database_alone() {
         .await
         .unwrap()
         .get("name");
-    assert_eq!(name, "nightly", "a name with no collision must not gain a suffix");
+    assert_eq!(
+        name, "nightly",
+        "a name with no collision must not gain a suffix"
+    );
 }
 
 #[tokio::test]

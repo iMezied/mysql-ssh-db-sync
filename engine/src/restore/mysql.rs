@@ -16,9 +16,9 @@ use super::{EngineRestoreOptions, MysqlRestoreOptions, RestoreError, RestoreRun}
 use crate::backup::mysql::Endpoint;
 use crate::events::JobPhase;
 use crate::exec::{ChildHandle, ToolCommand, wait_checked};
-use crate::tools::{ResolvedTool, Tool};
 use crate::job::JobContext;
 use crate::manifest::BackupManifest;
+use crate::tools::{ResolvedTool, Tool};
 
 /// Progress from the blocking restore worker.
 enum RestoreProgress {

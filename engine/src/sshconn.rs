@@ -432,10 +432,7 @@ mod tests {
     fn an_endpoint_without_a_host_is_refused() {
         let mut e = endpoint();
         e.host = "  ".into();
-        assert!(matches!(
-            e.validate(),
-            Err(SshConnectionError::NoHost)
-        ));
+        assert!(matches!(e.validate(), Err(SshConnectionError::NoHost)));
     }
 
     #[test]
@@ -463,10 +460,7 @@ mod tests {
             endpoint: endpoint(),
             jump_host_id: None,
         };
-        assert!(matches!(
-            input.validate(),
-            Err(SshConnectionError::NoName)
-        ));
+        assert!(matches!(input.validate(), Err(SshConnectionError::NoName)));
     }
 
     #[test]

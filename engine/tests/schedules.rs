@@ -166,7 +166,7 @@ async fn a_schedule_survives_a_round_trip_intact() {
 
     let created = store
         .create_schedule(ScheduleCreate {
-        pipeline_id: None,
+            pipeline_id: None,
             kind: ScheduleKind::Sync,
             name: "staging refresh".into(),
             plan_id: Some(plan_id),
@@ -242,7 +242,7 @@ async fn a_destructive_schedule_cannot_be_created() {
 
     let result = store
         .create_schedule(ScheduleCreate {
-        pipeline_id: None,
+            pipeline_id: None,
             kind: ScheduleKind::Sync,
             name: "dangerous".into(),
             plan_id: Some(plan_id),
@@ -283,7 +283,7 @@ async fn a_schedule_cannot_be_edited_into_a_destructive_one() {
 
     let created = store
         .create_schedule(ScheduleCreate {
-        pipeline_id: None,
+            pipeline_id: None,
             kind: ScheduleKind::Sync,
             name: "staging refresh".into(),
             plan_id: Some(plan_id),
@@ -589,7 +589,7 @@ async fn deleting_a_destination_profile_leaves_the_schedule_in_place() {
 
     let created = store
         .create_schedule(ScheduleCreate {
-        pipeline_id: None,
+            pipeline_id: None,
             kind: ScheduleKind::Sync,
             name: "staging refresh".into(),
             plan_id: Some(plan_id),
@@ -685,7 +685,9 @@ fn replace_pipeline(profile: Uuid, target: &str) -> PipelineCreate {
             PipelineStep::Restore {
                 profile_id: profile,
                 source: ArtifactSource::PreviousStep,
-                naming: TargetNaming::DropAndRecreate { name: target.into() },
+                naming: TargetNaming::DropAndRecreate {
+                    name: target.into(),
+                },
                 engine: EngineRestoreOptions::Mysql(MysqlRestoreOptions::default()),
                 verify_checksum: true,
             },
@@ -728,7 +730,10 @@ async fn an_unarmed_destructive_pipeline_cannot_be_scheduled() {
         .expect_err("an unarmed replace must not become an unattended job");
 
     let message = err.to_string();
-    assert!(message.contains("staging"), "it must name what it would drop: {message}");
+    assert!(
+        message.contains("staging"),
+        "it must name what it would drop: {message}"
+    );
     assert!(
         message.contains("Authorise"),
         "and say how to fix it: {message}"
@@ -743,7 +748,10 @@ async fn an_armed_pipeline_can_be_scheduled() {
         .create_pipeline(replace_pipeline(profile, "staging"))
         .await
         .unwrap();
-    store.arm_pipeline(pipeline.id, Some("staging")).await.unwrap();
+    store
+        .arm_pipeline(pipeline.id, Some("staging"))
+        .await
+        .unwrap();
 
     let schedule = store
         .create_schedule(pipeline_schedule(pipeline.id, "0 4 * * *"))
@@ -753,7 +761,11 @@ async fn an_armed_pipeline_can_be_scheduled() {
     assert_eq!(schedule.pipeline_id, Some(pipeline.id));
     assert!(schedule.is_pipeline());
     assert_eq!(
-        store.require_schedule(schedule.id).await.unwrap().pipeline_id,
+        store
+            .require_schedule(schedule.id)
+            .await
+            .unwrap()
+            .pipeline_id,
         Some(pipeline.id),
         "the pipeline reference survives the round trip"
     );
@@ -770,7 +782,10 @@ async fn disarming_a_pipeline_stops_its_schedule_at_the_next_run() {
         .create_pipeline(replace_pipeline(profile, "staging"))
         .await
         .unwrap();
-    store.arm_pipeline(pipeline.id, Some("staging")).await.unwrap();
+    store
+        .arm_pipeline(pipeline.id, Some("staging"))
+        .await
+        .unwrap();
     let schedule = store
         .create_schedule(pipeline_schedule(pipeline.id, "0 4 * * *"))
         .await
@@ -828,7 +843,10 @@ async fn a_pipeline_schedule_takes_no_plan_or_destination() {
         .create_pipeline(replace_pipeline(profile, "staging"))
         .await
         .unwrap();
-    store.arm_pipeline(pipeline.id, Some("staging")).await.unwrap();
+    store
+        .arm_pipeline(pipeline.id, Some("staging"))
+        .await
+        .unwrap();
 
     // The steps already say which connections they touch. Accepting a second
     // answer here would be two sources of truth, and the loser would lose

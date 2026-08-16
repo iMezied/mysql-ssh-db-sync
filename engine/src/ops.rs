@@ -15,19 +15,19 @@ use crate::backup::{
 use crate::connect::{self, ConnectError};
 use crate::db::ConnectParams;
 use crate::events::{JobKind, JobPhase};
-use crate::tools::{ResolvedTool, Tool, ToolSource};
 use crate::job::{JobContext, JobOutcome, JobRecord};
 use crate::mask::{self, MaskError, MaskRule, MaskingCoverage, MaskingReport};
 use crate::profile::ConnectionProfile;
 use crate::restore::{
     EngineRestoreOptions, RestoreError, RestoreRequest, RestoreRun, TargetNaming,
-    run_mysql_restore, run_mongo_restore, run_postgres_restore,
+    run_mongo_restore, run_mysql_restore, run_postgres_restore,
 };
 use crate::retention::RetentionPolicy;
 use crate::secrets::{self, SecretKind};
 use crate::ssh::TunnelHandle;
 use crate::step::{JobStepDetail, JobStepKind, JobStepOutcome, StepPlan, StepRecorder};
 use crate::store::Store;
+use crate::tools::{ResolvedTool, Tool, ToolSource};
 use crate::types::Engine;
 use crate::verify::{self, VerificationReport};
 use serde::{Deserialize, Serialize};
@@ -1941,11 +1941,8 @@ async fn run_mongo_masking(
     .await;
 
     let rewritten = mask::mongo::apply(&params, database, &coverage.effective, salt).await?;
-    ctx.emit(
-        JobPhase::Restore,
-        format!("masked {rewritten} document(s)"),
-    )
-    .await;
+    ctx.emit(JobPhase::Restore, format!("masked {rewritten} document(s)"))
+        .await;
 
     // ── Prove it ────────────────────────────────────────────────────────
     //

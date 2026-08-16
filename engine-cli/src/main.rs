@@ -586,8 +586,10 @@ async fn main() -> Result<()> {
             } else if connections.is_empty() {
                 eprintln!("no SSH servers saved");
             } else {
-                let by_id: std::collections::HashMap<_, _> =
-                    connections.iter().map(|c| (c.id, c.name.as_str())).collect();
+                let by_id: std::collections::HashMap<_, _> = connections
+                    .iter()
+                    .map(|c| (c.id, c.name.as_str()))
+                    .collect();
                 for c in &connections {
                     // Named, not counted: the reason to look at this list is
                     // usually "what breaks if I change this one".
@@ -607,13 +609,7 @@ async fn main() -> Result<()> {
                     };
                     println!(
                         "{}  {:<24} {}@{}:{}{}  [{}]",
-                        c.id,
-                        c.name,
-                        c.endpoint.user,
-                        c.endpoint.host,
-                        c.endpoint.port,
-                        via,
-                        used
+                        c.id, c.name, c.endpoint.user, c.endpoint.host, c.endpoint.port, via, used
                     );
                 }
             }
@@ -1057,8 +1053,9 @@ async fn run_backup(store: &Store, args: BackupArgs<'_>, json: bool) -> Result<(
     .await
     .map_err(|e| anyhow::anyhow!("could not record the job: {e}"))?;
 
-    let result = db_sync_engine::ops::backup(&profile, &request, store, &store.tool_source().await, &ctx)
-        .await;
+    let result =
+        db_sync_engine::ops::backup(&profile, &request, store, &store.tool_source().await, &ctx)
+            .await;
 
     // The off-site copy is part of a backup, not an extra step, so a headless
     // run ships to the same destinations the app does.
@@ -1336,8 +1333,9 @@ async fn run_restore(store: &Store, args: RestoreArgs<'_>, json: bool) -> Result
     .await
     .map_err(|e| anyhow::anyhow!("could not record the job: {e}"))?;
 
-    let result = db_sync_engine::ops::restore(&profile, &request, store, &store.tool_source().await, &ctx)
-        .await;
+    let result =
+        db_sync_engine::ops::restore(&profile, &request, store, &store.tool_source().await, &ctx)
+            .await;
 
     let outcome = match &result {
         Ok(_) => JobOutcome::Success,
@@ -1522,8 +1520,7 @@ async fn run_pipeline_now(
         db_sync_engine::events::JobKind::Sync,
         source,
         dest,
-        serde_json::json!({ "pipeline": pipeline.name, "steps": pipeline.steps.len() })
-            .to_string(),
+        serde_json::json!({ "pipeline": pipeline.name, "steps": pipeline.steps.len() }).to_string(),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1577,9 +1574,7 @@ async fn run_pipeline_now(
                 "  {}. {} — {}",
                 step.index,
                 step.label,
-                step.outcome
-                    .map(|o| o.as_str())
-                    .unwrap_or("did not finish")
+                step.outcome.map(|o| o.as_str()).unwrap_or("did not finish")
             );
         }
     }

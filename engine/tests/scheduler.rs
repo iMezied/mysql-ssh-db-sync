@@ -176,7 +176,7 @@ async fn a_deleted_destination_profile_fails_the_run_loudly() {
     let schedule = h
         .store
         .create_schedule(ScheduleCreate {
-        pipeline_id: None,
+            pipeline_id: None,
             kind: ScheduleKind::Sync,
             name: "staging refresh".into(),
             plan_id: Some(plan_id),
@@ -241,7 +241,7 @@ async fn an_unrunnable_plan_fails_before_opening_any_connection() {
     let schedule = h
         .store
         .create_schedule(ScheduleCreate {
-        pipeline_id: None,
+            pipeline_id: None,
             kind: ScheduleKind::Sync,
             name: "empty".into(),
             plan_id: Some(plan_id),
@@ -297,7 +297,7 @@ async fn a_schedule_already_running_is_not_started_again() {
     let schedule = h
         .store
         .create_schedule(ScheduleCreate {
-        pipeline_id: None,
+            pipeline_id: None,
             kind: ScheduleKind::Sync,
             name: "slow".into(),
             plan_id: Some(plan_id),
@@ -342,7 +342,7 @@ async fn the_default_policy_stays_quiet_about_success_but_not_failure() {
     let schedule = h
         .store
         .create_schedule(ScheduleCreate {
-        pipeline_id: None,
+            pipeline_id: None,
             kind: ScheduleKind::Sync,
             name: "quiet".into(),
             plan_id: Some(plan_id),
@@ -380,7 +380,7 @@ async fn a_never_policy_reports_nothing_at_all() {
     let schedule = h
         .store
         .create_schedule(ScheduleCreate {
-        pipeline_id: None,
+            pipeline_id: None,
             kind: ScheduleKind::Sync,
             name: "silent".into(),
             plan_id: Some(plan_id),
@@ -422,7 +422,7 @@ async fn a_manual_run_does_not_consume_the_next_scheduled_occurrence() {
     let schedule = h
         .store
         .create_schedule(ScheduleCreate {
-        pipeline_id: None,
+            pipeline_id: None,
             kind: ScheduleKind::Sync,
             name: "nightly".into(),
             plan_id: Some(plan_id),
@@ -500,7 +500,7 @@ async fn a_tick_starts_a_schedule_that_has_come_due() {
     let schedule = h
         .store
         .create_schedule(ScheduleCreate {
-        pipeline_id: None,
+            pipeline_id: None,
             kind: ScheduleKind::Sync,
             name: "hourly".into(),
             plan_id: Some(plan_id),
@@ -544,7 +544,7 @@ async fn a_tick_does_not_rerun_an_occurrence_it_already_ran() {
     let schedule = h
         .store
         .create_schedule(ScheduleCreate {
-        pipeline_id: None,
+            pipeline_id: None,
             kind: ScheduleKind::Sync,
             name: "hourly".into(),
             plan_id: Some(plan_id),

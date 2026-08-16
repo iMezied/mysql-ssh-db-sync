@@ -19,9 +19,9 @@
 use std::time::Duration;
 
 use db_sync_engine::db::{ConnectParams, Introspector, MongoIntrospector};
-use db_sync_engine::tools::ToolSource;
 use db_sync_engine::mask::mongo as mask_mongo;
 use db_sync_engine::mask::{MaskRule, MaskTransform, derive_salt};
+use db_sync_engine::tools::ToolSource;
 use db_sync_engine::types::Engine;
 use mongodb::bson::{Bson, doc};
 use secrecy::SecretString;

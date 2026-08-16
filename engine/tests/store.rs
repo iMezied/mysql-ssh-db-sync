@@ -15,8 +15,8 @@ use db_sync_engine::mask::{MaskRule, MaskTransform};
 use db_sync_engine::pipeline::{PipelineCreate, PipelineStep, PipelineUpdate};
 use db_sync_engine::plan::SyncPlanCreate;
 use db_sync_engine::profile::{DbConfig, ProfileCreate, ProfileUpdate, ToolOverrides};
-use db_sync_engine::sshconn::{SshAuth, SshConnectionCreate, SshEndpoint};
 use db_sync_engine::retention::RetentionPolicy;
+use db_sync_engine::sshconn::{SshAuth, SshConnectionCreate, SshEndpoint};
 use db_sync_engine::store::{Store, StoreError};
 use db_sync_engine::types::{Engine, EnvironmentTag};
 use uuid::Uuid;
@@ -603,7 +603,13 @@ async fn a_malformed_ssh_endpoint_is_corruption() {
 
     let err = store.get_ssh_connection(id).await.unwrap_err();
     assert!(
-        matches!(err, StoreError::Corrupt { field: "endpoint", .. }),
+        matches!(
+            err,
+            StoreError::Corrupt {
+                field: "endpoint",
+                ..
+            }
+        ),
         "an unreadable endpoint must be reported, not guessed at: {err}"
     );
 }

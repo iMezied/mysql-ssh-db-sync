@@ -128,7 +128,10 @@ enum DumpProgress {
 }
 
 /// Run a MongoDB backup.
-pub async fn run_mongo_backup(run: BackupRun<'_>, ctx: &JobContext) -> Result<PathBuf, BackupError> {
+pub async fn run_mongo_backup(
+    run: BackupRun<'_>,
+    ctx: &JobContext,
+) -> Result<PathBuf, BackupError> {
     let BackupRun {
         profile,
         request,
@@ -166,8 +169,7 @@ pub async fn run_mongo_backup(run: BackupRun<'_>, ctx: &JobContext) -> Result<Pa
 
     let tool_version = mongodump.probe_version();
     if let (Some(client), Some(server)) = (tool_version, Version::parse_first(&server_version))
-        && let CompatibilityVerdict::Warn(message) =
-            check_mongodump_compatibility(client, server)
+        && let CompatibilityVerdict::Warn(message) = check_mongodump_compatibility(client, server)
     {
         ctx.emit_warn(JobPhase::Initializing, message).await;
     }
@@ -554,7 +556,8 @@ mod tests {
     #[test]
     fn the_password_never_appears_in_the_command_line() {
         let file = password_config(&SecretString::from("hunter2")).expect("config file");
-        let rendered = dump_command(&local_tool(Tool::Mongodump), &plan(), Some(file.path())).display();
+        let rendered =
+            dump_command(&local_tool(Tool::Mongodump), &plan(), Some(file.path())).display();
         assert!(
             !rendered.contains("hunter2"),
             "password leaked into argv: {rendered}"
@@ -583,8 +586,7 @@ mod tests {
         // parses. A single-quoted YAML scalar folds multiple lines and would
         // still read it as part of the password, but that is a property of the
         // reader. Escaping makes it a property of the file.
-        let file =
-            password_config(&SecretString::from("a\nuri: mongodb://evil.test")).unwrap();
+        let file = password_config(&SecretString::from("a\nuri: mongodb://evil.test")).unwrap();
         let contents = std::fs::read_to_string(file.path()).unwrap();
 
         assert_eq!(
@@ -592,7 +594,10 @@ mod tests {
             1,
             "the file must be exactly one line: {contents:?}"
         );
-        assert!(contents.contains("\\n"), "newline must be escaped: {contents:?}");
+        assert!(
+            contents.contains("\\n"),
+            "newline must be escaped: {contents:?}"
+        );
     }
 
     #[test]
@@ -657,7 +662,11 @@ mod tests {
     fn no_config_flag_when_there_is_no_password() {
         let mut p = plan();
         p.endpoint.password = None;
-        assert!(!dump_command(&local_tool(Tool::Mongodump), &p, None).display().contains("--config"));
+        assert!(
+            !dump_command(&local_tool(Tool::Mongodump), &p, None)
+                .display()
+                .contains("--config")
+        );
     }
 
     #[test]
@@ -689,10 +698,18 @@ mod tests {
 
     #[test]
     fn compression_is_the_tools_own_not_a_second_layer() {
-        assert!(dump_command(&local_tool(Tool::Mongodump), &plan(), None).display().contains("--gzip"));
+        assert!(
+            dump_command(&local_tool(Tool::Mongodump), &plan(), None)
+                .display()
+                .contains("--gzip")
+        );
         let mut p = plan();
         p.compress = false;
-        assert!(!dump_command(&local_tool(Tool::Mongodump), &p, None).display().contains("--gzip"));
+        assert!(
+            !dump_command(&local_tool(Tool::Mongodump), &p, None)
+                .display()
+                .contains("--gzip")
+        );
     }
 
     #[test]
@@ -708,10 +725,18 @@ mod tests {
     fn oplog_capture_is_off_unless_asked_for() {
         // Defaulting it on would break every standalone server, which is what
         // most development databases are.
-        assert!(!dump_command(&local_tool(Tool::Mongodump), &plan(), None).display().contains("--oplog"));
+        assert!(
+            !dump_command(&local_tool(Tool::Mongodump), &plan(), None)
+                .display()
+                .contains("--oplog")
+        );
         let mut p = plan();
         p.options.oplog = true;
-        assert!(dump_command(&local_tool(Tool::Mongodump), &p, None).display().contains("--oplog"));
+        assert!(
+            dump_command(&local_tool(Tool::Mongodump), &p, None)
+                .display()
+                .contains("--oplog")
+        );
     }
 
     #[test]
@@ -728,7 +753,11 @@ mod tests {
     fn extra_flags_reach_the_command() {
         let mut p = plan();
         p.options.extra_flags = vec!["--quiet".into()];
-        assert!(dump_command(&local_tool(Tool::Mongodump), &p, None).display().contains("--quiet"));
+        assert!(
+            dump_command(&local_tool(Tool::Mongodump), &p, None)
+                .display()
+                .contains("--quiet")
+        );
     }
 
     // ── What MongoDB refuses, and why ───────────────────────────────────

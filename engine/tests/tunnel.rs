@@ -12,11 +12,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use db_sync_engine::sshconn::{SshAuth, SshConfig, SshEndpoint};
 use db_sync_engine::ssh::{
     AcceptAllHostKeys, HostKeyInfo, HostKeyVerifier, RusshTunnelProvider, SshCredentials,
     StoreHostKeyVerifier, TunnelError, TunnelProvider,
 };
+use db_sync_engine::sshconn::{SshAuth, SshConfig, SshEndpoint};
 use db_sync_engine::store::Store;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;

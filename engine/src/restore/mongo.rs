@@ -29,9 +29,9 @@ use crate::backup::mysql::Endpoint;
 use crate::db::MONGO_AUTH_SOURCE;
 use crate::events::JobPhase;
 use crate::exec::{ChildHandle, ToolCommand, wait_checked};
-use crate::tools::{ResolvedTool, Tool};
 use crate::job::JobContext;
 use crate::manifest::BackupManifest;
+use crate::tools::{ResolvedTool, Tool};
 
 /// How often to report streaming progress, in bytes.
 const PROGRESS_EVERY: u64 = 4 * 1024 * 1024;
@@ -252,7 +252,11 @@ impl RestoreWorker {
         self.stream(&tx, &current_child, &cancel)
     }
 
-    fn command(&self, mongorestore: &ResolvedTool, config: Option<&std::path::Path>) -> ToolCommand {
+    fn command(
+        &self,
+        mongorestore: &ResolvedTool,
+        config: Option<&std::path::Path>,
+    ) -> ToolCommand {
         let o = &self.options;
         let mut args = vec![
             format!("--host={}", self.endpoint.host),
@@ -316,9 +320,9 @@ impl RestoreWorker {
     ) -> Result<(), RestoreError> {
         // Held until the child has exited; dropping it deletes the file.
         let credentials = match &self.endpoint.password {
-            Some(pw) => Some(
-                crate::backup::mongo::password_config(pw).map_err(RestoreError::Invalid)?,
-            ),
+            Some(pw) => {
+                Some(crate::backup::mongo::password_config(pw).map_err(RestoreError::Invalid)?)
+            }
             None => None,
         };
 
@@ -513,7 +517,9 @@ mod tests {
 
     #[test]
     fn the_password_never_appears_in_the_command_line() {
-        let rendered = worker(&timestamped()).command(&local_tool(Tool::Mongorestore), None).display();
+        let rendered = worker(&timestamped())
+            .command(&local_tool(Tool::Mongorestore), None)
+            .display();
         assert!(!rendered.contains("hunter2"), "{rendered}");
         assert!(!rendered.contains("--password"), "{rendered}");
     }
@@ -540,7 +546,10 @@ mod tests {
         let mut w = worker(&timestamped());
         w.options.only_collections = vec!["orders".into()];
         let rendered = w.command(&local_tool(Tool::Mongorestore), None).display();
-        assert!(rendered.contains("--nsInclude=prod_app.orders"), "{rendered}");
+        assert!(
+            rendered.contains("--nsInclude=prod_app.orders"),
+            "{rendered}"
+        );
         assert!(
             !rendered.contains(&format!("--nsInclude={}.orders", w.target)),
             "{rendered}"
@@ -549,7 +558,9 @@ mod tests {
 
     #[test]
     fn a_timestamped_restore_never_drops() {
-        let rendered = worker(&timestamped()).command(&local_tool(Tool::Mongorestore), None).display();
+        let rendered = worker(&timestamped())
+            .command(&local_tool(Tool::Mongorestore), None)
+            .display();
         assert!(
             !rendered.contains("--drop"),
             "the default restore must be non-destructive: {rendered}"
@@ -561,7 +572,11 @@ mod tests {
         let w = worker(&TargetNaming::DropAndRecreate {
             name: "staging".into(),
         });
-        assert!(w.command(&local_tool(Tool::Mongorestore), None).display().contains("--drop"));
+        assert!(
+            w.command(&local_tool(Tool::Mongorestore), None)
+                .display()
+                .contains("--drop")
+        );
         assert_eq!(w.target, "staging");
     }
 
@@ -571,15 +586,29 @@ mod tests {
             MongoRestoreOptions::default().stop_on_error,
             "without this mongorestore skips failed documents and exits 0"
         );
-        assert!(worker(&timestamped()).command(&local_tool(Tool::Mongorestore), None).display().contains("--stopOnError"));
+        assert!(
+            worker(&timestamped())
+                .command(&local_tool(Tool::Mongorestore), None)
+                .display()
+                .contains("--stopOnError")
+        );
     }
 
     #[test]
     fn gzip_is_passed_only_for_an_archive_that_has_it() {
-        assert!(worker(&timestamped()).command(&local_tool(Tool::Mongorestore), None).display().contains("--gzip"));
+        assert!(
+            worker(&timestamped())
+                .command(&local_tool(Tool::Mongorestore), None)
+                .display()
+                .contains("--gzip")
+        );
         let mut w = worker(&timestamped());
         w.gzipped = false;
-        assert!(!w.command(&local_tool(Tool::Mongorestore), None).display().contains("--gzip"));
+        assert!(
+            !w.command(&local_tool(Tool::Mongorestore), None)
+                .display()
+                .contains("--gzip")
+        );
     }
 
     #[test]
@@ -592,12 +621,18 @@ mod tests {
         );
         let mut w = worker(&timestamped());
         w.options.restore_indexes = false;
-        assert!(w.command(&local_tool(Tool::Mongorestore), None).display().contains("--noIndexRestore"));
+        assert!(
+            w.command(&local_tool(Tool::Mongorestore), None)
+                .display()
+                .contains("--noIndexRestore")
+        );
     }
 
     #[test]
     fn the_tool_authenticates_against_the_same_database_as_the_driver() {
-        let rendered = worker(&timestamped()).command(&local_tool(Tool::Mongorestore), None).display();
+        let rendered = worker(&timestamped())
+            .command(&local_tool(Tool::Mongorestore), None)
+            .display();
         assert!(rendered.contains(&format!("--authenticationDatabase={MONGO_AUTH_SOURCE}")));
     }
 
