@@ -136,7 +136,10 @@ export default function SshPage() {
           </div>
         )}
 
-        <div className="grid gap-3">
+        {/* `grid-cols-1` for the same reason as on the connections list: an
+            implicit track is floored at min-content, and the truncated
+            user@host:port line makes that the width of the whole string. */}
+        <div className="grid grid-cols-1 gap-3">
           {connections.data?.map((c) => (
             <ConnectionRow
               key={c.id}

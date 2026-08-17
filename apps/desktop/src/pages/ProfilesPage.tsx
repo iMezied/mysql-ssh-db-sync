@@ -140,7 +140,14 @@ export default function ProfilesPage() {
           </div>
         )}
 
-        <div className="grid gap-3">
+        {/*
+          `grid-cols-1` rather than a bare `grid`: an implicit `auto` track is
+          floored at min-content, and a row's min-content is the whole
+          user@host:port line, which `truncate` sets to nowrap. Without the
+          `minmax(0, …)` that `grid-cols-1` expands to, a long hostname widens
+          every row past the pane and the window scrolls sideways.
+        */}
+        <div className="grid grid-cols-1 gap-3">
           {profiles.data?.map((p) => (
             <ProfileRow
               key={p.id}

@@ -109,7 +109,10 @@ export default function LibraryPage() {
           <LibrarySummary stats={stats.data} />
         )}
 
-        <div className="grid gap-2">
+        {/* `grid-cols-1` for the same reason as on the connections list: an
+            implicit track is floored at min-content, and a truncated archive
+            path makes that the width of the whole path. */}
+        <div className="grid grid-cols-1 gap-2">
           {artifacts.data?.map((a) => (
             <ArtifactRow
               key={a.path}
