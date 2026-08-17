@@ -617,7 +617,9 @@ async fn main() -> Result<()> {
         }
         Command::Jobs { limit } => {
             let store = open_store(&store_path).await?;
-            let jobs = store.list_jobs(limit).await?;
+            // Offset 0: the CLI prints the newest `limit` runs in one go and
+            // has no page to be on.
+            let jobs = store.list_jobs(limit, 0).await?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&jobs)?);
             } else if jobs.is_empty() {
@@ -691,7 +693,7 @@ async fn main() -> Result<()> {
         }
         Command::Audit { limit } => {
             let store = open_store(&store_path).await?;
-            let entries = store.list_audit(limit).await;
+            let entries = store.list_audit(limit, 0).await;
             store.close().await;
             let entries = entries?;
 

@@ -52,6 +52,18 @@ pub struct JobRecord {
     pub log: String,
 }
 
+/// One page of job history, with the size of the whole set.
+///
+/// The count travels with the rows rather than in a second command: a job can
+/// finish between two calls, and a pager that reads "page 9 of 8" because the
+/// total was fetched separately is worse than no pager.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct JobPage {
+    pub jobs: Vec<JobRecord>,
+    /// Total rows in `job_history`, not the length of `jobs`.
+    pub total: u32,
+}
+
 /// Which step of a composite job is currently running.
 ///
 /// `index` is 1-based, because it is read by a human as "step 2 of 5".

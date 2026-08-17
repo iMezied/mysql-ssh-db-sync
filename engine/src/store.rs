@@ -322,17 +322,32 @@ impl Store {
         Ok(())
     }
 
-    pub async fn list_jobs(&self, limit: i64) -> Result<Vec<JobRecord>> {
+    /// One page of history, newest first.
+    ///
+    /// `started_at` is not unique — a pipeline starts its steps in the same
+    /// second — so the id is the tiebreaker. Without it two pages sharing a
+    /// timestamp can repeat a row and drop another, which is the one bug a
+    /// paginated list must not have.
+    pub async fn list_jobs(&self, limit: i64, offset: i64) -> Result<Vec<JobRecord>> {
         let rows = sqlx::query(
             "SELECT id, kind, source_profile_id, dest_profile_id, started_at, finished_at, \
              outcome, artifact_path, options_json, log FROM job_history \
-             ORDER BY started_at DESC LIMIT ?1",
+             ORDER BY started_at DESC, id DESC LIMIT ?1 OFFSET ?2",
         )
         .bind(limit)
+        .bind(offset.max(0))
         .fetch_all(&self.pool)
         .await?;
 
         rows.into_iter().map(row_to_job).collect()
+    }
+
+    /// How many job records exist, for sizing the pager.
+    pub async fn count_jobs(&self) -> Result<i64> {
+        let row = sqlx::query("SELECT COUNT(*) AS n FROM job_history")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get::<i64, _>("n"))
     }
 
     pub async fn get_job(&self, id: Uuid) -> Result<Option<JobRecord>> {
@@ -1054,12 +1069,22 @@ impl Store {
         }
     }
 
-    /// Recent configuration changes, newest first.
-    pub async fn list_audit(&self, limit: i64) -> Result<Vec<crate::audit::AuditEntry>> {
+    /// One page of configuration changes, newest first.
+    ///
+    /// Ordered by id as well as time for the same reason as [`Self::list_jobs`]:
+    /// a single edit can write several rows within one second, and a pager that
+    /// orders on a non-unique column repeats and skips rows across pages.
+    pub async fn list_audit(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<crate::audit::AuditEntry>> {
         let rows = sqlx::query(
-            "SELECT id, at, action, subject, detail FROM audit_log ORDER BY at DESC LIMIT ?1",
+            "SELECT id, at, action, subject, detail FROM audit_log \
+             ORDER BY at DESC, id DESC LIMIT ?1 OFFSET ?2",
         )
         .bind(limit.max(1))
+        .bind(offset.max(0))
         .fetch_all(&self.pool)
         .await?;
 
@@ -1074,6 +1099,14 @@ impl Store {
                 })
             })
             .collect()
+    }
+
+    /// How many changes are recorded, for sizing the pager.
+    pub async fn count_audit(&self) -> Result<i64> {
+        let row = sqlx::query("SELECT COUNT(*) AS n FROM audit_log")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get::<i64, _>("n"))
     }
 }
 

@@ -92,7 +92,7 @@ async fn ssh_with_jump_host(store: &Store) -> Uuid {
 async fn migrations_run_on_a_fresh_database() {
     let (store, _dir) = store().await;
     assert!(store.list_profiles().await.unwrap().is_empty());
-    assert!(store.list_jobs(10).await.unwrap().is_empty());
+    assert!(store.list_jobs(10, 0).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -432,12 +432,89 @@ async fn jobs_are_listed_newest_first_and_respect_the_limit() {
             .unwrap();
     }
 
-    let jobs = store.list_jobs(3).await.unwrap();
+    let jobs = store.list_jobs(3, 0).await.unwrap();
     assert_eq!(jobs.len(), 3);
     assert!(
         jobs[0].started_at > jobs[1].started_at,
         "history must read newest first"
     );
+}
+
+#[tokio::test]
+async fn job_pages_cover_the_history_exactly_once() {
+    // What a pager is actually for: walking every page must visit every run,
+    // with nothing repeated and nothing missed. All twelve share a start time,
+    // so this fails unless the ordering has a unique tiebreaker.
+    let (store, _dir) = store().await;
+    let profile = store
+        .create_profile(profile_input("src", Engine::Mysql))
+        .await
+        .unwrap();
+
+    let at = Utc::now();
+    for _ in 0..12 {
+        store
+            .insert_job(&JobRecord {
+                id: Uuid::new_v4(),
+                kind: JobKind::Backup,
+                source_profile_id: profile.id,
+                dest_profile_id: None,
+                started_at: at,
+                finished_at: None,
+                outcome: None,
+                artifact_path: None,
+                options_json: "{}".into(),
+                log: String::new(),
+            })
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(store.count_jobs().await.unwrap(), 12);
+
+    let mut seen = Vec::new();
+    for page in 0..3 {
+        let rows = store.list_jobs(5, page * 5).await.unwrap();
+        assert_eq!(rows.len(), if page == 2 { 2 } else { 5 }, "page {page}");
+        seen.extend(rows.into_iter().map(|j| j.id));
+    }
+
+    assert_eq!(seen.len(), 12, "every run should appear once");
+    let unique: std::collections::HashSet<_> = seen.iter().collect();
+    assert_eq!(unique.len(), 12, "a run appeared on two pages");
+
+    // Past the end is empty, not an error: the UI clamps, but a stale page
+    // number should not fail the request.
+    assert!(store.list_jobs(5, 500).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn counting_jobs_is_independent_of_the_page_size() {
+    let (store, _dir) = store().await;
+    assert_eq!(store.count_jobs().await.unwrap(), 0);
+
+    let profile = store
+        .create_profile(profile_input("src", Engine::Mysql))
+        .await
+        .unwrap();
+    store
+        .insert_job(&JobRecord {
+            id: Uuid::new_v4(),
+            kind: JobKind::Backup,
+            source_profile_id: profile.id,
+            dest_profile_id: None,
+            started_at: Utc::now(),
+            finished_at: None,
+            outcome: None,
+            artifact_path: None,
+            options_json: "{}".into(),
+            log: String::new(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(store.count_jobs().await.unwrap(), 1);
+    assert!(store.list_jobs(1, 1).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -993,7 +1070,7 @@ async fn configuration_changes_are_recorded_newest_first() {
         .audit(AuditAction::MaskingChanged, "nightly", "0 rule(s), was 3")
         .await;
 
-    let entries = store.list_audit(10).await.unwrap();
+    let entries = store.list_audit(10, 0).await.unwrap();
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].action, "masking.changed");
     assert_eq!(entries[0].subject, "nightly");
@@ -1011,7 +1088,7 @@ async fn the_audit_log_records_that_a_secret_was_set_not_what_it_was() {
         .audit(AuditAction::SecretSet, "prod-eu", "DbPassword stored")
         .await;
 
-    let entries = store.list_audit(10).await.unwrap();
+    let entries = store.list_audit(10, 0).await.unwrap();
     assert!(entries[0].detail.contains("stored"));
     assert!(!entries[0].detail.to_lowercase().contains("hunter2"));
 }
@@ -1043,10 +1120,41 @@ async fn the_audit_limit_is_respected_and_never_zero() {
             .await;
     }
 
-    assert_eq!(store.list_audit(3).await.unwrap().len(), 3);
+    assert_eq!(store.list_audit(3, 0).await.unwrap().len(), 3);
     // A zero or negative limit would return nothing and read as "no changes",
     // which is a different claim from "you asked for none".
-    assert_eq!(store.list_audit(0).await.unwrap().len(), 1);
+    assert_eq!(store.list_audit(0, 0).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn audit_pages_cover_the_log_exactly_once() {
+    // Same contract as job history: several rows can land in one second — one
+    // edit that touches three things — so paging must not repeat or skip.
+    use db_sync_engine::audit::AuditAction;
+
+    let (store, _dir) = store().await;
+    for i in 0..7 {
+        store
+            .audit(AuditAction::ProfileCreated, format!("p{i}"), "")
+            .await;
+    }
+
+    assert_eq!(store.count_audit().await.unwrap(), 7);
+
+    let first = store.list_audit(3, 0).await.unwrap();
+    let second = store.list_audit(3, 3).await.unwrap();
+    let third = store.list_audit(3, 6).await.unwrap();
+    assert_eq!((first.len(), second.len(), third.len()), (3, 3, 1));
+
+    let seen: std::collections::HashSet<_> = first
+        .iter()
+        .chain(&second)
+        .chain(&third)
+        .map(|e| e.id)
+        .collect();
+    assert_eq!(seen.len(), 7, "an entry appeared on two pages");
+
+    assert!(store.list_audit(3, 99).await.unwrap().is_empty());
 }
 
 // ── Job steps ───────────────────────────────────────────────────────────

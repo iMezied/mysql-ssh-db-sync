@@ -75,7 +75,7 @@ export default function JobDetailPage() {
     queryKey: ["jobs", HISTORY_LIMIT],
     queryFn: () => api.listJobs(HISTORY_LIMIT),
   });
-  const job = jobs.data?.find((j) => j.id === jobId) ?? null;
+  const job = jobs.data?.jobs.find((j) => j.id === jobId) ?? null;
 
   const launched = useProgressStore((s) => s.launched[jobId]);
   const lines = useProgressStore((s) => s.lines[jobId]);

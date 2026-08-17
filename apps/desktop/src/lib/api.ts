@@ -79,7 +79,9 @@ export const api = {
     unwrap(commands.renameSyncPlan(id, name)),
   importTablesConf: (contents: string, available: string[]) =>
     unwrap(commands.importTablesConf(contents, available)),
-  listJobs: (limit: number) => unwrap(commands.listJobs(limit)),
+  /** One page of history, newest first, with the total to size a pager by. */
+  listJobs: (limit: number, offset = 0) =>
+    unwrap(commands.listJobs(limit, offset)),
   listJobSteps: (jobId: string) => unwrap(commands.listJobSteps(jobId)),
 
   listPipelines: () => unwrap(commands.listPipelines()),
@@ -94,7 +96,8 @@ export const api = {
   deletePipeline: (id: string) => unwrap(commands.deletePipeline(id)),
   startPipeline: (id: string, typedConfirmations: string[]) =>
     unwrap(commands.startPipeline(id, typedConfirmations)),
-  listAudit: (limit: number) => unwrap(commands.listAudit(limit)),
+  listAudit: (limit: number, offset = 0) =>
+    unwrap(commands.listAudit(limit, offset)),
   cancelJob: (id: string) => unwrap(commands.cancelJob(id)),
   activeJobIds: () => unwrap(commands.activeJobIds()),
   discoverTools: () => unwrap(commands.discoverTools()),

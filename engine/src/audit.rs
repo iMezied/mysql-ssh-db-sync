@@ -33,6 +33,17 @@ pub struct AuditEntry {
     pub detail: String,
 }
 
+/// One page of recorded changes, with the size of the whole set.
+///
+/// The count travels with the rows for the same reason as [`crate::job::JobPage`]:
+/// fetched separately it can disagree with the page it is describing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct AuditPage {
+    pub entries: Vec<AuditEntry>,
+    /// Total rows in `audit_log`, not the length of `entries`.
+    pub total: u32,
+}
+
 /// The verbs this application records.
 ///
 /// A closed set rather than free strings, so a call site cannot invent a verb

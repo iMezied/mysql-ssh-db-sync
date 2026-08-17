@@ -266,7 +266,7 @@ async fn an_import_is_recorded_whichever_surface_ran_it() {
     let (target, _b) = store().await;
     share::import(&target, &bundle).await.unwrap();
 
-    let entries = target.list_audit(10).await.unwrap();
+    let entries = target.list_audit(10, 0).await.unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].action, "config.imported");
     assert!(

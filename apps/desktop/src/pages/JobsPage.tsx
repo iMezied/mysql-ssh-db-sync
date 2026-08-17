@@ -1,11 +1,13 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { ChevronRight } from "lucide-react";
 
 import PageHeader from "@/components/PageHeader";
 import JobProgressStrip from "@/components/JobProgressStrip";
+import Pager from "@/components/Pager";
 import { api } from "@/lib/api";
+import { clampPage, offsetOf } from "@/lib/paging";
 import { cn, formatDuration, formatTimestamp } from "@/lib/utils";
 import { useTick } from "@/lib/useTick";
 import {
@@ -25,6 +27,17 @@ const OUTCOME_STYLES: Record<JobOutcome, string> = {
 const LIVE_LIMIT = 200;
 
 /**
+ * Rows per page of history and of the change log.
+ *
+ * Sized to fill the pane without turning the page into a scroll: both lists
+ * grow without limit — a nightly schedule alone adds a row a day — and before
+ * this they were a single flat list capped at 50, which quietly hid everything
+ * older and could not be paged back to.
+ */
+const JOBS_PER_PAGE = 25;
+const AUDIT_PER_PAGE = 20;
+
+/**
  * How often to re-ask which jobs this process is actually running.
  *
  * Only polled while an unfinished job is on screen, and only as a backstop:
@@ -40,12 +53,19 @@ const ACTIVE_POLL_MS = 5_000;
  * was removed, a connection was re-pointed, the key was exported.
  */
 function ChangeLog() {
+  const [page, setPage] = useState(0);
+
   const audit = useQuery({
-    queryKey: ["audit"],
-    queryFn: () => api.listAudit(20),
+    queryKey: ["audit", page],
+    queryFn: () => api.listAudit(AUDIT_PER_PAGE, offsetOf(page, AUDIT_PER_PAGE)),
+    // Hold the previous page while the next one loads. Without it the list
+    // collapses to nothing between clicks and the pager jumps up the screen.
+    placeholderData: keepPreviousData,
   });
 
-  if (!audit.data || audit.data.length === 0) return null;
+  usePageInRange(page, setPage, audit.data?.total, AUDIT_PER_PAGE);
+
+  if (!audit.data || audit.data.total === 0) return null;
 
   return (
     <section>
@@ -53,7 +73,7 @@ function ChangeLog() {
         Configuration changes
       </h2>
       <div className="panel divide-y divide-slate-800">
-        {audit.data.map((entry) => (
+        {audit.data.entries.map((entry) => (
           <div
             key={entry.id}
             className="flex flex-wrap items-baseline gap-x-3 gap-y-1 px-4 py-2 text-xs"
@@ -69,20 +89,56 @@ function ChangeLog() {
           </div>
         ))}
       </div>
+
+      <Pager
+        page={page}
+        pageSize={AUDIT_PER_PAGE}
+        total={audit.data.total}
+        onPage={setPage}
+        noun="changes"
+      />
     </section>
   );
 }
 
+/**
+ * Pull the page back into range when the list shrinks under it.
+ *
+ * Reachable without deleting anything: sit on the last page, then let the
+ * count drop — a pruned log, a store swapped by an import — and the request
+ * returns an empty page that reads as "no history" rather than "you are past
+ * the end". The arithmetic lives in `lib/paging` so its edges are tested.
+ */
+function usePageInRange(
+  page: number,
+  setPage: (page: number) => void,
+  total: number | undefined,
+  pageSize: number,
+) {
+  useEffect(() => {
+    if (total === undefined) return;
+    const clamped = clampPage(page, total, pageSize);
+    if (clamped !== page) setPage(clamped);
+  }, [page, setPage, total, pageSize]);
+}
+
 export default function JobsPage() {
   const [live, setLive] = useState<ProgressEvent[]>([]);
+  const [page, setPage] = useState(0);
 
-  const jobs = useQuery({ queryKey: ["jobs"], queryFn: () => api.listJobs(50) });
+  const jobs = useQuery({
+    queryKey: ["jobs", JOBS_PER_PAGE, page],
+    queryFn: () => api.listJobs(JOBS_PER_PAGE, offsetOf(page, JOBS_PER_PAGE)),
+    placeholderData: keepPreviousData,
+  });
+
+  usePageInRange(page, setPage, jobs.data?.total, JOBS_PER_PAGE);
 
   // A job with no finish time has not necessarily survived: a crash or a quit
   // leaves the row open forever. Only this process can say which ones are
   // genuinely still going, and the difference matters — one is worth waiting
   // for, the other is worth starting again.
-  const unfinished = jobs.data?.some((j) => j.outcome === null) ?? false;
+  const unfinished = jobs.data?.jobs.some((j) => j.outcome === null) ?? false;
   const active = useQuery({
     queryKey: ["active-jobs"],
     queryFn: () => api.activeJobIds(),
@@ -90,7 +146,9 @@ export default function JobsPage() {
   });
   const activeIds = new Set(active.data ?? []);
 
-  const anyLive = jobs.data?.some((j) => j.outcome === null && activeIds.has(j.id));
+  const anyLive = jobs.data?.jobs.some(
+    (j) => j.outcome === null && activeIds.has(j.id),
+  );
   const now = useTick(anyLive ?? false);
 
   // Page-local scrollback. The store in `App` keeps the *latest* state per job
@@ -154,21 +212,33 @@ export default function JobsPage() {
             History
           </h2>
 
-          {jobs.data?.length === 0 ? (
+          {jobs.data?.total === 0 ? (
             <div className="panel p-8 text-center text-sm text-slate-500">
               No jobs have run yet.
             </div>
           ) : (
-            <div className="panel divide-y divide-slate-800">
-              {jobs.data?.map((job) => (
-                <JobRow
-                  key={job.id}
-                  job={job}
-                  live={activeIds.has(job.id)}
-                  now={now}
+            <>
+              <div className="panel divide-y divide-slate-800">
+                {jobs.data?.jobs.map((job) => (
+                  <JobRow
+                    key={job.id}
+                    job={job}
+                    live={activeIds.has(job.id)}
+                    now={now}
+                  />
+                ))}
+              </div>
+
+              {jobs.data && (
+                <Pager
+                  page={page}
+                  pageSize={JOBS_PER_PAGE}
+                  total={jobs.data.total}
+                  onPage={setPage}
+                  noun="jobs"
                 />
-              ))}
-            </div>
+              )}
+            </>
           )}
         </section>
       </div>

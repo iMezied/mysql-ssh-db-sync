@@ -139,7 +139,8 @@ export const commands = {
 	checkArtifact: (path: string) => typedError<IntegrityCheck, CommandError>(__TAURI_INVOKE("check_artifact", { path })),
 	/**  Delete an artifact and its manifest. */
 	deleteArtifact: (path: string) => typedError<null, CommandError>(__TAURI_INVOKE("delete_artifact", { path })),
-	listJobs: (limit: number) => typedError<JobRecord[], CommandError>(__TAURI_INVOKE("list_jobs", { limit })),
+	/**  One page of job history, newest first, with the size of the whole set. */
+	listJobs: (limit: number, offset: number) => typedError<JobPage, CommandError>(__TAURI_INVOKE("list_jobs", { limit, offset })),
 	/**
 	 *  The steps one job is made of, in order.
 	 * 
@@ -223,8 +224,8 @@ export const commands = {
 	schedulerStatus: () => typedError<SchedulerStatus, CommandError>(__TAURI_INVOKE("scheduler_status")),
 	getAppSettings: () => typedError<AppSettings, CommandError>(__TAURI_INVOKE("get_app_settings")),
 	setAppSettings: (next: AppSettings) => typedError<AppSettings, CommandError>(__TAURI_INVOKE("set_app_settings", { next })),
-	/**  Recent configuration changes, newest first. */
-	listAudit: (limit: number) => typedError<AuditEntry[], CommandError>(__TAURI_INVOKE("list_audit", { limit })),
+	/**  One page of configuration changes, newest first. */
+	listAudit: (limit: number, offset: number) => typedError<AuditPage, CommandError>(__TAURI_INVOKE("list_audit", { limit, offset })),
 	/**  Size and growth across the backup library. */
 	libraryStats: (directory: string | null) => typedError<LibraryStats, CommandError>(__TAURI_INVOKE("library_stats", { directory })),
 	/**
@@ -443,6 +444,18 @@ export type AuditEntry = {
 	/**  What it happened to, in words a person recognises. */
 	subject: string,
 	detail: string,
+};
+
+/**
+ *  One page of recorded changes, with the size of the whole set.
+ * 
+ *  The count travels with the rows for the same reason as [`crate::job::JobPage`]:
+ *  fetched separately it can disagree with the page it is describing.
+ */
+export type AuditPage = {
+	entries: AuditEntry[],
+	/**  Total rows in `audit_log`, not the length of `entries`. */
+	total: number,
 };
 
 export type BackupRequest = {
@@ -817,6 +830,19 @@ export type JobFinished = {
 export type JobKind = "backup" | "restore" | "verify" | "sync";
 
 export type JobOutcome = "success" | "failed" | "cancelled";
+
+/**
+ *  One page of job history, with the size of the whole set.
+ * 
+ *  The count travels with the rows rather than in a second command: a job can
+ *  finish between two calls, and a pager that reads "page 9 of 8" because the
+ *  total was fetched separately is worse than no pager.
+ */
+export type JobPage = {
+	jobs: JobRecord[],
+	/**  Total rows in `job_history`, not the length of `jobs`. */
+	total: number,
+};
 
 export type JobPhase = "initializing" | "ssh_connect" | "tunneling" | "introspect" | "dump_schema" | "dump_data" | "compress" | "transfer" | "restore" | "verify" | "cleanup" | "done";
 

@@ -19,8 +19,7 @@ use db_sync_engine::cron::{CronExpression, ScheduleTimezone};
 use db_sync_engine::db::{DatabaseInfo, TableInfo};
 use db_sync_engine::destination::{Destination, DestinationCreate, DestinationUpdate};
 use db_sync_engine::events::{JobKind, JobPhase};
-use db_sync_engine::job::JobRecord;
-use db_sync_engine::job::{JobContext, JobOutcome};
+use db_sync_engine::job::{JobContext, JobOutcome, JobPage};
 use db_sync_engine::library::{self, Artifact, IntegrityCheck};
 use db_sync_engine::mask::MaskRule;
 use db_sync_engine::ops::{self, SyncRequest};
@@ -591,13 +590,19 @@ pub async fn list_tables(
 
 // ── Jobs ────────────────────────────────────────────────────────────────
 
+/// One page of job history, newest first, with the size of the whole set.
 #[tauri::command]
 #[specta::specta]
-pub async fn list_jobs(state: State<'_, AppState>, limit: u32) -> CmdResult<Vec<JobRecord>> {
-    Ok(state
+pub async fn list_jobs(state: State<'_, AppState>, limit: u32, offset: u32) -> CmdResult<JobPage> {
+    let total = state.store.count_jobs().await?;
+    let jobs = state
         .store
-        .list_jobs(i64::from(limit.clamp(1, 500)))
-        .await?)
+        .list_jobs(i64::from(limit.clamp(1, 500)), i64::from(offset))
+        .await?;
+    Ok(JobPage {
+        jobs,
+        total: total.try_into().unwrap_or(u32::MAX),
+    })
 }
 
 /// The steps one job is made of, in order.
@@ -1829,7 +1834,7 @@ mod tests {
     }
 }
 
-/// Recent configuration changes, newest first.
+/// One page of configuration changes, newest first.
 #[tauri::command]
 #[specta::specta]
 pub async fn list_audit(
@@ -1837,11 +1842,17 @@ pub async fn list_audit(
     // `u32`, not `i64`: specta forbids exporting BigInt-style types, and a
     // clamp here is better than trusting the caller anyway.
     limit: u32,
-) -> CmdResult<Vec<db_sync_engine::audit::AuditEntry>> {
-    Ok(state
+    offset: u32,
+) -> CmdResult<db_sync_engine::audit::AuditPage> {
+    let total = state.store.count_audit().await?;
+    let entries = state
         .store
-        .list_audit(i64::from(limit.clamp(1, 500)))
-        .await?)
+        .list_audit(i64::from(limit.clamp(1, 500)), i64::from(offset))
+        .await?;
+    Ok(db_sync_engine::audit::AuditPage {
+        entries,
+        total: total.try_into().unwrap_or(u32::MAX),
+    })
 }
 
 // ── Shareable configuration ─────────────────────────────────────────────
